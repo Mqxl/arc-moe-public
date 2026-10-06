@@ -1,0 +1,156 @@
+From bf7d5ee59cbb5403d32659218569c67a29d1e9f5 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:18:15 +0000
+Subject: [PATCH 2/6] sycl: layer split with the pinned expert mirror;
+ STRATA_VERIFY_NO_HOST=auto
+
+- The mirror's miss list walked all layers, so under --layer-split it pinned
+  the later stages' experts (which their own caches hold, and which no plan
+  reads from the mirror) and left CUDA0's real misses on the SSD. It now
+  covers CUDA0's layers only, with a bitmap instead of a quadratic find.
+- --layer-split auto: with STRATA_SPLIT_MIRROR_MS the misses of CUDA0's layers
+  are priced as mirror reads, a later stage's as host-path misses, so the
+  search keeps the later stages whole and puts the overflow on CUDA0.
+- STRATA_VERIFY_NO_HOST=auto: resolved after the placement - on only when
+  every expert is in VRAM or in the mirror (the host-free window hangs when
+  one is neither). verify.cpp reads the variable per window.
+---
+ sycl/src/core/verify.cpp      |  5 ++-
+ sycl/src/program/generate.cpp | 66 ++++++++++++++++++++++++++++++-----
+ 2 files changed, 62 insertions(+), 9 deletions(-)
+
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 27aa6fb..69514b3 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -1359,7 +1359,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+     // memory are not reliably visible while the graph runs (measured: the ring is seen late or not at all),
+     // so waiting on them per layer fails. STRATA_VERIFY_NO_HOST=1 waits for the whole window instead. Only for
+     // an all-resident cache: a missed expert would leave the GPU waiting for a plan that never comes.
+-    static const bool no_host = std::getenv("STRATA_VERIFY_NO_HOST") != nullptr;
++    // arc-moe: read per window, not once - STRATA_VERIFY_NO_HOST=auto is resolved by generate.cpp after the expert
++    // placement (to "1" or unset); "auto" still unresolved, or "0", means the per-layer host path.
++    const char* const no_host_v = std::getenv("STRATA_VERIFY_NO_HOST");
++    const bool no_host = no_host_v != nullptr && std::strcmp(no_host_v, "auto") != 0 && std::strcmp(no_host_v, "0") != 0;
+     const int64_t steps = (le_ - lb_) * G;
+     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
+     for (int64_t k = 0; !no_host && k < steps; ++k) {
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 1b05070..64dbed7 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -2965,6 +2965,12 @@ int main(int argc, char **argv) try {
+                          (double) cap[(size_t) i] / 1073741824.0);
+         }
+         const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
++        const double mirror_ms = std::getenv("STRATA_SPLIT_MIRROR_MS") && o.stream_experts &&
++                                         !(std::getenv("STRATA_MIRROR_MIB") && std::atoll(std::getenv("STRATA_MIRROR_MIB")) == 0)
++                                     ? std::atof(std::getenv("STRATA_SPLIT_MIRROR_MS")) : 0.0;
++        if (mirror_ms > 0)
++            std::fprintf(stderr, "strata generate: layer split auto: CUDA0's misses priced at %.1f ms (the pinned host "
++                                 "mirror), a later stage's at %.1f ms\n", mirror_ms, miss_ms);
+         std::vector<double> mass(profile.size());
+         double total_mass = 0;
+         for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
+@@ -2986,18 +2992,28 @@ int main(int argc, char **argv) try {
+             held_mass = 0;
+             held = 0;
+             std::vector<bool> full((size_t) ns, false);
++            double miss0_mass = 0;   // arc-moe: the misses of CUDA0's layers, which the pinned host mirror serves
+             for (size_t r = 0; r < profile.size(); ++r) {
+                 const int64_t l = profile[r].first;
+                 int st = 0;
+                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
+-                if (full[(size_t) st]) continue;
+-                if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
++                if (full[(size_t) st] || used[(size_t) st] + cost(l) > capr[(size_t) st]) {   // as the fill
++                    full[(size_t) st] = true;
++                    if (st == 0) miss0_mass += mass[r];
++                    continue;
++                }
+                 used[(size_t) st] += cost(l);
+                 held_mass += mass[r];
+                 ++held;
+             }
+             held_mass /= std::max(total_mass, 1e-9);
+-            double ms = miss_ms * (1.0 - held_mass);
++            miss0_mass /= std::max(total_mass, 1e-9);
++            // arc-moe: with STRATA_SPLIT_MIRROR_MS the experts CUDA0 cannot hold are read by the GPU from the pinned
++            // host mirror (a PCIe read inside the window), while a later stage's miss still takes the host path.
++            // Pricing the two apart moves the boundary so the later stages hold every expert of their layers and
++            // CUDA0 carries the overflow - the placement that keeps the whole window on the GPUs.
++            double ms = mirror_ms > 0 ? miss_ms * (1.0 - held_mass - miss0_mass) + mirror_ms * miss0_mass
++                                      : miss_ms * (1.0 - held_mass);
+             for (int i = 0; i < ns; ++i) {
+                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                 ms += (double) (le - lb) * layer_ms[(size_t) i];
+@@ -3789,12 +3805,20 @@ int main(int argc, char **argv) try {
+     int64_t unmirrored_misses = 0;
+     if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
+         std::vector<std::pair<int64_t, int64_t>> miss;
+-        for (const auto& pr : profile)   // the profile's order: the most-routed misses first, if the cap is reached
++        // arc-moe: only CUDA0's own layers. With a layer split `profile` is already CUDA0's share, but the loop
++        // over unlisted pairs used to walk all 48 layers, so every expert of the later stages (which their own
++        // caches hold) was "missing" here: the mirror spent the RAM on them and CUDA0's real misses went to the SSD.
++        // Only CUDA0's verify plan reads the mirror table, so those are the only pairs worth pinning.
++        const int64_t mirror_hi = multi_gpu && !split_at.empty() ? split_at[0] : g.n_layers;
++        std::vector<uint8_t> listed((size_t) (g.n_layers * g.n_expert), 0);
++        for (const auto& pr : profile) {  // the profile's order: the most-routed misses first, if the cap is reached
++            if (pr.first < 0 || pr.first >= mirror_hi || pr.second < 0 || pr.second >= g.n_expert) continue;
++            listed[(size_t) (pr.first * g.n_expert + pr.second)] = 1;
+             if (xcache.slot_of(pr.first, pr.second) == strata::core::kNotResident) miss.push_back({pr.first, pr.second});
+-        for (int64_t l = 0; l < g.n_layers; ++l)                     // pairs the profile does not list at all
++        }
++        for (int64_t l = 0; l < mirror_hi; ++l)                      // pairs the profile does not list at all
+             for (int64_t e = 0; e < g.n_expert; ++e)
+-                if (xcache.slot_of(l, e) == strata::core::kNotResident &&
+-                    std::find(miss.begin(), miss.end(), std::pair<int64_t, int64_t>{l, e}) == miss.end())
++                if (!listed[(size_t) (l * g.n_expert + e)] && xcache.slot_of(l, e) == strata::core::kNotResident)
+                     miss.push_back({l, e});
+         uint64_t avail = 0;
+         if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+@@ -3829,7 +3853,8 @@ int main(int argc, char **argv) try {
+         }
+         unmirrored_misses = (int64_t) miss.size() - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.end(),
+             [&](const std::pair<int64_t, int64_t>& pr) { return gguf_src.pinned(pr.first, pr.second); }) : 0);
+-        if (unmirrored_misses > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr)
++        if (unmirrored_misses > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr &&
++            std::string(std::getenv("STRATA_VERIFY_NO_HOST")) != "auto")
+             std::fprintf(stderr, "strata generate: WARNING: %lld experts are neither in VRAM nor mirrored; with STRATA_VERIFY_NO_HOST "
+                                  "the device plan cannot run them and their layers' windows fall back slowly - raise "
+                                  "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
+@@ -3895,6 +3920,31 @@ int main(int argc, char **argv) try {
+     }
+     if (multi_gpu)
+         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
++    // arc-moe: STRATA_VERIFY_NO_HOST=auto. The host-free window (the host waits for the whole window, not per layer)
++    // is the fast path on Arc, but it is only valid when the GPUs never need the host for an expert: every pair of
++    // CUDA0's layers in VRAM or in the pinned mirror, and every later stage holding all of its layers' pairs.
++    // Decided here, after the placement and before the first window (verify.cpp reads the variable per window).
++    if (const char* nh = std::getenv("STRATA_VERIFY_NO_HOST"); nh != nullptr && std::string(nh) == "auto") {
++        bool covered = o.stream_experts && unmirrored_misses == 0;
++        for (auto& stp : stages)
++            covered = covered && stp->cache.slots() > 0 &&
++                      [&] {
++                          for (int64_t l = stp->lb; l < stp->le; ++l)
++                              for (int64_t e = 0; e < g.n_expert; ++e)
++                                  if (stp->cache.slot_of(l, e) == strata::core::kNotResident) return false;
++                          return true;
++                      }();
++        if (covered) {
++            setenv("STRATA_VERIFY_NO_HOST", "1", 1);
++            std::fprintf(stderr, "strata generate: STRATA_VERIFY_NO_HOST=auto -> on: every expert is in VRAM or in the "
++                                 "pinned mirror\n");
++        } else {
++            unsetenv("STRATA_VERIFY_NO_HOST");
++            std::fprintf(stderr, "strata generate: STRATA_VERIFY_NO_HOST=auto -> off: some experts are neither in VRAM "
++                                 "nor mirrored (%lld on CUDA0); raise STRATA_MIRROR_MIB / free RAM, or shorten the "
++                                 "context, for the host-free path\n", (long long) unmirrored_misses);
++        }
++    }
+ 
+     std::array<strata::core::RemoteExperts, 3> remote_experts;
+     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+-- 
+2.43.0
+

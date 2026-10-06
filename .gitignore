@@ -1,0 +1,7 @@
+# model files and build output
+/data/
+*.gguf
+build*/
+__pycache__/
+*.pyc
+*.log

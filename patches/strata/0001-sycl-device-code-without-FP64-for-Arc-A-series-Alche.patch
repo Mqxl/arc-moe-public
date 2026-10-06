@@ -1,0 +1,885 @@
+From ec1f67e4153b6323f90e310414adbdd9e2abda59 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:18:15 +0000
+Subject: [PATCH 1/6] sycl: device code without FP64 for Arc A-series
+ (Alchemist)
+
+Xe-HPG (DG2: A770/A750/A580/A380) has no FP64 unit. Eight kernel files
+accumulate in double (router top-10 softmax, GDN/QSA RMS norms, shared expert
+gate, moe_combine, PLE, sampler nucleus, quantize_q8_0, silu): an AOT build for
+acm-g10 stops with "Double type is not supported on this platform" and a JIT
+build fails at the kernel's first launch.
+
+- strata/sycl_fp.hpp: sfp_t is float under STRATA_SYCL_NO_FP64, double
+  otherwise (Battlemage keeps upstream's arithmetic bit for bit).
+- Those device functions use sfp_t, sfp_t(...) literals, sfp_t local arrays
+  and sizeof(sfp_t) for their dynamic local memory.
+- CMake: STRATA_SYCL_NO_FP64 defaults to ON when STRATA_SYCL_AOT names an
+  Alchemist part (acm-*, dg2).
+- CMake: -ze-opt-greater-than-4GB-buffer-required for every kernel (the
+  expert cache is one 10-15 GB allocation), and STRATA_SYCL_IGC_EXTRA for
+  further IGC options; both reach ocloc (AOT) and the JIT.
+---
+ sycl/CMakeLists.txt                        | 22 ++++++++-
+ sycl/include/strata/sycl_fp.hpp            | 27 ++++++++++
+ sycl/src/kernels/cuda/elementwise.dp.cpp   |  5 +-
+ sycl/src/kernels/cuda/gdn.dp.cpp           | 17 ++++---
+ sycl/src/kernels/cuda/gr.dp.cpp            | 11 +++--
+ sycl/src/kernels/cuda/ple.dp.cpp           | 25 +++++-----
+ sycl/src/kernels/cuda/qsa.dp.cpp           | 57 +++++++++++-----------
+ sycl/src/kernels/cuda/quantize_act.dp.cpp  |  7 +--
+ sycl/src/kernels/cuda/router_top10.dp.cpp  | 23 ++++-----
+ sycl/src/kernels/cuda/sampler.dp.cpp       | 45 ++++++++---------
+ sycl/src/kernels/cuda/shared_expert.dp.cpp | 23 ++++-----
+ 11 files changed, 158 insertions(+), 104 deletions(-)
+ create mode 100644 sycl/include/strata/sycl_fp.hpp
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index 1b6094a..b5b2879 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -21,12 +21,30 @@ endif()
+ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}-sycl")
+ 
+ set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
++# arc-moe: Alchemist (Xe-HPG: acm-g10 = A770/A750, acm-g11 = A380, acm-g12 = A580, "dg2") has no FP64 unit.
++# STRATA_SYCL_NO_FP64 turns the device reductions upstream writes in double into float (strata/sycl_fp.hpp);
++# it is on by default whenever the AOT target is an Alchemist part.
++set(_strata_alchemist OFF)
++if(STRATA_SYCL_AOT MATCHES "(^|,)(acm|dg2)")
++  set(_strata_alchemist ON)
++endif()
++option(STRATA_SYCL_NO_FP64 "Device code without FP64 (required on Arc A-series / Alchemist)" ${_strata_alchemist})
++if(STRATA_SYCL_NO_FP64)
++  add_compile_definitions(STRATA_SYCL_NO_FP64=1)
++endif()
++# The expert cache is ONE device allocation of 10-15 GB. IGC may otherwise assume every buffer is below 4 GB and
++# address it with 32-bit offsets; this option makes it keep 64-bit (stateless) addressing for every kernel.
++set(_strata_igc_opts "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
++set(STRATA_SYCL_IGC_EXTRA "" CACHE STRING "Extra IGC options for the device code (e.g. -ze-opt-large-register-file)")
++if(STRATA_SYCL_IGC_EXTRA)
++  string(APPEND _strata_igc_opts " ${STRATA_SYCL_IGC_EXTRA}")
++endif()
+ set(_sycl_flags -fsycl)
+ if(STRATA_SYCL_AOT)
+   list(APPEND _sycl_flags -fsycl-targets=spir64_gen)
+   # the divide/sqrt rounding option (below) must reach ocloc here: an AOT build has no spir64 backend to take it
+   set(_sycl_link -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen
+-      "-device ${STRATA_SYCL_AOT} -options -cl-fp32-correctly-rounded-divide-sqrt")
++      "-device ${STRATA_SYCL_AOT} -options \"${_strata_igc_opts}\"")
+ else()
+   set(_sycl_link -fsycl)
+ endif()
+@@ -36,7 +54,7 @@ endif()
+ # SYCL_PROGRAM_COMPILE_OPTIONS=-cl-fp32-correctly-rounded-divide-sqrt at run time.) The AOT build passes it to
+ # ocloc above; without that the 303k mismatches came back on 2026-09-30, unnoticed since the AOT switch.
+ if(NOT STRATA_SYCL_AOT)
+-  list(APPEND _sycl_link "-Xsycl-target-backend=spir64" "-cl-fp32-correctly-rounded-divide-sqrt")
++  list(APPEND _sycl_link "-Xsycl-target-backend=spir64" "${_strata_igc_opts}")
+ endif()
+ # Every translation unit gets -fsycl: the migrated host files construct queues and USM, not only the kernels.
+ # icpx defaults to a fast floating-point model (reciprocal approximations, reassociation); the kernels are
+diff --git a/sycl/include/strata/sycl_fp.hpp b/sycl/include/strata/sycl_fp.hpp
+new file mode 100644
+index 0000000..52c6151
+--- /dev/null
++++ b/sycl/include/strata/sycl_fp.hpp
+@@ -0,0 +1,27 @@
++// include/strata/sycl_fp.hpp - the SYCL port's precision switch for GPUs without FP64 (arc-moe).
++//
++// Upstream accumulates a handful of device reductions in `double` (the router's softmax sum, the RMS norms of the
++// GDN and QSA paths, the shared expert's scalar gate, the sampler's nucleus). Battlemage (Xe2) executes FP64 in
++// hardware, so the port kept it. Alchemist (Xe-HPG, the Arc A770 / A750 / A580 / A380) has NO FP64 unit at all:
++// an AOT build for acm-g10 stops with "Double type is not supported on this platform", and a JIT build either
++// fails at the first launch of such a kernel or, with the driver's software emulation forced on, spends tens of
++// microseconds per call in it.
++//
++// `sfp_t` is that accumulator. With STRATA_SYCL_NO_FP64 (set by -DSTRATA_SYCL_NO_FP64=ON, the default for an
++// acm-g10 build) it is `float`, which is what llama.cpp's SYCL backend uses for the same reductions; otherwise it
++// is `double` and the kernels are exactly upstream's. Every partial sum in these kernels is already a tree (or
++// at most 512 terms of magnitude <= 1), so float keeps the result within a few ulp of the float output it is
++// rounded to anyway.
++#pragma once
++
++namespace strata {
++#if defined(STRATA_SYCL_NO_FP64)
++using sfp_t = float;
++inline constexpr bool kDeviceFp64 = false;
++#else
++using sfp_t = double;
++inline constexpr bool kDeviceFp64 = true;
++#endif
++}  // namespace strata
++
++using strata::sfp_t;
+diff --git a/sycl/src/kernels/cuda/elementwise.dp.cpp b/sycl/src/kernels/cuda/elementwise.dp.cpp
+index 6f01683..b1b4cc5 100644
+--- a/sycl/src/kernels/cuda/elementwise.dp.cpp
++++ b/sycl/src/kernels/cuda/elementwise.dp.cpp
+@@ -13,6 +13,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -119,8 +120,8 @@ __dpct_inline__ void silu_kernel(float *__restrict__ x, int64_t n) {
+     // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
+     // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
+     // difference is in the last bits and this is one line.
+-    const double v = (double) x[i];
+-    x[i] = (float)(v / (1.0 + sycl::exp(-v)));
++    const sfp_t v = (sfp_t) x[i];
++    x[i] = (float)(v / (sfp_t(1.0) + sycl::exp(-v)));
+ }
+ 
+ /// A bounded launch: a zero-length grid is illegal, and `n == 0` is a real call (an empty selection).
+diff --git a/sycl/src/kernels/cuda/gdn.dp.cpp b/sycl/src/kernels/cuda/gdn.dp.cpp
+index 3373560..7829936 100644
+--- a/sycl/src/kernels/cuda/gdn.dp.cpp
++++ b/sycl/src/kernels/cuda/gdn.dp.cpp
+@@ -11,6 +11,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -149,10 +150,10 @@ __dpct_inline__ void gdn_l2_kernel(float *__restrict__ x, int cols, float eps) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     const int row = item_ct1.get_group(2);
+     float* p = x + (size_t) row * cols;
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int i = item_ct1.get_local_id(2); i < cols;
+-         i += item_ct1.get_local_range(2)) acc += (double)p[i] * (double)p[i];
++         i += item_ct1.get_local_range(2)) acc += (sfp_t)p[i] * (sfp_t)p[i];
+     // warp reduction
+     /*
+ DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
+@@ -164,7 +165,7 @@ runtimes. You may need to adjust the code.
+         dpct::experimental::shift_sub_group_left(
+             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+             acc, off);
+-    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
++    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     if (item_ct1.get_local_id(2) == 0) ssum = acc;
+     /*
+@@ -173,7 +174,7 @@ runtimes. You may need to adjust the code.
+     performance if there is no access to global memory.
+     */
+     item_ct1.barrier();
+-    const float inv = (float)(1.0 / sycl::sqrt(ssum + (double)eps));
++    const float inv = (float)(sfp_t(1.0) / sycl::sqrt(ssum + (sfp_t)eps));
+ #pragma unroll
+     for (int i = item_ct1.get_local_id(2); i < cols;
+          i += item_ct1.get_local_range(2)) p[i] *= inv;
+@@ -190,10 +191,10 @@ __dpct_inline__ void gdn_out_norm_kernel(const float *__restrict__ o,
+     const float* po = o + (size_t) h * S;
+     const float* pz = z + (size_t) h * S;
+     float* py = y + (size_t) h * S;
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int i = item_ct1.get_local_id(2); i < S;
+-         i += item_ct1.get_local_range(2)) acc += (double)po[i] * (double)po[i];
++         i += item_ct1.get_local_range(2)) acc += (sfp_t)po[i] * (sfp_t)po[i];
+     /*
+ DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
+ masked sub_group function which may not be supported by all compilers or
+@@ -204,11 +205,11 @@ runtimes. You may need to adjust the code.
+         dpct::experimental::shift_sub_group_left(
+             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+             acc, off);
+-    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
++    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     if (item_ct1.get_local_id(2) == 0) ssum = acc;
+     item_ct1.barrier(sycl::access::fence_space::local_space);
+-    const float inv = (float)(1.0 / sycl::sqrt(ssum / (double)S + (double)eps));
++    const float inv = (float)(sfp_t(1.0) / sycl::sqrt(ssum / (sfp_t)S + (sfp_t)eps));
+ #pragma unroll
+     for (int i = item_ct1.get_local_id(2); i < S;
+          i += item_ct1.get_local_range(2))
+diff --git a/sycl/src/kernels/cuda/gr.dp.cpp b/sycl/src/kernels/cuda/gr.dp.cpp
+index fd8f809..e6d172a 100644
+--- a/sycl/src/kernels/cuda/gr.dp.cpp
++++ b/sycl/src/kernels/cuda/gr.dp.cpp
+@@ -36,6 +36,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -74,7 +75,7 @@ __dpct_inline__ float sigmoid_f(float x) {
+     return 1.0f / (1.0f + sycl::native::exp(-x));
+ }
+ 
+-__dpct_inline__ double warp_sum(double v) {
++__dpct_inline__ sfp_t warp_sum(sfp_t v) {
+     /*
+ DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
+ masked sub_group function which may not be supported by all compilers or
+@@ -136,7 +137,7 @@ function/algorithm is initialized.
+ /// The scratch is taken as `double*` and reinterpreted as `float*` rather than changing the callers' shared
+ /// arrays, because `double scratch[8]` is 64 bytes and so is at least as large as the `float[8]` this needs -
+ /// the cast cannot overrun, and it keeps the change to one function instead of one per caller.
+-inline float block_sumf(float v, double *scratch_raw) {
++inline float block_sumf(float v, sfp_t *scratch_raw) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     float *scratch = (float *)scratch_raw;
+     // The leading barrier is not decoration - see the note on `block_sum` above: the result is read straight out
+@@ -181,7 +182,7 @@ inline float block_sumf(float v, double *scratch_raw) {
+ /// The leading `__syncthreads()` is not decoration: the result is read straight out of `scratch[0]` by every
+ /// thread, and a later call reuses the same array.  Without a barrier on entry a fast thread can overwrite
+ /// `scratch[0]` before a slow one has read the previous result - a race that is invisible in most runs.
+-double block_sum(double v, double* scratch) {
++sfp_t block_sum(sfp_t v, sfp_t* scratch) {
+     /*
+     DPCT1065: Consider replacing sycl::nd_item::barrier() with
+     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+@@ -201,7 +202,7 @@ double block_sum(double v, double* scratch) {
+     item_ct1.barrier();
+     const int nw = ((int)item_ct1.get_local_range(2) + 31) >> 5;
+     v = (item_ct1.get_local_id(2) < nw) ? scratch[item_ct1.get_local_id(2)]
+-                                        : 0.0;
++                                        : sfp_t(0.0);
+     if (warp == 0) v = warp_sum(v);
+     if (item_ct1.get_local_id(2) == 0) scratch[0] = v;
+     /*
+@@ -228,7 +229,7 @@ __dpct_inline__ void gr_norm_kernel(const float *__restrict__ R,
+                                     int n_embd, float *__restrict__ xn,
+                                     uint16_t *__restrict__ xq) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
++auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[8]>(
+     sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     const int c = item_ct1.get_group(2);
+     const float* Rc = R + (size_t) c * n_embd;
+diff --git a/sycl/src/kernels/cuda/ple.dp.cpp b/sycl/src/kernels/cuda/ple.dp.cpp
+index 1d43007..13b68ce 100644
+--- a/sycl/src/kernels/cuda/ple.dp.cpp
++++ b/sycl/src/kernels/cuda/ple.dp.cpp
+@@ -31,6 +31,7 @@
+ #include <cstdlib>
+ #include <stdexcept>
+ #include <string>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -80,7 +81,7 @@ __dpct_inline__ float silu_f(float x) {
+ /// read out of `scratch[0]` and a later call reuses the array, so without a barrier a fast thread can
+ /// overwrite it before a slow one has read it - invisible in most runs and a slightly different norm when it
+ /// fires.
+-inline double block_sum(double v, double *scratch) {
++inline sfp_t block_sum(sfp_t v, sfp_t *scratch) {
+     /*
+     DPCT1065: Consider replacing sycl::nd_item::barrier() with
+     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+@@ -113,7 +114,7 @@ function/algorithm is initialized.
+     item_ct1.barrier();
+     const int nw = ((int)item_ct1.get_local_range(2) + 31) >> 5;
+     v = (item_ct1.get_local_id(2) < nw) ? scratch[item_ct1.get_local_id(2)]
+-                                        : 0.0;
++                                        : sfp_t(0.0);
+     if (warp == 0)
+         /*
+ DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
+@@ -147,21 +148,21 @@ __dpct_inline__ void gnorm_kernel(const float *__restrict__ x,
+                                   float *__restrict__ y, int n_embd,
+                                   float eps) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
++auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[8]>(
+     sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     const int c = item_ct1.get_group(2);
+     const float* xc = x + (size_t) c * n_embd;
+     const float* wc = w + (size_t) c * n_embd;
+     float* yc = y + (size_t) c * n_embd;
+ 
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+     for (int d = item_ct1.get_local_id(2); d < n_embd;
+          d += item_ct1.get_local_range(2)) {
+         // The PRODUCT is rounded in f32 before it is widened - `(ggml_float)(x[i00]*x[i00])`.
+         const float sq = xc[d] * xc[d];
+-        acc += (double) sq;
++        acc += (sfp_t) sq;
+     }
+-    const float mean = (float) (block_sum(acc, scratch) / (double) n_embd);
++    const float mean = (float) (block_sum(acc, scratch) / (sfp_t) n_embd);
+     const float scale = 1.0f / sycl::sqrt(mean + eps);
+ #pragma unroll
+     for (int d = item_ct1.get_local_id(2); d < n_embd;
+@@ -177,16 +178,16 @@ __dpct_inline__ void gate_kernel(const float *__restrict__ key,
+                                  float *__restrict__ gate, int n_embd,
+                                  float inv_sqrt_n) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
++auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[8]>(
+     sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     const int c = item_ct1.get_group(2);
+     const float* kc = key + (size_t) c * n_embd;
+     const float* qc = query + (size_t) c * n_embd;
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int d = item_ct1.get_local_id(2); d < n_embd;
+-         d += item_ct1.get_local_range(2)) acc += (double)(kc[d] * qc[d]);
+-    const float s = (float) (block_sum(acc, scratch) / (double) 1.0) * inv_sqrt_n;
++         d += item_ct1.get_local_range(2)) acc += (sfp_t)(kc[d] * qc[d]);
++    const float s = (float) (block_sum(acc, scratch) / sfp_t(1.0)) * inv_sqrt_n;
+     const float mag = sycl::sqrt(sycl::fmax(sycl::fabs(s), 1e-6f));
+     const float sgn = (s > 0.0f) ? 1.0f : ((s < 0.0f) ? -1.0f : 0.0f);
+     if (item_ct1.get_local_id(2) == 0) gate[c] =
+@@ -260,10 +261,10 @@ __dpct_inline__ void bf16_gemv_kernel(const uint16_t *__restrict__ x,
+                   item_ct1.get_local_id(2);
+     if (o >= n_out) return;
+     const uint16_t* row = w + (size_t) o * n_in;
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int i = 0; i < n_in; ++i) acc +=
+-        (double)bf16_float(x[i]) * (double)bf16_float(row[i]);
++        (sfp_t)bf16_float(x[i]) * (sfp_t)bf16_float(row[i]);
+     y[o] = (float) acc;
+ }
+ 
+diff --git a/sycl/src/kernels/cuda/qsa.dp.cpp b/sycl/src/kernels/cuda/qsa.dp.cpp
+index 7fe2cda..266cfae 100644
+--- a/sycl/src/kernels/cuda/qsa.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa.dp.cpp
+@@ -57,6 +57,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -175,7 +176,7 @@ __dpct_inline__ void indexer_key_append_kernel(
+     const float *__restrict__ sin_tab, const int32_t *__restrict__ mtab,
+     uint8_t *dpct_local) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-    auto s_mean = (double *)dpct_local; // idx_dim doubles
++    auto s_mean = (sfp_t *)dpct_local; // idx_dim doubles
+     const int d = item_ct1.get_local_id(2);
+     /*
+     DPCT1098: The '*' expression is used instead of the __ldg call. These
+@@ -192,8 +193,8 @@ __dpct_inline__ void indexer_key_append_kernel(
+     // The spare slot's key is `rms_norm(raw[0])`, which is CONSTANT for the sequence and is the only reason
+     // cell 0's raw key has to be kept: the three-row tail no longer holds it after the first block.
+     if (pos == 0) {
+-        double p = (double) raw[d];
+-        double ss = 0.0;
++        sfp_t p = (sfp_t) raw[d];
++        sfp_t ss = sfp_t(0.0);
+         // Same order as the pooled path, so the two are comparable: sum of squares over the dims, sequential.
+         // Every thread computes the same `ss` and uses only its own output element.
+         //
+@@ -203,7 +204,7 @@ __dpct_inline__ void indexer_key_append_kernel(
+         // key comes out 0.4 f32 ulp away - close enough that only a BIT-EXACT assertion notices.  `__ddiv_rn`
+         // and `__dsqrt_rn` pin the reciprocal square root for the same reason.
+         for (int i = 0; i < idx_dim; ++i) {
+-            const double v = (double) raw[i];
++            const sfp_t v = (sfp_t) raw[i];
+             /*
+             DPCT1013: The rounding mode could not be specified and the
+             generated code may have different accuracy than the original code.
+@@ -218,8 +219,8 @@ __dpct_inline__ void indexer_key_append_kernel(
+         correctness. SYCL math built-in function rounding mode is aligned with
+         OpenCL C 1.2 standard.
+         */
+-        const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
+-        float y = (float) (p * inv * (double) w_k_norm[d]);
++        const sfp_t inv = sfp_t(1.0) / sycl::sqrt(ss / (sfp_t)idx_dim + (sfp_t)eps);
++        float y = (float) (p * inv * (sfp_t) w_k_norm[d]);
+         // The spare rotates at position 0 - ALWAYS row 0 of the table, whatever `pos_base` is, as the native
+         // indexer's spare does.  At angle 0 the sine is exactly 0 in every scaling (sin(0) * mscale), so the
+         // pair rotation reduces to `v * cos_tab[pair]` with no partner element to read (and no barrier).
+@@ -245,7 +246,7 @@ __dpct_inline__ void indexer_key_append_kernel(
+     // The mean of this block's r raw keys, in CELL order: the r-1 tail rows (slots 0..r-2) then the incoming
+     // cell (slot r-1).  The sum of r f32 values is exact in double, so the mean's order cannot matter here -
+     // but the order of the SUM OF SQUARES below can, and it is fixed to d ascending on both sides.
+-    double m = 0.0;
++    sfp_t m = sfp_t(0.0);
+     /*
+ DPCT1013: The rounding mode could not be specified and the generated code
+ may have different accuracy than the original code. Verify the correctness. SYCL
+@@ -253,15 +254,15 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
+ */
+ #pragma unroll
+     for (int j = 0; j < r - 1; ++j)
+-        m = m + (double)tail[(size_t)j * idx_dim + d];
++        m = m + (sfp_t)tail[(size_t)j * idx_dim + d];
+     /*
+     DPCT1013: The rounding mode could not be specified and the generated
+     code may have different accuracy than the original code. Verify the
+     correctness. SYCL math built-in function rounding mode is aligned with
+     OpenCL C 1.2 standard.
+     */
+-    m = m + (double)raw[d];
+-    m = m / (double) r;
++    m = m + (sfp_t)raw[d];
++    m = m / (sfp_t) r;
+     s_mean[d] = m;
+     /*
+     DPCT1065: Consider replacing sycl::nd_item::barrier() with
+@@ -270,7 +271,7 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
+     */
+     item_ct1.barrier();
+ 
+-    double ss = 0.0;
++    sfp_t ss = sfp_t(0.0);
+     /*
+ DPCT1013: The rounding mode could not be specified and the generated code
+ may have different accuracy than the original code. Verify the correctness. SYCL
+@@ -284,10 +285,10 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
+     correctness. SYCL math built-in function rounding mode is aligned with
+     OpenCL C 1.2 standard.
+     */
+-    const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
++    const sfp_t inv = sfp_t(1.0) / sycl::sqrt(ss / (sfp_t)idx_dim + (sfp_t)eps);
+ 
+     const int b = pos / r;
+-    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (double) w_k_norm[d]);
++    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (sfp_t) w_k_norm[d]);
+     // The spare slot MOVES to b+1 and is rewritten with the same constant value.
+     pooled[(size_t) (b + 1) * idx_dim + d] = dead[d];
+     // The rotation position for this row, kept because a capture reader and the debug dumps want it.  It is the
+@@ -342,7 +343,7 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
+     */
+     const long long n_kv = (long long)*(step + kStepNKv);
+     auto &s_dot =
+-        *sycl::ext::oneapi::group_local_memory_for_overwrite<double[32]>(
++        *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[32]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     const long long b = item_ct1.get_group(2);
+     // A BLOCK PAST THE COMPLETED-BLOCK COUNT MUST DO NOTHING.  This is what lets the LAYER launch a CONSTANT
+@@ -353,10 +354,10 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
+     if (b > n_bid) return;
+     const int wid = item_ct1.get_local_id(2) >> 5,
+               lane = item_ct1.get_local_id(2) & 31;
+-    if (wid == 0) s_dot[lane] = 0.0;     // thread 0 reads all idx_n_head entries; zero the unused ones
++    if (wid == 0) s_dot[lane] = sfp_t(0.0);     // thread 0 reads all idx_n_head entries; zero the unused ones
+     item_ct1.barrier(sycl::access::fence_space::local_space);
+ 
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int d = lane; d < idx_dim; d += 32)
+         /*
+@@ -365,8 +366,8 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
+         correctness. SYCL math built-in function rounding mode is aligned with
+         OpenCL C 1.2 standard.
+         */
+-        acc = acc + (double)pooled[(size_t)b * idx_dim + d] *
+-                        (double)q_idx[(size_t)wid * idx_dim + d];
++        acc = acc + (sfp_t)pooled[(size_t)b * idx_dim + d] *
++                        (sfp_t)q_idx[(size_t)wid * idx_dim + d];
+     /*
+ DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
+ masked sub_group function which may not be supported by all compilers or
+@@ -386,11 +387,11 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
+     item_ct1.barrier(sycl::access::fence_space::local_space);
+ 
+     if (item_ct1.get_local_id(2) != 0) return;
+-    double score = 0.0;
++    sfp_t score = sfp_t(0.0);
+ #pragma unroll
+     for (int h = 0; h < idx_n_head; ++h) score +=
+-        (s_dot[h] > 0.0) ? s_dot[h] : 0.0;
+-    if (bias != nullptr) score += (double) bias[b];
++        (s_dot[h] > sfp_t(0.0)) ? s_dot[h] : sfp_t(0.0);
++    if (bias != nullptr) score += (sfp_t) bias[b];
+     // cell_block: cells of block b for b < n_bid, and the WHOLE incomplete tail for b == n_bid
+     long long lo = b * r, hi = lo + r;
+     if (b == n_bid) hi = n_kv;
+@@ -766,9 +767,9 @@ __dpct_inline__ void qsa_gate_apply_kernel(const float *__restrict__ attn,
+         item_ct1.get_local_id(2);
+     if (i >= (long long) n_head * head_dim) return;
+     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
+-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+-    const double sig = 1.0 / (1.0 + sycl::exp(-g));
+-    out[i] = f16_from_f32((float) ((double) attn[i] * sig));
++    const sfp_t g = (sfp_t) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
++    const sfp_t sig = sfp_t(1.0) / (sfp_t(1.0) + sycl::exp(-g));
++    out[i] = f16_from_f32((float) ((sfp_t) attn[i] * sig));
+ }
+ 
+ inline unsigned grid_for(long long n, int threads) {
+@@ -1114,7 +1115,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
+     from the original code. Check that the allocated memory size in the migrated
+     code is correct.
+     */
+-    const size_t smem = (size_t)s.idx_dim * sizeof(double);
++    const size_t smem = (size_t)s.idx_dim * sizeof(sfp_t);
+     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
+     // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
+     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
+@@ -1219,9 +1220,9 @@ __dpct_inline__ void qsa_gate_apply_f32_kernel(const float *__restrict__ attn,
+         item_ct1.get_local_id(2);
+     if (i >= (long long) n_head * head_dim) return;
+     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
+-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+-    const double sig = 1.0 / (1.0 + sycl::exp(-g));
+-    out[i] = (float) ((double) attn[i] * sig);
++    const sfp_t g = (sfp_t) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
++    const sfp_t sig = sfp_t(1.0) / (sfp_t(1.0) + sycl::exp(-g));
++    out[i] = (float) ((sfp_t) attn[i] * sig);
+ }
+ 
+ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
+diff --git a/sycl/src/kernels/cuda/quantize_act.dp.cpp b/sycl/src/kernels/cuda/quantize_act.dp.cpp
+index ac4d0fd..d4b504b 100644
+--- a/sycl/src/kernels/cuda/quantize_act.dp.cpp
++++ b/sycl/src/kernels/cuda/quantize_act.dp.cpp
+@@ -31,6 +31,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -76,9 +77,9 @@ __dpct_inline__ void quantize_q8_0_kernel(const float *__restrict__ x,
+ 
+     // double division, matching the reference exactly (subtlety 2)
+     for (int i = 0; i < QK8_0; ++i) {
+-        double q = sycl::rint((double)xb[i] / (double)d32);
+-        if (q > 127.0) q = 127.0;
+-        if (q < -128.0) q = -128.0;
++        sfp_t q = sycl::rint((sfp_t)xb[i] / (sfp_t)d32);
++        if (q > sfp_t(127.0)) q = sfp_t(127.0);
++        if (q < -sfp_t(128.0)) q = -sfp_t(128.0);
+         out[2 + i] = (uint8_t) (int8_t) q;
+     }
+ }
+diff --git a/sycl/src/kernels/cuda/router_top10.dp.cpp b/sycl/src/kernels/cuda/router_top10.dp.cpp
+index 1a602e5..30ee2ef 100644
+--- a/sycl/src/kernels/cuda/router_top10.dp.cpp
++++ b/sycl/src/kernels/cuda/router_top10.dp.cpp
+@@ -60,6 +60,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -85,14 +86,14 @@ __dpct_inline__ void router_top10_kernel(const float *__restrict__ logits,
+     auto s_raw = (unsigned char *)dpct_local;
+     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
+     unsigned char* s_taken = s_raw;
+-    double* s_ex = (double*) (s_raw + taken_bytes);
++    sfp_t* s_ex = (sfp_t*) (s_raw + taken_bytes);
+     auto &s_red = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+         float[RT_MAX_THREADS / 32]>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     auto &s_rid = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+         int[RT_MAX_THREADS / 32]>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+-    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
++    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+ 
+     const int t = item_ct1.get_group(2);
+@@ -150,7 +151,7 @@ runtimes. You may need to adjust the code.
+     // and was 5,632 serial calls before; it is 512 parallel ones now.
+ #pragma unroll
+     for (int e = tid; e < n_expert; e += nt)
+-        s_ex[e] = sycl::exp((double)l[e] - (double)mx);
++        s_ex[e] = sycl::exp((sfp_t)l[e] - (sfp_t)mx);
+     /*
+     DPCT1065: Consider replacing sycl::nd_item::barrier() with
+     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+@@ -160,7 +161,7 @@ runtimes. You may need to adjust the code.
+ 
+     // ---- the sum, ascending, on one thread: see the note above on why this is NOT parallelised.
+     if (tid == 0) {
+-        double sum = 0.0;
++        sfp_t sum = sfp_t(0.0);
+ #pragma unroll
+         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
+         s_sum = sum;
+@@ -171,7 +172,7 @@ runtimes. You may need to adjust the code.
+     performance if there is no access to global memory.
+     */
+     item_ct1.barrier();
+-    const float inv = (float) (1.0 / s_sum);
++    const float inv = (float) (sfp_t(1.0) / s_sum);
+ 
+     // ---- the selection, by rank.  `p[e] = (float)(s_ex[e] * inv)` reproduces the old expression exactly:
+     // `(float)(exp((double) l[e] - (double) mx) * inv)` with `inv` a FLOAT.
+@@ -303,13 +304,13 @@ runtimes. You may need to adjust the code.
+ 
+     // ---- renormalise, with ggml's lower clamp.  Order preserved.
+     if (tid == 0) {
+-        double s = 0.0;
++        sfp_t s = sfp_t(0.0);
+ #pragma unroll
+-        for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
+-        const double sc = sycl::fmax(s, 6.103515625e-05); // 2**-14
++        for (int i = 0; i < k; ++i) s += (sfp_t)weights[(size_t)t * k + i];
++        const sfp_t sc = sycl::fmax(s, sfp_t(6.103515625e-05)); // 2**-14
+ #pragma unroll
+         for (int i = 0; i < k; ++i)
+-            weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
++            weights[(size_t) t * k + i] = (float) ((sfp_t) weights[(size_t) t * k + i] / sc);
+     }
+ }
+ 
+@@ -437,7 +438,7 @@ void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int*
+     int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
+     threads = (threads + 31) & ~31;
+     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
+-    const size_t smem = taken_bytes + (size_t) n_expert * sizeof(double) + (size_t) n_expert * sizeof(float);
++    const size_t smem = taken_bytes + (size_t) n_expert * sizeof(sfp_t) + (size_t) n_expert * sizeof(float);
+     if (mode == 1) {
+         router_top10_fast_kernel<false><<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
+             logits, n_tokens, n_expert, k, ids, weights);
+@@ -513,7 +514,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
+         different from the original code. Check that the allocated memory size
+         in the migrated code is correct.
+         */
+-        taken_bytes + (size_t)n_expert * sizeof(double) +
++        taken_bytes + (size_t)n_expert * sizeof(sfp_t) +
+         (size_t)n_expert * sizeof(float);
+     /*
+     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
+diff --git a/sycl/src/kernels/cuda/sampler.dp.cpp b/sycl/src/kernels/cuda/sampler.dp.cpp
+index 6c86dfa..e4a77ec 100644
+--- a/sycl/src/kernels/cuda/sampler.dp.cpp
++++ b/sycl/src/kernels/cuda/sampler.dp.cpp
+@@ -33,6 +33,7 @@
+ #include <cstring>
+ #include <mutex>
+ #include <vector>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -583,16 +584,16 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
+ #pragma unroll
+     for (int i = 1; i < k; ++i) mx = sycl::fmax(mx, sel_logit[i]);
+     if (p.top_p < 1.0f) {
+-        double sum = 0.0;
++        sfp_t sum = sfp_t(0.0);
+ #pragma unroll
+         for (int i = 0; i < k; ++i) sum +=
+-            sycl::exp((double)sel_logit[i] - (double)mx);
+-        double cum = 0.0;
++            sycl::exp((sfp_t)sel_logit[i] - (sfp_t)mx);
++        sfp_t cum = sfp_t(0.0);
+         int cut = k;
+ #pragma unroll
+         for (int i = 0; i < k; ++i) {
+-            cum += sycl::exp((double)sel_logit[i] - (double)mx) / sum;
+-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
++            cum += sycl::exp((sfp_t)sel_logit[i] - (sfp_t)mx) / sum;
++            if (cum >= (sfp_t) p.top_p) { cut = i + 1; break; }
+         }
+         if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+         n_keep = cut;
+@@ -613,17 +614,17 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
+     float smx = scaled(0);
+ #pragma unroll
+     for (int i = 1; i < n_keep; ++i) smx = sycl::fmax(smx, scaled(i));
+-    double sum = 0.0;
++    sfp_t sum = sfp_t(0.0);
+ #pragma unroll
+     for (int i = 0; i < n_keep; ++i) sum +=
+-        sycl::exp((double)scaled(i) - (double)smx);
++        sycl::exp((sfp_t)scaled(i) - (sfp_t)smx);
+     const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+-    double cum = 0.0;
++    sfp_t cum = sfp_t(0.0);
+     int pick = sel_ids[n_keep - 1];
+ #pragma unroll
+     for (int i = 0; i < n_keep; ++i) {
+-        cum += sycl::exp((double)scaled(i) - (double)smx) / sum;
+-        if ((double) u < cum) { pick = sel_ids[i]; break; }
++        cum += sycl::exp((sfp_t)scaled(i) - (sfp_t)smx) / sum;
++        if ((sfp_t) u < cum) { pick = sel_ids[i]; break; }
+     }
+     if (item_ct1.get_local_id(2) == 0) out[t] = pick;
+ }
+@@ -689,7 +690,7 @@ __dpct_inline__ void warp_first(float &bv, int &bi) {
+ template <bool kProb = false>
+ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
+                               const SamplerParams &p, int t,
+-                              int *__restrict__ out, double *ex,
++                              int *__restrict__ out, sfp_t *ex,
+                               float *prob_out = nullptr) {
+     const int lane =
+         (int)(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_local_id(
+@@ -703,9 +704,9 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
+     if (p.top_p < 1.0f) {
+ #pragma unroll
+         for (int i = lane; i < k; i += 32)
+-            ex[i] = sycl::exp((double)sel_logit[i] - (double)mx);
++            ex[i] = sycl::exp((sfp_t)sel_logit[i] - (sfp_t)mx);
+         sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+-        double sum = 0.0;
++        sfp_t sum = sfp_t(0.0);
+         if (lane == 0)
+ #pragma unroll
+             for (int i = 0; i < k; ++i) sum += ex[i];
+@@ -725,11 +726,11 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
+         sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+         int cut = k;
+         if (lane == 0) {
+-            double cum = 0.0;
++            sfp_t cum = sfp_t(0.0);
+ #pragma unroll
+             for (int i = 0; i < k; ++i) {
+                 cum += ex[i];
+-                if (cum >= (double) p.top_p) { cut = i + 1; break; }
++                if (cum >= (sfp_t) p.top_p) { cut = i + 1; break; }
+             }
+         }
+         /*
+@@ -759,9 +760,9 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
+         smx = sycl::fmax(smx, sel_logit[i] * inv_t);
+ #pragma unroll
+     for (int i = lane; i < n_keep; i += 32)
+-        ex[i] = sycl::exp((double)(sel_logit[i] * inv_t) - (double)smx);
++        ex[i] = sycl::exp((sfp_t)(sel_logit[i] * inv_t) - (sfp_t)smx);
+     sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+-    double sum = 0.0;
++    sfp_t sum = sfp_t(0.0);
+     if (lane == 0)
+ #pragma unroll
+         for (int i = 0; i < n_keep; ++i) sum += ex[i];
+@@ -778,13 +779,13 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
+     sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
+     if (lane == 0) {
+         const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+-        double cum = 0.0;
++        sfp_t cum = sfp_t(0.0);
+         int pi = n_keep > 0 ? n_keep - 1 : 0;
+         int pick = sel_ids[pi];
+ #pragma unroll
+         for (int i = 0; i < n_keep; ++i) {
+             cum += ex[i];
+-            if ((double) u < cum) { pick = sel_ids[i]; pi = i; break; }
++            if ((sfp_t) u < cum) { pick = sel_ids[i]; pi = i; break; }
+         }
+         out[t] = pick;
+         if constexpr (kProb) *prob_out = n_keep > 0 ? (float) ex[pi] : 1.0f;
+@@ -859,7 +860,7 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
+         *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kSelMax]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     auto &ex =
+-        *sycl::ext::oneapi::group_local_memory_for_overwrite<double[kSelMax]>(
++        *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[kSelMax]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+@@ -1146,7 +1147,7 @@ sampler_split_merge_kernel(const sycl::int2 *__restrict__ cand, int n_blocks,
+         *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kSelMax]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     auto &ex =
+-        *sycl::ext::oneapi::group_local_memory_for_overwrite<double[kSelMax]>(
++        *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[kSelMax]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     const sycl::int2 *src = cand + (size_t)t * n_blocks * k;
+ #pragma unroll
+@@ -1247,7 +1248,7 @@ __dpct_inline__ void coupled_merge_kernel(
+         *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kSelMax]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     auto &ex =
+-        *sycl::ext::oneapi::group_local_memory_for_overwrite<double[kSelMax]>(
++        *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[kSelMax]>(
+             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+     auto &pick = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[1]>(
+         sycl::ext::oneapi::this_work_item::get_work_group<3>());
+diff --git a/sycl/src/kernels/cuda/shared_expert.dp.cpp b/sycl/src/kernels/cuda/shared_expert.dp.cpp
+index 6541051..c45688b 100644
+--- a/sycl/src/kernels/cuda/shared_expert.dp.cpp
++++ b/sycl/src/kernels/cuda/shared_expert.dp.cpp
+@@ -38,6 +38,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
++#include "strata/sycl_fp.hpp"
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -60,8 +61,8 @@ __dpct_inline__ void swiglu_kernel(const float *__restrict__ gate,
+     const int i = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+                   item_ct1.get_local_id(2);
+     if (i >= n) return;
+-    const double x = (double) gate[i];
+-    out[i] = (float)(x / (1.0 + sycl::exp(-x))) * up[i];
++    const sfp_t x = (sfp_t) gate[i];
++    out[i] = (float)(x / (sfp_t(1.0) + sycl::exp(-x))) * up[i];
+ }
+ 
+ __dpct_inline__ void native_swiglu_kernel(const float *gate, const float *up,
+@@ -111,7 +112,7 @@ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int
+ //
+ // A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
+ // 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
+-__dpct_inline__ double warp_sum_d(double v) {
++__dpct_inline__ sfp_t warp_sum_d(sfp_t v) {
+     /*
+ DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
+ masked sub_group function which may not be supported by all compilers or
+@@ -143,14 +144,14 @@ __dpct_inline__ void scalar_gate_kernel(const uint16_t *__restrict__ x_bf16,
+                                         const uint16_t *__restrict__ w_bf16,
+                                         float *__restrict__ out, int n_embd) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
++auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<sfp_t[8]>(
+     sycl::ext::oneapi::this_work_item::get_work_group<
+         3>()); // 8 warps: the launch is <<<1, 256>>>
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int i = item_ct1.get_local_id(2); i < n_embd;
+          i += item_ct1.get_local_range(2))
+-        acc += (double) f32_from_bf16(x_bf16[i]) * (double) f32_from_bf16(w_bf16[i]);
++        acc += (sfp_t) f32_from_bf16(x_bf16[i]) * (sfp_t) f32_from_bf16(w_bf16[i]);
+     item_ct1.barrier(sycl::access::fence_space::local_space);
+     const int lane = item_ct1.get_local_id(2) & 31,
+               warp = item_ct1.get_local_id(2) >> 5;
+@@ -161,10 +162,10 @@ auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
+     if (warp == 0) {
+         acc = (item_ct1.get_local_id(2) < nw)
+                   ? scratch[item_ct1.get_local_id(2)]
+-                  : 0.0;
++                  : sfp_t(0.0);
+         acc = warp_sum_d(acc);
+         if (item_ct1.get_local_id(2) == 0) out[0] =
+-            (float)(1.0 / (1.0 + sycl::exp(-acc)));
++            (float)(sfp_t(1.0) / (sfp_t(1.0) + sycl::exp(-acc)));
+     }
+ }
+ 
+@@ -204,12 +205,12 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
+     if (j >= n_embd) return;
+     // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
+     // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
+-    double acc = 0.0;
++    sfp_t acc = sfp_t(0.0);
+ #pragma unroll
+     for (int e = 0; e < k; ++e) acc +=
+-        (double)weights[e] * (double)parts[(size_t)e * n_embd + j];
++        (sfp_t)weights[e] * (sfp_t)parts[(size_t)e * n_embd + j];
+     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
+-    if (has_shared) acc += (double) shared[j];
++    if (has_shared) acc += (sfp_t) shared[j];
+     y[j] = (float) acc;
+ }
+ 
+-- 
+2.43.0
+

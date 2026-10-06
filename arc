@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# arc-moe: Qwen3.8-Flash-Next (Strata engine, SYCL) on 2x Intel Arc A770.
+#
+#   ./arc doctor            check the machine: GPUs, driver, ReBAR, PCIe, oneAPI, RAM, disk
+#   ./arc deps              install the GPU runtime, oneAPI (DPC++ + oneMKL), ocloc, build tools   (sudo)
+#   ./arc build             fetch Strata, apply the A770 patches, compile the engine AOT for acm-g10
+#   ./arc setup [opts]      download / adopt the model, image encoder, config; then start      (setup.py options)
+#   ./arc start             start the server (http://127.0.0.1:8080, OpenAI + Anthropic APIs)
+#   ./arc bench [opts]      measure prompt and decode speed through the API
+#   ./arc service           install a systemd unit that starts the server at boot              (sudo)
+#   ./arc check-fp64        prove the device code has no FP64 left (no GPU needed)
+#   ./arc all               deps + build + setup: everything, from a fresh Ubuntu
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")" && pwd)
+cmd=${1:-help}
+shift || true
+case "$cmd" in
+  doctor)     exec "$ROOT/scripts/doctor.sh" "$@" ;;
+  deps)       exec "$ROOT/scripts/install-deps.sh" "$@" ;;
+  build)      exec "$ROOT/scripts/build.sh" "$@" ;;
+  setup)      exec "$ROOT/scripts/setup-model.sh" "$@" ;;
+  start)      exec "$ROOT/scripts/start.sh" "$@" ;;
+  bench)      exec "$ROOT/scripts/bench.sh" "$@" ;;
+  service)    exec "$ROOT/scripts/install-service.sh" "$@" ;;
+  check-fp64) exec "$ROOT/scripts/check-fp64.sh" "$@" ;;
+  all)        "$ROOT/scripts/install-deps.sh" && "$ROOT/scripts/build.sh" && exec "$ROOT/scripts/setup-model.sh" "$@" ;;
+  help|-h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "unknown command: $cmd (./arc help)" >&2; exit 2 ;;
+esac

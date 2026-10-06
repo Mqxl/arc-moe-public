@@ -1,0 +1,4 @@
+[submodule "third_party/strata"]
+	path = third_party/strata
+	url = https://github.com/Niko1221/Strata
+	ignore = all

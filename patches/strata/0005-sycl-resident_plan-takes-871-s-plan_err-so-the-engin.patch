@@ -1,0 +1,79 @@
+From 93ebffa22c3fd989ce0597fff5e2c4e6ab12c051 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:24:38 +0000
+Subject: [PATCH 5/6] sycl: resident_plan takes #871's plan_err, so the engine
+ links
+
+6f7f680 (#871) gave resident_plan a 14th parameter (uint32_t* plan_err) in the
+shared include/strata/kernels/verify_kernels.hpp and in the CUDA kernel, but
+not in the SYCL copy: every call (the parameter has a default) resolves to the
+14-parameter declaration, which nothing defines, and the engine does not link.
+The SYCL definition now takes it, and the kernel follows #871 when there is no
+skip flag: an empty plan and the mapped error flag (with a system-scope fence)
+instead of a stale plan or a null store.
+---
+ sycl/src/kernels/cuda/verify_kernels.dp.cpp | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/verify_kernels.dp.cpp b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+index f3ca248..7d16003 100644
+--- a/sycl/src/kernels/cuda/verify_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+@@ -931,7 +931,17 @@ __dpct_inline__ void resident_plan_kernel(
+     const int32_t *__restrict__ res, int n_expert, const uint8_t *cache_base,
+     const unsigned long long *slot_off, long long blob,
+     int32_t *__restrict__ pl, long long capx, uint32_t *skip, uint32_t ring,
+-    const unsigned long long *__restrict__ mir, bool par) {
++    const unsigned long long *__restrict__ mir, bool par, uint32_t *plan_err) {
++    // #871 (ported by arc-moe): without `skip` (the all-resident graph) there is no host plan to fall back on - an
++    // empty plan, so no expert runs on a stale pointer, and the mapped error flag for the host
++    auto refuse = [&]() {
++        if (skip != nullptr) { *skip = 0; return; }
++        pl[0] = 0; pl[1] = 0; pl[2] = 0;
++        if (plan_err != nullptr) {
++            *(volatile uint32_t *) plan_err = 1;
++            sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
++        }
++    };
+ #if STRATA_PLAN_LOCAL
+     // SYCL port: the host's exact loop, but over a local copy of the ids and their slots. One thread reading global
+     // memory for every compare (n^2 of them) took 87 us per layer on the B70 - 4% of a decode round; a work-group
+@@ -955,7 +965,7 @@ __dpct_inline__ void resident_plan_kernel(
+         if (!valid || (sl < 0 && ma == 0)) s_bad = 1;
+     }
+     item.barrier(sycl::access::fence_space::local_space);
+-    if (s_bad || n > 64) { if (tid == 0) *skip = 0; return; }   // n > 64 never happens (kVerifyMaxT * 10 = 60); refuse rather than read past
++    if (s_bad || n > 64) { if (tid == 0) refuse(); return; }   // n > 64 never happens (kVerifyMaxT * 10 = 60); refuse rather than read past
+     if (par) {
+         // SYCL port: the grouping in parallel, one thread per entry (unitrace: thread 0 alone took 73 us per layer,
+         // ~3.5 ms of a decode round). The plan is the host loop's exactly: groups in order of first occurrence,
+@@ -1012,7 +1022,7 @@ __dpct_inline__ void resident_plan_kernel(
+     // the original: one thread, the host's exact loop over global memory
+     for (int i = 0; i < n; ++i) {
+         const int32_t e = ids[i];
+-        if (e < 0 || e >= n_expert || res[e] < 0) { *skip = 0; return; }
++        if (e < 0 || e >= n_expert || res[e] < 0) { refuse(); return; }
+     }
+ #endif
+ #if !STRATA_PLAN_LOCAL
+@@ -1120,7 +1130,7 @@ void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mi
+ }
+ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+-                   long long capx, uint32_t* skip, uint32_t ring, void* stream) {
++                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
+     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
+     if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
+         mir = g_mirror_table + (res_layer - g_mirror_res);
+@@ -1135,7 +1145,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
+                 exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                     resident_plan_kernel(ids, n_entries, k, res_layer, n_expert,
+                                          cache_base, slot_off, blob, plan, capx,
+-                                         skip, ring, mir, par);
++                                         skip, ring, mir, par, plan_err);
+                 });
+     }
+     check("resident_plan");
+-- 
+2.43.0
+

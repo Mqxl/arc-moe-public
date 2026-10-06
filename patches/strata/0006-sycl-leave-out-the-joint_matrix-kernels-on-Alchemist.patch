@@ -1,0 +1,95 @@
+From eceb7b56258db4083f3c206a7d496e924be43ead Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:26:16 +0000
+Subject: [PATCH 6/6] sycl: leave out the joint_matrix kernels on Alchemist
+
+qsa_prompt_attn_xmx (6 instances) and xmx_gemm_iq use 16x16x16 FP16
+joint_matrix tiles, Xe2's DPAS shape. Alchemist's DPAS is 8x8x16 for FP16, and
+IGC (2.11, oneAPI 2026.1.1) dies on all 7 device modules for acm-g10 with
+"Internal Compiler Error: Floating point exception" - the AOT link of the
+engine fails. Both kernels are opt-in (STRATA_PROMPT_ATTN_XMX, the xmx bench)
+and slower than their fallbacks even on the B70, so STRATA_SYCL_NO_XMX (ON by
+default for Alchemist targets) builds them as stubs that return false: the
+callers take the FP32 attention and the dequantize + oneMKL GEMM, as without
+the opt-in.
+---
+ sycl/CMakeLists.txt                            |  6 ++++++
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp        |  6 ++++++
+ .../kernels/cuda/qsa_prompt_attn_xmx.dp.cpp    | 18 ++++++++++++++++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index b5b2879..a49a50d 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -32,6 +32,12 @@ option(STRATA_SYCL_NO_FP64 "Device code without FP64 (required on Arc A-series /
+ if(STRATA_SYCL_NO_FP64)
+   add_compile_definitions(STRATA_SYCL_NO_FP64=1)
+ endif()
++# The opt-in XMX kernels (qsa_prompt_attn_xmx, xmx_gemm_iq) use 16x16x16 FP16 joint_matrix tiles, Xe2's shape;
++# Alchemist's DPAS is 8x8x16 and IGC crashes on them for acm-g10. Off by default on Alchemist (the callers fall back).
++option(STRATA_SYCL_NO_XMX "Leave out the joint_matrix kernels (required on Arc A-series / Alchemist)" ${_strata_alchemist})
++if(STRATA_SYCL_NO_XMX)
++  add_compile_definitions(STRATA_SYCL_NO_XMX=1)
++endif()
+ # The expert cache is ONE device allocation of 10-15 GB. IGC may otherwise assume every buffer is below 4 GB and
+ # address it with 32-bit offsets; this option makes it keep 64-bit (stateless) addressing for every kernel.
+ set(_strata_igc_opts "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index cecfcd8..08bee42 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2594,6 +2594,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+ }
+ 
+ 
++#if !defined(STRATA_SYCL_NO_XMX)   // arc-moe: 16x16x16 FP16 joint_matrix crashes IGC for Alchemist (acm-g10)
+ // ================================================================ SYCL port: XMX GEMM straight from the quantized rows
+ //
+ // The prompt path dequantizes every routed expert to FP16 (8 MB written, then read back by oneMKL) before its GEMMs:
+@@ -2749,4 +2750,9 @@ bool xmx_gemm_iq(int ty, const void* gate, const void* up, int64_t K, int n_out,
+     });
+     return true;
+ }
++#else
++bool xmx_gemm_iq(int, const void*, const void*, int64_t, int, const uint16_t*, int, float*, int64_t, void*) {
++    return false;   // the caller's dequantize + oneMKL path
++}
++#endif  // STRATA_SYCL_NO_XMX
+ }  // namespace strata::kernels
+diff --git a/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp b/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp
+index 15516ee..b396a3a 100644
+--- a/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp
+@@ -25,6 +25,23 @@
+ #include <cstdio>
+ #include <cstdlib>
+ 
++#if defined(STRATA_SYCL_NO_XMX)
++// arc-moe: Alchemist's DPAS takes M <= 8, N = 8, K = 16 for FP16; these 16x16x16 tiles crash IGC for acm-g10
++// ("Internal Compiler Error: Floating point exception"). The kernel is opt-in and slower than the fallback even on
++// the B70, so an Alchemist build leaves it out: the caller's FP32 path runs.
++namespace strata::kernels {
++bool qsa_prompt_attn_xmx(const float*, const QsaAttnPools&, const int32_t*, const int32_t*, int64_t, const QsaShapes&,
++                         float*, int64_t, void*) {
++    static const bool asked = std::getenv("STRATA_PROMPT_ATTN_XMX") && std::atoi(std::getenv("STRATA_PROMPT_ATTN_XMX"));
++    static bool told = false;
++    if (asked && !told) {
++        told = true;
++        std::fprintf(stderr, "strata: STRATA_PROMPT_ATTN_XMX ignored - this build has no XMX kernels (Arc A-series)\n");
++    }
++    return false;
++}
++}  // namespace strata::kernels
++#else
+ namespace strata::kernels {
+ namespace {
+ namespace jm = sycl::ext::oneapi::experimental::matrix;
+@@ -383,3 +400,4 @@ bool qsa_prompt_attn_xmx(const float* q, const QsaAttnPools& pools, const int32_
+                 : dispatch<32>(q, pools, ids, steps, cap, s, attn, n_q, st);
+ }
+ }  // namespace strata::kernels
++#endif  // STRATA_SYCL_NO_XMX
+-- 
+2.43.0
+

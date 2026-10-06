@@ -1,0 +1,234 @@
+From 8287366c53e8d8155c79d9b4262f8d26bf6892d7 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:19:52 +0000
+Subject: [PATCH 3/6] sycl setup: native runner, CPU image encoder, every Arc
+ in the layer split
+
+- STRATA_SYCL_NATIVE (default when the strata-sycl-dev image is absent):
+  serve/strata-sycl-native.sh sources oneAPI and runs the engine on the host;
+  host paths in the config; the Arc switches in its "env" (device plan,
+  NO_HOST=auto, stager threads, Sysman, relaxed >4 GB allocations, the
+  device selector, the split's mirror pricing).
+- Images: setup's CPU encoder build (tools/vision, #304) into engine-sycl/,
+  and the config keeps its "vision" section; --vision cpu by default.
+- Two or more Arcs: --gpus with all of them (layers split, auto).
+- VRAM reserve 1536 MiB up to 32K.
+
+The device selector "arc" is resolved by the runner to the discrete Arcs as
+Level Zero numbers them, so an Intel CPU's integrated GPU never takes a
+card's place in the split.
+---
+ sycl/serve/strata-sycl-native.sh | 29 ++++++++++
+ sycl/setup_intel.py              | 94 +++++++++++++++++++++++++++++---
+ 2 files changed, 115 insertions(+), 8 deletions(-)
+ create mode 100755 sycl/serve/strata-sycl-native.sh
+
+diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
+new file mode 100755
+index 0000000..d7f047f
+--- /dev/null
++++ b/sycl/serve/strata-sycl-native.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++# strata-sycl-native.sh (arc-moe): the SYCL engine as serve/server.py's `exe`, run on the host - no Docker.
++# The serve protocol is lines on stdin/stdout; stderr goes to the server's log. The config's "env" carries the
++# Arc switches (sycl/setup_intel.py: arc_env); this only makes the oneAPI runtime findable and execs the binary.
++#   STRATA_SYCL_BIN   the engine binary (default: build-sycl-aot/strata in this checkout)
++#   ONEAPI_ROOT       where oneAPI is installed (default: /opt/intel/oneapi)
++here=$(cd "$(dirname "$0")/../.." && pwd)
++bin=${STRATA_SYCL_BIN:-$here/build-sycl-aot/strata}
++case "$bin" in /*) ;; *) bin=$here/$bin ;; esac
++if [ -z "${SETVARS_COMPLETED:-}" ]; then
++    # setvars.sh trips over `set -u` (OCL_ICD_FILENAMES: unbound variable, oneAPI 2026.1): source it before any set -u
++    # shellcheck disable=SC1091
++    . "${ONEAPI_ROOT:-/opt/intel/oneapi}/setvars.sh" --force >/dev/null 2>&1 || {
++        echo "strata-sycl-native: cannot source ${ONEAPI_ROOT:-/opt/intel/oneapi}/setvars.sh" >&2; exit 127; }
++fi
++set -euo pipefail
++if [ "${ONEAPI_DEVICE_SELECTOR:-}" = arc ]; then
++    # the discrete Arcs only, as Level Zero numbers them: an Intel CPU's integrated GPU (UHD, or an integrated
++    # "Arc(TM) Graphics") would otherwise be level_zero:0 and take a card's place in the layer split
++    unset ONEAPI_DEVICE_SELECTOR
++    ids=$(sycl-ls 2>/dev/null | sed -nE 's/^\[level_zero:gpu\]\[level_zero:([0-9]+)\].*Arc\(TM\) (Pro )?[AB][0-9]{2,3}.*/\1/p' | paste -sd, -)
++    if [ -n "$ids" ]; then export ONEAPI_DEVICE_SELECTOR="level_zero:$ids"; fi
++    echo "strata-sycl-native: discrete Arc GPUs: ${ONEAPI_DEVICE_SELECTOR:-none found, all devices visible}" >&2
++fi
++: "${SYCL_CACHE_PERSISTENT:=0}" "${ZES_ENABLE_SYSMAN:=1}" "${UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS:=1}"
++export SYCL_CACHE_PERSISTENT ZES_ENABLE_SYSMAN UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS
++[ -x "$bin" ] || { echo "strata-sycl-native: no engine at $bin (scripts/build.sh)" >&2; exit 127; }
++cd "$here"
++exec "$bin" "$@"
+diff --git a/sycl/setup_intel.py b/sycl/setup_intel.py
+index 0b1e2f0..674e6a1 100644
+--- a/sycl/setup_intel.py
++++ b/sycl/setup_intel.py
+@@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT))
+ import setup as S  # noqa: E402
+ 
+ SYCL_WRAPPER = ROOT / "sycl" / "serve" / "strata-sycl.sh"
++NATIVE_WRAPPER = ROOT / "sycl" / "serve" / "strata-sycl-native.sh"   # arc-moe: the engine on the host, no Docker
+ SYCL_IMAGE = "strata-sycl-dev"
++ENGINE_DIR = ROOT / "engine-sycl"                    # arc-moe: BUILD.json and the CPU image encoder (strata-vision)
+ SERVER = ROOT / "sycl" / "serve" / "server_intel.py"
+ MOUNT = Path(os.environ.get("STRATA_SYCL_ROOT") or ROOT.parent)   # what strata-sycl.sh mounts at /work
+ 
+@@ -78,13 +80,32 @@ def intel_gpus():
+     return found
+ 
+ 
++def native() -> bool:
++    """arc-moe: run the engine on the host (oneAPI installed natively) instead of in the strata-sycl-dev image.
++    STRATA_SYCL_NATIVE=1 forces it, =0 forces Docker; unset: native unless the Docker image exists."""
++    v = os.environ.get("STRATA_SYCL_NATIVE")
++    if v is not None:
++        return v not in ("", "0", "no")
++    if not shutil.which("docker"):
++        return True
++    return subprocess.run(["docker", "image", "inspect", SYCL_IMAGE], capture_output=True).returncode != 0
++
++
+ def sycl_engine():
+     """The SYCL build: (binary, why-not)."""
+     if S.WIN:
+         return None, "the SYCL port runs on Linux only"
+-    exe = next((b for b in (ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata") if b.exists()), None)
++    bins = [ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata", ROOT / "build-sycl" / "sycl" / "strata"]
++    if os.environ.get("STRATA_SYCL_BIN"):
++        b = Path(os.environ["STRATA_SYCL_BIN"])
++        bins.insert(0, b if b.is_absolute() else ROOT / b)
++    exe = next((b for b in bins if b.exists()), None)
+     if exe is None:
+         return None, "it is not built (sycl/tools/build.sh; docs/INTEL.md)"
++    if native():
++        if not Path("/opt/intel/oneapi/setvars.sh").exists() and not os.environ.get("ONEAPI_ROOT"):
++            return None, "the oneAPI runtime is not installed (/opt/intel/oneapi/setvars.sh)"
++        return exe, None
+     if not shutil.which("docker"):
+         return None, "docker is not installed (the engine runs in the oneAPI image)"
+     if subprocess.run(["docker", "image", "inspect", SYCL_IMAGE], capture_output=True).returncode != 0:
+@@ -96,6 +117,8 @@ def sycl_path(path) -> str:
+     """A host path as the engine's container sees it: the folder above the Strata checkout (or STRATA_SYCL_ROOT) is
+     mounted at /work."""
+     p, root = Path(path).resolve(), MOUNT.resolve()
++    if native():                                         # arc-moe: no container, the host's own paths
++        return str(p)
+     try:
+         return "/work/" + p.relative_to(root).as_posix()
+     except ValueError:
+@@ -118,6 +141,22 @@ def drop(args, name, value=False):
+         del args[i:i + 1 + int(value)]
+ 
+ 
++def arc_env(cfg: dict, n_gpus: int) -> dict:
++    """arc-moe: the engine's run-time switches for an Arc, natively (strata-sycl.sh sets the first three in Docker).
++    STRATA_VERIFY_NO_HOST=auto: the engine turns the host-free window on only when every expert is in VRAM or in the
++    pinned mirror (it is the path that hung on small cards when an expert was neither)."""
++    env = {"STRATA_VERIFY_DEVICE_PLAN": "1", "STRATA_VERIFY_NO_HOST": "auto", "STRATA_STAGER_THREADS": "12",
++           "SYCL_CACHE_PERSISTENT": "0",                 # the persistent JIT cache crashed (an AOT build does not JIT)
++           "ZES_ENABLE_SYSMAN": "1",                     # free-VRAM queries through Level Zero Sysman
++           "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1",   # the expert cache is one 10-15 GB allocation (> 4 GB)
++           # "arc": strata-sycl-native.sh resolves it to the discrete Arcs (never the CPU's integrated GPU)
++           "ONEAPI_DEVICE_SELECTOR": "arc"}
++    if n_gpus > 1:
++        # the split search prices CUDA0's misses as mirror reads: the later card keeps its layers whole
++        env["STRATA_SPLIT_MIRROR_MS"] = "25"
++    return env
++
++
+ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
+     GGUF into VRAM (every expert must fit, so the VRAM reserve is the smallest that leaves the KV and the prompt
+@@ -139,10 +178,20 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+         args += ["--kv-resident", "32768"]
+         S.ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram:.1f} GB), every expert stays in VRAM")
+     drop(args, "--vram-reserve-mib", True)
+-    args += ["--stream-experts", "--vram-reserve-mib", "1024" if ctx <= 32768 else "2048"]
++    # arc-moe: 1.5 GB kept free up to 32K (the i915/xe drivers move buffers to RAM when VRAM runs out)
++    args += ["--stream-experts", "--vram-reserve-mib", "1536" if ctx <= 32768 else "2048"]
+     if ctx > 32768:                                     # long contexts: 4096-token chunks keep the prompt buffers small
+         drop(args, "--prefill", True)
+         args += ["--prefill", "4096"]
++    gl = cfg.get("gpu")
++    n_gpus = len(gl) if isinstance(gl, list) else 1
++    if native():                                        # arc-moe: the host runs the engine and the image encoder
++        out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "gpus")}
++        out.update({"backend": "sycl", "exe": str(NATIVE_WRAPPER), "args": args})
++        env = {"STRATA_SYCL_BIN": str(exe.resolve()), **arc_env(cfg, n_gpus)}
++        out["env"] = env
++        out.update(keep)
++        return out
+     out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "vision", "gpus")}
+     out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
+     env = {}
+@@ -150,6 +199,8 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+         env["STRATA_SYCL_BIN"] = str(exe.relative_to(ROOT))
+     if MOUNT.resolve() != ROOT.parent.resolve():
+         env["STRATA_SYCL_ROOT"] = str(MOUNT)
++    if n_gpus > 1:
++        env["ONEAPI_DEVICE_SELECTOR"] = "level_zero:*"
+     if env:
+         out["env"] = env
+     out.update(keep)
+@@ -176,9 +227,24 @@ def install(argv) -> None:
+             keep[p.name] = {k: c[k] for k in ("model_switcher", "sampling") if k in c}
+         except (OSError, ValueError):
+             pass
+-    stub = Path(tempfile.mkdtemp(prefix="strata-sycl-"))  # setup reads the engine's BUILD.json; the SYCL build has none
+-    atexit.register(shutil.rmtree, stub, True)
+-    (stub / "BUILD.json").write_text(json.dumps({"version": sycl_version(), "source": "local", "lib_dirs": []}))
++    if native():                                        # arc-moe: a lasting engine folder (the image encoder lives there)
++        stub = ENGINE_DIR
++        stub.mkdir(exist_ok=True)
++    else:
++        stub = Path(tempfile.mkdtemp(prefix="strata-sycl-"))  # setup reads the engine's BUILD.json; the SYCL build has none
++        atexit.register(shutil.rmtree, stub, True)
++    stamp = stub / "BUILD.json"
++    old_meta = json.loads(stamp.read_text()) if stamp.exists() else {}
++    stamp.write_text(json.dumps({**{k: v for k, v in old_meta.items() if k.startswith("vision")},
++                                 "version": sycl_version(), "source": "local", "lib_dirs": []}))
++
++    def build_engine_sycl(gpu, llama, vision="none"):
++        """arc-moe: the SYCL engine is built by scripts/build.sh; what setup still compiles is the CPU image encoder
++        (tools/vision, llama.cpp's mtmd) - the HIP path's #304 build, beside the SYCL engine."""
++        if vision == "cpu" and native():
++            meta = json.loads(stamp.read_text())
++            return S.build_vision_cpu(stub, stamp, meta, llama, S.source_hash(S.VISION_SOURCES))
++        return stub
+ 
+     say = S.say
+     fake_ram = max(real_ram, 1024.0)
+@@ -201,8 +267,18 @@ def install(argv) -> None:
+     S.gpus = lambda *a, **k: []
+     S.amd_gpus = lambda *a, **k: intel
+     S.amd_problem = lambda g: None
+-    S.hip_vision = lambda asked: "none"                 # images are not wired on the SYCL port yet
+-    S.build_engine_hip = lambda *a, **k: stub
++    def sycl_vision(asked) -> str:
++        """arc-moe: images through the CPU encoder (the engine side, --vision and GENI, is in the SYCL port). The
++        encoder on the CPU keeps all of both cards' VRAM for experts; a picture costs ~3 s on 8 cores."""
++        if not native():
++            return "none"                               # the Docker runner has no image encoder
++        if asked in ("yes", "gpu", "cpu"):
++            if asked == "gpu":
++                S.warn("images on an Arc are read by the CPU image encoder (no SYCL encoder build yet)")
++            return "cpu"
++        return "none"
++    S.hip_vision = sycl_vision
++    S.build_engine_hip = build_engine_sycl
+     S.hipblaslt_table = lambda *a, **k: None
+     S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
+ 
+@@ -232,7 +308,9 @@ def install(argv) -> None:
+     if "--backend" not in argv:
+         sys.argv += ["--backend", "hip"]
+     if "--vision" not in argv:
+-        sys.argv += ["--vision", "none"]
++        sys.argv += ["--vision", "cpu" if native() else "none"]   # arc-moe: images on by default (CPU encoder)
++    if "--gpus" not in argv and "--gpu" not in argv and len(intel) > 1:
++        sys.argv += ["--gpus", ",".join(str(g["index"]) for g in intel)]   # arc-moe: every Arc, layers split
+     if "--low-ram" not in argv:
+         sys.argv += ["--low-ram", "off"]
+     sys.exit(S.main())
+-- 
+2.43.0
+

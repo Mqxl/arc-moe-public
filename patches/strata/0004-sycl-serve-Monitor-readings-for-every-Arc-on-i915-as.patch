@@ -1,0 +1,65 @@
+From 4c009fb293245b6bfce715bb4056cc5ce499e8c7 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:19:52 +0000
+Subject: [PATCH 4/6] sycl serve: Monitor readings for every Arc, on i915 as
+ well as xe
+
+The xe reader took the first card with tile0/ for every index, so a layer
+split showed one card twice and the Arc A-series (i915 by default) showed
+none. It now takes the index-th Intel discrete card on xe or i915, and reads
+i915's unlabelled temp1 and power1_max.
+---
+ sycl/serve/xe_telemetry.py | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/sycl/serve/xe_telemetry.py b/sycl/serve/xe_telemetry.py
+index 3eb3b61..bf7fe9f 100644
+--- a/sycl/serve/xe_telemetry.py
++++ b/sycl/serve/xe_telemetry.py
+@@ -21,13 +21,21 @@ class _XeGpu:
+     def __init__(self, index=0):
+         import glob
+         self.dev = None
++        # arc-moe: the index-th Intel discrete card, on xe (tile0/) or i915 (the Arc A-series' default driver; the
++        # integrated GPU at 00:02.0 is not one), so a layer split's second card has its own readings too
++        cards = []
+         for d in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
+             try:
+-                if open(f"{d}/vendor").read().strip() == "0x8086" and os.path.isdir(f"{d}/tile0"):
+-                    self.dev = os.path.realpath(d)
+-                    break
++                real = os.path.realpath(d)
++                drv = os.path.basename(os.path.realpath(f"{d}/driver")) if os.path.exists(f"{d}/driver") else ""
++                if open(f"{d}/vendor").read().strip() != "0x8086" or real in cards:
++                    continue
++                if os.path.isdir(f"{d}/tile0") or (drv == "i915" and not os.path.basename(real).startswith("0000:00:02.")):
++                    cards.append(real)
+             except OSError:
+                 continue
++        if 0 <= index < len(cards):
++            self.dev = cards[index]
+         self.hwmon = None
+         for n in glob.glob(f"{self.dev}/hwmon/hwmon*/name") if self.dev else []:
+             self.hwmon = os.path.dirname(n)
+@@ -89,6 +97,9 @@ class _XeGpu:
+                     if lab.endswith("_label") and self._rd(f"{self.hwmon}/{lab}") == "pkg":
+                         v = self._rd(f"{self.hwmon}/{lab[:-6]}_input")
+                         out["temp"] = int(v) / 1000 if v else None
++                if out.get("temp") is None:             # i915: an unlabelled temp1
++                    v = self._rd(f"{self.hwmon}/temp1_input")
++                    out["temp"] = int(v) / 1000 if v and v.isdigit() else None
+             if out.get("power") is None:
+                 e, t = self._rd(f"{self.hwmon}/energy1_input"), time.time()
+                 if e and e.isdigit():
+@@ -96,7 +107,7 @@ class _XeGpu:
+                         out["power"] = (int(e) - self._e[1]) / 1e6 / (t - self._e[0])
+                     self._e = (t, int(e))
+             if out.get("power_limit") is None:
+-                cap = self._rd(f"{self.hwmon}/power1_cap")
++                cap = self._rd(f"{self.hwmon}/power1_cap") or self._rd(f"{self.hwmon}/power1_max")   # xe / i915
+                 out["power_limit"] = int(cap) / 1e6 if cap and cap.isdigit() and int(cap) > 0 else None
+         out["pcie_gen"], out["pcie_gen_max"], out["pcie_width"] = self._link()
+         out["pcie_rx_mb"] = out["pcie_tx_mb"] = None    # xe exposes no PCIe traffic counters
+-- 
+2.43.0
+
