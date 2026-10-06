@@ -185,7 +185,7 @@ flag with a system-scope fence, instead of a null store.
 | FP64 scan of the device code, `STRATA_SYCL_NO_FP64=ON` | 0 instructions |
 | Every per-kernel SPIR-V module through `ocloc -device acm-g10` | 994 of 1001 before patch 6; the 7 failures are exactly the `joint_matrix` modules |
 | Host link of the engine | fails at `a5682fe` (#871 drift); links with patch 5 |
-| AOT build of `strata` for `acm-g10` with all 6 patches | see the end of this table |
+| AOT build of `strata` for `acm-g10` with all 6 patches | **links**: 994 device modules built by IGC for acm-g10, 0 compiler errors (the 7 XMX modules are stubs now), 16 min on 4 cores; the 102 MB binary runs (`--help`) |
 | A tiny double kernel: `acm-g10` fails, `bmg-g21` builds | reproduced |
 | Run on an A770 | **not yet**: no Arc in the build machine. `./arc bench` reports the real numbers |
 | Kernel parity tests (`ARC_PARITY=ON`, `ctest`) on an A770 | not yet. Expect the tight-tolerance ones that compare against float64 references to report ulp differences |
