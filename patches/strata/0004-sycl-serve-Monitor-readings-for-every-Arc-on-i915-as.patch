@@ -1,4 +1,4 @@
-From 4c009fb293245b6bfce715bb4056cc5ce499e8c7 Mon Sep 17 00:00:00 2001
+From 89979c22f2e194fd0b56924943348828233a4a68 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:19:52 +0000
 Subject: [PATCH 4/6] sycl serve: Monitor readings for every Arc, on i915 as

@@ -66,7 +66,8 @@ for b in "${bdfs[@]}"; do
 done
 if [ "$n_a770" -ge 2 ]; then ok "${n_a770}x Arc A770: the layers are split across them (32 GB of VRAM together)"
 elif [ "$n_a770" -eq 1 ]; then wrn "one A770: IQ2_XS mirrors more than half of its experts in RAM (slower); the Coder fits better"; fi
-if id -nG | tr ' ' '\n' | grep -qx render; then ok "user $(id -un) is in the render group"
+if [ "$(id -u)" -eq 0 ]; then ok "running as root (/dev/dri is open to it)"
+elif id -nG | tr ' ' '\n' | grep -qx render; then ok "user $(id -un) is in the render group"
 else blk "user $(id -un) is not in the 'render' group: sudo usermod -aG render,video $(id -un), then log in again"; fi
 
 step "Compute runtime and oneAPI"

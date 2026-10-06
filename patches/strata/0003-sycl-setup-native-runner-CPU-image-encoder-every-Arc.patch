@@ -1,4 +1,4 @@
-From 8287366c53e8d8155c79d9b4262f8d26bf6892d7 Mon Sep 17 00:00:00 2001
+From 55dc6f3218a73d81a5702c0d230704a55d5c202b Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:19:52 +0000
 Subject: [PATCH 3/6] sycl setup: native runner, CPU image encoder, every Arc
@@ -18,9 +18,9 @@ The device selector "arc" is resolved by the runner to the discrete Arcs as
 Level Zero numbers them, so an Intel CPU's integrated GPU never takes a
 card's place in the split.
 ---
- sycl/serve/strata-sycl-native.sh | 29 ++++++++++
- sycl/setup_intel.py              | 94 +++++++++++++++++++++++++++++---
- 2 files changed, 115 insertions(+), 8 deletions(-)
+ sycl/serve/strata-sycl-native.sh |  29 +++++++++
+ sycl/setup_intel.py              | 102 ++++++++++++++++++++++++++++---
+ 2 files changed, 121 insertions(+), 10 deletions(-)
  create mode 100755 sycl/serve/strata-sycl-native.sh
 
 diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
@@ -59,7 +59,7 @@ index 0000000..d7f047f
 +cd "$here"
 +exec "$bin" "$@"
 diff --git a/sycl/setup_intel.py b/sycl/setup_intel.py
-index 0b1e2f0..674e6a1 100644
+index 0b1e2f0..98c1c0a 100644
 --- a/sycl/setup_intel.py
 +++ b/sycl/setup_intel.py
 @@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT))
@@ -197,7 +197,28 @@ index 0b1e2f0..674e6a1 100644
  
      say = S.say
      fake_ram = max(real_ram, 1024.0)
-@@ -201,8 +267,18 @@ def install(argv) -> None:
+@@ -186,23 +252,37 @@ def install(argv) -> None:
+     def say_intel(msg=""):
+         """setup's words for its AMD path and its RAM rule, said for the Intel card."""
+         msg = str(msg).replace("(AMD, experimental: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
++        msg = msg.replace("(AMD: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
+         msg = msg.replace("Your AMD GPUs:", "Your Intel GPUs:").replace("just run ./setup.sh", "just run sycl/setup_intel.py")
+         msg = msg.replace(f"RAM: {fake_ram:.0f} GB", f"RAM: {real_ram:.0f} GB (the experts are streamed into VRAM)")
+         if re.match(r"\s+\S+\s+needs ~\d+ GB RAM:", msg):   # --check's CUDA verdicts: replaced by the Intel one
+             m = msg.split()[0]
+             d = S.MODELS.get(m, {})
+             shard1 = d.get("download_gb", 0) - 28.8          # all but the per-layer lookup table (read from disk)
+-            room = intel[0]["vram_gb"] - 3 + max(0.0, real_ram - 10)   # VRAM, plus a pinned host mirror
++            # arc-moe: every Arc's VRAM when the layers are split across them (1.5 GB kept free on each)
++            cards = intel if len(intel) > 1 else intel[:1]
++            vram = sum(g["vram_gb"] - 1.5 for g in cards)
++            room = vram - 1.5 + max(0.0, real_ram - 10)   # VRAM, plus a pinned host mirror
+             msg = (f"  {m:8s} ~{shard1:.0f} GB of weights: " +
+-                   ("fits in VRAM" if shard1 <= intel[0]["vram_gb"] - 1.5 else
++                   ("fits in VRAM" if shard1 <= vram else
+                     "fits with part of its experts mirrored in RAM (slower)" if shard1 <= room else "does not fit"))
+         say(msg)
+     S.say = say_intel
      S.gpus = lambda *a, **k: []
      S.amd_gpus = lambda *a, **k: intel
      S.amd_problem = lambda g: None
@@ -218,7 +239,7 @@ index 0b1e2f0..674e6a1 100644
      S.hipblaslt_table = lambda *a, **k: None
      S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
  
-@@ -232,7 +308,9 @@ def install(argv) -> None:
+@@ -232,7 +312,9 @@ def install(argv) -> None:
      if "--backend" not in argv:
          sys.argv += ["--backend", "hip"]
      if "--vision" not in argv:
