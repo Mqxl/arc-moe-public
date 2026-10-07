@@ -202,6 +202,21 @@ These came from the first runs on the target machine (2x A770 16 GB, i915, 48 GB
   `./arc probe` checks this hypothesis in a minute: it launches the same 384 x 256 gather on every GPU, both ways, plus
   a kernel that reads pinned host memory.
 
+- **`./arc probe` ruled the cooperative path out.** Ordinary and cooperative launches both work on both cards.
+  The real cue was in the engine's own log: `layer split, CUDA1: 15.11 GiB free of 15.11`, printed when GPU 1
+  already held its layers' weights, the LM head, the session and the 839 MiB drafter. GPU 0 also read 15.11 free
+  after loading 1.47 GiB. The free-VRAM query (`ext_intel_free_memory`, Level Zero Sysman) asks i915 for the
+  region's `unallocated_size`, and i915 hides that from a process without `CAP_PERFMON`, so it answers with the
+  probed size. Every free-memory query said "all free", the caches were sized for empty cards, and GPU 1 ended up
+  overcommitted. i915 lets that happen, because local memory is backed lazily, and then fails the first execution
+  that needs it all resident: the first kernel on GPU 1, `gather_rows`, with `UR_RESULT_ERROR_OUT_OF_HOST_MEMORY`.
+  The probe's kernels did not show it because they allocate little. The B60s ran on `xe`, where the query works.
+
+  Patch 10: `dpct::device_ext::get_memory_info` also reads `/proc/self/fdinfo` (`drm-pdev`, `drm-total-local*`
+  on i915, `drm-total-vram*` on xe). The kernel prints these per DRM client, and a process can always read its
+  own. Free memory becomes the smaller of the driver's answer and "total minus what this process holds".
+  `./arc probe` now prints both numbers with 2 GiB allocated on each card.
+
 ## What was verified here, and what was not
 
 | Check | Status |

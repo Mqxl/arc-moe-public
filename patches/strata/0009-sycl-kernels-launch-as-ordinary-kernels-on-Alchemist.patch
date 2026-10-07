@@ -1,8 +1,8 @@
-From a3278dc692e0f7a6069ef1c79e15977216f35f0d Mon Sep 17 00:00:00 2001
+From 18e48878364eb834a36fd06b2af200bb47b1d150 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 07:18:32 +0000
-Subject: [PATCH 9/9] sycl: kernels launch as ordinary kernels on Alchemist (no
- use_root_sync)
+Subject: [PATCH 09/10] sycl: kernels launch as ordinary kernels on Alchemist
+ (no use_root_sync)
 
 dpct gave all 318 kernel launches sycl::ext::oneapi::experimental::
 use_root_sync, which makes DPC++ submit them as cooperative kernels

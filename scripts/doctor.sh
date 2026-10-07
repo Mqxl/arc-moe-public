@@ -41,6 +41,13 @@ for b in "${bdfs[@]}"; do
     case "$id" in 56a0) name="Arc A770"; n_a770=$((n_a770 + 1)) ;; 56a1) name="Arc A750" ;; 56a2) name="Arc A580" ;; 56a5|56a6) name="Arc A380/A310" ;; esac
     say "  ${B}$b${N}  $name [8086:$id]  driver: $drv"
     case "$drv" in i915|xe) ok "kernel driver $drv" ;; *) blk "no i915/xe driver bound (kernel too old, or i915.force_probe=$id needed)" ;; esac
+    if [ "$drv" = i915 ]; then
+        # the engine sizes its caches from the VRAM it holds per /proc/self/fdinfo (drm-total-local*): i915 hides
+        # the free size from unprivileged processes, and prints per-client memory stats only on newer kernels
+        kv=$(uname -r | cut -d. -f1-2); kmaj=${kv%%.*}; kmin=${kv#*.}; kmin=${kmin%%[^0-9]*}
+        if [ "$kmaj" -gt 6 ] || { [ "$kmaj" -eq 6 ] && [ "${kmin:-0}" -ge 8 ]; }; then ok "kernel $kv: i915 per-process VRAM stats (fdinfo)"
+        else wrn "kernel $kv: i915 may not print per-process VRAM stats - the engine then cannot see what it holds (./arc probe shows it; 6.8+ recommended)"; fi
+    fi
     # ReBAR: BAR2 is the VRAM aperture; without Resizable BAR it is 256 MiB and every upload goes through a window
     bar=0
     if [ -r "$d/resource" ]; then

@@ -1,8 +1,8 @@
-From b70a31c716437a378946c2be2307e0ac8a4de541 Mon Sep 17 00:00:00 2001
+From 2b1a7d6e28675602387fb97295f559a15f56df36 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:24:38 +0000
-Subject: [PATCH 5/9] sycl: resident_plan takes #871's plan_err, so the engine
- links
+Subject: [PATCH 05/10] sycl: resident_plan takes #871's plan_err, so the
+ engine links
 
 6f7f680 (#871) gave resident_plan a 14th parameter (uint32_t* plan_err) in the
 shared include/strata/kernels/verify_kernels.hpp and in the CUDA kernel, but

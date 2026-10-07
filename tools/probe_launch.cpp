@@ -4,10 +4,17 @@
 // On 2x Arc A770 (i915) the engine's first kernel on the second GPU failed with UR_RESULT_ERROR_OUT_OF_HOST_MEMORY.
 // This runs the same shape (gather_rows: 384 work-groups of 256, a 16-byte row gather) on every Level Zero GPU,
 // both ways, plus a USM host read from that GPU (the expert mirror's path), and prints what each one does.
+// It also checks the free-VRAM query: with 2 GiB allocated, the driver's answer against what /proc/self/fdinfo says
+// this process holds (on i915 an unprivileged process is told the whole card is free).
 //
 //   ./arc probe        (builds this with icpx and runs it)
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <sycl/sycl.hpp>
+#include <cctype>
 #include <cstdio>
+#include <dirent.h>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -27,6 +34,38 @@ static std::string run(sycl::queue& q, Props props, const sycl::uint4* src, cons
     } catch (const sycl::exception& e) {
         return std::string("FAILED: ") + e.what();
     }
+}
+
+// the VRAM this process holds on the device at `pci`, from the DRM fdinfo memory stats; -1 when the kernel prints none
+static long long fdinfo_vram(std::string pci) {
+    for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+    DIR* dir = opendir("/proc/self/fdinfo");
+    if (!dir) return -1;
+    long long sum = -1;
+    while (dirent* e = readdir(dir)) {
+        if (e->d_name[0] == '.') continue;
+        std::ifstream f(std::string("/proc/self/fdinfo/") + e->d_name);
+        std::string line, pdev;
+        long long mem = -1;
+        while (std::getline(f, line)) {
+            if (line.rfind("drm-pdev:", 0) == 0) {
+                std::istringstream is(line.substr(9));
+                is >> pdev;
+                for (auto& c : pdev) c = (char) std::tolower((unsigned char) c);
+            } else if (line.rfind("drm-total-local", 0) == 0 || line.rfind("drm-total-vram", 0) == 0) {
+                std::istringstream is(line.substr(line.find(':') + 1));
+                unsigned long long v = 0;
+                std::string unit;
+                if (!(is >> v)) continue;
+                is >> unit;
+                const unsigned long long mul = unit == "KiB" ? 1ull << 10 : unit == "MiB" ? 1ull << 20 : unit == "GiB" ? 1ull << 30 : 1;
+                mem = (mem < 0 ? 0 : mem) + (long long) (v * mul);
+            }
+        }
+        if (mem >= 0 && pdev == pci) sum = (sum < 0 ? 0 : sum) + mem;
+    }
+    closedir(dir);
+    return sum;
 }
 
 int main() {
@@ -61,6 +100,23 @@ int main() {
             std::fill(hsrc, hsrc + rows * row, sycl::uint4{});
             host = run(q, syclex::properties{}, hsrc, ids, dst, rows, row);
             sycl::free(hsrc, q);
+        }
+        // the free-VRAM query, with 2 GiB held by this process
+        {
+            const size_t big = 2ull << 30;
+            void* hold = sycl::malloc_device(big, q);
+            if (hold) q.memset(hold, 0, big).wait();
+            const double total = (double) gpus[g].get_info<sycl::info::device::global_mem_size>() / 1073741824.0;
+            double drv = -1;
+            if (gpus[g].has(sycl::aspect::ext_intel_free_memory))
+                drv = (double) gpus[g].get_info<sycl::ext::intel::info::device::free_memory>() / 1073741824.0;
+            long long used = -1;
+            if (gpus[g].has(sycl::aspect::ext_intel_pci_address))
+                used = fdinfo_vram(gpus[g].get_info<sycl::ext::intel::info::device::pci_address>());
+            std::printf("  free VRAM with 2 GiB held:    driver says %.2f of %.2f GiB; fdinfo: this process holds %s\n",
+                        drv, total, used < 0 ? "(no stats)" : (std::to_string(used >> 20) + " MiB").c_str());
+            if (drv >= total - 0.05) std::printf("  -> the driver reports the whole card free: it does not see allocations\n");
+            if (hold) sycl::free(hold, q);
         }
         std::printf("  ordinary launch:              %s\n", plain.c_str());
         std::printf("  cooperative (use_root_sync):  %s\n", coop.c_str());

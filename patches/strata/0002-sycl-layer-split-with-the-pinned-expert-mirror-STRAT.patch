@@ -1,7 +1,7 @@
-From 715ea16f464e591ff1d3bd3d02801f0f87251634 Mon Sep 17 00:00:00 2001
+From 274ebb1b776fba1e4dbdfa9fb8d7a9edfe30c59b Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:18:15 +0000
-Subject: [PATCH 2/9] sycl: layer split with the pinned expert mirror;
+Subject: [PATCH 02/10] sycl: layer split with the pinned expert mirror;
  STRATA_VERIFY_NO_HOST=auto
 
 - The mirror's miss list walked all layers, so under --layer-split it pinned

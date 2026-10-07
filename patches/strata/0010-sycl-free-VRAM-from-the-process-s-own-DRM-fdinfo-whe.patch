@@ -1,0 +1,111 @@
+From c445bd224e15f93796d6d8ff9ddc62f25383398a Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 07:31:26 +0000
+Subject: [PATCH 10/10] sycl: free VRAM from the process's own DRM fdinfo when
+ the driver hides it
+
+i915 reports a memory region's unallocated size only to CAP_PERFMON; an
+unprivileged process gets the probed size, so ext_intel_free_memory (Level
+Zero Sysman) answered 'all free' on both A770s at every query - 15.11 of
+15.11 GiB on GPU 1 with its weights, head, session and the 839 MiB drafter
+already loaded. The caches were sized for empty cards, GPU 1 was
+overcommitted (i915 backs local memory lazily), and its first kernel
+(gather_rows in MtpDrafter::bind) failed with
+UR_RESULT_ERROR_OUT_OF_HOST_MEMORY. The B60s ran on xe, where the query works.
+
+dpct::device_ext::get_memory_info now also sums this process's
+drm-total-local* (i915) / drm-total-vram* (xe) for the device's PCI address
+from /proc/self/fdinfo, and free memory is the smaller of the driver's answer
+and total minus that.
+---
+ sycl/include/dpct/device.hpp | 60 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/sycl/include/dpct/device.hpp b/sycl/include/dpct/device.hpp
+index b55d2dc..eec8710 100644
+--- a/sycl/include/dpct/device.hpp
++++ b/sycl/include/dpct/device.hpp
+@@ -25,6 +25,9 @@
+ #include <vector>
+ #if defined(__linux__)
+ #include <unistd.h>
++#include <dirent.h>
++#include <fstream>
++#include <cctype>
+ #include <sys/syscall.h>
+ #endif
+ #if defined(_WIN64)
+@@ -530,6 +533,54 @@ public:
+   /// Get the number of bytes of free and total memory on the SYCL device.
+   /// \param [out] free_memory The number of bytes of free memory on the SYCL device.
+   /// \param [out] total_memory The number of bytes of total memory on the SYCL device.
++  /// arc-moe: the VRAM this process holds on this device, from /proc/self/fdinfo (the kernel's per-DRM-client
++  /// memory stats: drm-pdev + drm-total-local* on i915, drm-total-vram* on xe). Readable without privileges.
++  /// Returns false when the device has no PCI address or the kernel prints no such stats.
++  bool process_vram_used(size_t &used) const {
++#if defined(__linux__)
++    if (!has(sycl::aspect::ext_intel_pci_address)) return false;
++    std::string pci = get_info<sycl::ext::intel::info::device::pci_address>();
++    for (auto &c : pci) c = (char)std::tolower((unsigned char)c);
++    DIR *dir = opendir("/proc/self/fdinfo");
++    if (dir == nullptr) return false;
++    bool found = false;
++    size_t sum = 0;
++    while (dirent *e = readdir(dir)) {
++      if (e->d_name[0] == '.') continue;
++      std::ifstream f(std::string("/proc/self/fdinfo/") + e->d_name);
++      std::string line, pdev;
++      size_t mem = 0;
++      bool has_mem = false;
++      while (std::getline(f, line)) {
++        if (line.rfind("drm-pdev:", 0) == 0) {
++          std::istringstream is(line.substr(9));
++          is >> pdev;
++          for (auto &c : pdev) c = (char)std::tolower((unsigned char)c);
++        } else if (line.rfind("drm-total-local", 0) == 0 || line.rfind("drm-total-vram", 0) == 0) {
++          const size_t colon = line.find(':');
++          if (colon == std::string::npos) continue;
++          std::istringstream is(line.substr(colon + 1));
++          unsigned long long v = 0;
++          std::string unit;
++          if (!(is >> v)) continue;
++          is >> unit;
++          const unsigned long long mul = unit == "KiB" ? 1ull << 10 : unit == "MiB" ? 1ull << 20
++                                       : unit == "GiB" ? 1ull << 30 : 1ull;
++          mem += (size_t)(v * mul);
++          has_mem = true;
++        }
++      }
++      if (has_mem && pdev == pci) { sum += mem; found = true; }
++    }
++    closedir(dir);
++    if (found) used = sum;
++    return found;
++#else
++    (void)used;
++    return false;
++#endif
++  }
++
+   void get_memory_info(size_t &free_memory, size_t &total_memory) {
+ #if (defined(__SYCL_COMPILER_VERSION) && __SYCL_COMPILER_VERSION >= 20221105)
+     if (!has(sycl::aspect::ext_intel_free_memory)) {
+@@ -548,6 +599,15 @@ public:
+ #endif
+ #endif
+     total_memory = get_device_info().get_global_mem_size();
++    // arc-moe: on i915 the driver's free memory is the region's probed size for a process without CAP_PERFMON
++    // (the kernel hides unallocated_size), so every query answered "all free" and the expert caches were sized
++    // for an empty card: the second A770 was overcommitted and its first kernel failed with
++    // UR_RESULT_ERROR_OUT_OF_HOST_MEMORY. What this process holds is known exactly from fdinfo; trust the smaller.
++    size_t used = 0;
++    if (process_vram_used(used)) {
++      const size_t by_us = used < total_memory ? total_memory - used : 0;
++      if (free_memory == 0 || by_us < free_memory) free_memory = by_us;
++    }
+   }
+ 
+   void get_device_info(device_info &out) const {
+-- 
+2.43.0
+

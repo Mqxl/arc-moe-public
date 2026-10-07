@@ -1,8 +1,8 @@
-From c2cf725f020af838b494d663754ba2081666fcb7 Mon Sep 17 00:00:00 2001
+From a6b09da06f0ed6a5a55215696daa2072635102d0 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 06:54:32 +0000
-Subject: [PATCH 7/9] sycl: the pinned expert mirror in 1 GiB chunks; RAM kept
- free after it
+Subject: [PATCH 07/10] sycl: the pinned expert mirror in 1 GiB chunks; RAM
+ kept free after it
 
 The mirror was one sycl::malloc_host of every mirrored expert - 10.5 GB for
 IQ2_XS on 2x A770. Arc A-series reports a max_mem_alloc_size of ~4 GB and
