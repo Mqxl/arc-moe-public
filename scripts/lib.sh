@@ -10,6 +10,19 @@ STRATA_BRANCH=arc-moe
 AOT_TARGET=${ARC_AOT:-acm-g10}          # Arc A770 / A750 (DG2-512). A580: acm-g12, A380/A310: acm-g11
 BUILD_DIR=$STRATA/build-sycl-aot
 ONEAPI=${ONEAPI_ROOT:-/opt/intel/oneapi}
+# The engine settings ./arc start adds, each measured on 2x A770 with ./arc profile (docs/ENGINEERING.md section 9):
+#   --prefill-borrow --prefill auto   8K prompt chunks in borrowed cache slots: every chunk walks all of GPU 0's experts
+#                                     (most stream from the RAM mirror), so few big chunks win (2K 49 -> 116 tok/s)
+#   --vram-reserve-mib 768            ~550 more expert slots per card than setup's 1536 (512: decode +9%, but 432 MiB free)
+#   --spec 6                          8-token windows (code accepts ~90% of the drafts): +4% on code
+#   STRATA_GU_LANES=32                32 lanes per row in the experts' gate/up GEMV (8, tuned on Xe2): code +18%
+#   STRATA_PREFILL_FIRST=0            no 256-token first chunk (a whole extra walk over the experts, ~4.7 s)
+ARC_ENGINE_ARGS_DEFAULT="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6"
+arc_engine_env() {   # export the defaults above; a variable already set (even empty) wins
+    export STRATA_EXTRA_ARGS="${STRATA_EXTRA_ARGS-$ARC_ENGINE_ARGS_DEFAULT}"
+    export STRATA_PREFILL_FIRST="${STRATA_PREFILL_FIRST-0}"
+    export STRATA_GU_LANES="${STRATA_GU_LANES-32}"
+}
 
 if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'; else B='' G='' Y='' R='' D='' N=''; fi
 say()  { printf '%s\n' "$*"; }

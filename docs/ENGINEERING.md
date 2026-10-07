@@ -360,6 +360,23 @@ and two Level Zero runtime switches as A/B runs: the v2 adapter, and the driver'
   - `--spec 5/6`: windows of 7/8 tokens, since code accepts 93% of the drafts. This needed patch 20: the device plan
     held 64 entries and refused the 80 of an 8-token window, which in a host-free window means a plan nobody sends.
 
+### Round 6 (003ea10): one change per run, against 25.3 / 17.6 tok/s (code / prose)
+
+| run | code | prose | note |
+|---|---|---|---|
+| `STRATA_GU_LANES=32` | **29.9** | 18.4 | 32 lanes per row in the experts' gate/up GEMV (8 was tuned on Xe2) |
+| `--vram-reserve-mib 512` | 27.7 | **19.1** | 1,284 more expert slots across the two cards; 432 MiB left free; 10K prompt 695 vs 757 |
+| `STRATA_GU_LANES=16` | 26.9 | 17.7 | |
+| `--spec 6` (8-token windows) | 26.4 | 17.5 | |
+| `--spec 5` | 25.8 | 17.6 | |
+| `STRATA_DOWN_LANES=16` | 25.1 | 16.8 | |
+| `STRATA_GU_LANES=4` | 23.8 | 15.9 | |
+
+The lanes change the summation order, so greedy text can differ: prose ran to 128 tokens instead of 107.
+`./arc start` now sets 32 gate/up lanes, `--vram-reserve-mib 768` (a margin above 512's 432 MiB free) and
+`--spec 6` (lib.sh `arc_engine_env`). Round 7 measures that combination twice per prompt and A/Bs it against
+512, `--spec 4`, and 32 / 4 down lanes.
+
 ## What was verified here, and what was not
 
 | Check | Status |

@@ -3,10 +3,12 @@
 # engine's profilers on, sends prompts, stops it, and writes everything worth reading into one file
 # (profile-<time>.txt).
 #
-#   N   the defaults (./arc start's), nothing traced: the real speeds on short prompts and on 2K / 10K prompts
-#   R512  --vram-reserve-mib 512 (1,536 by default): ~750 more expert slots per card, fewer reads over PCIe
-#   GU*/DN16  lanes per row of the expert kernels (STRATA_GU_LANES / STRATA_DOWN_LANES, 8 by default)
-#   S5/S6 --spec 5 / 6: windows of 7 / 8 tokens (6 by default) - code accepts 93% of the drafts
+#   N     the defaults (./arc start's: lib.sh arc_engine_env), nothing traced: the real speeds on short prompts and on
+#         2K / 10K prompts
+#   R512  the defaults with --vram-reserve-mib 512 (768 by default)
+#   S4    the defaults with --spec 4 (6 by default: 8-token windows)
+#   DN32 / DN4  the experts' down GEMV with 32 / 4 lanes per row (8 by default; gate/up runs 32)
+#   GU16  gate/up with 16 lanes per row
 #   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
 #   D   decode, eager, under unitrace: the GPU time of every kernel by name   (ARC_PROFILE_TRACE=1)
 #   E   the 10K prompt under unitrace                                          (ARC_PROFILE_TRACE=1)
@@ -75,7 +77,7 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
         [ $t -lt 900 ] || { warn "not loaded after 15 minutes"; break; }
     done
     echo "================ $name: $*" >>"$out"
-    python3 "$ROOT/tools/bench.py" --url "$url" "${keyarg[@]}" --runs 1 --max-tokens "$maxt" --cases "$cases" >>"$out" 2>&1 || true
+    python3 "$ROOT/tools/bench.py" --url "$url" "${keyarg[@]}" --runs "${ARC_PROFILE_RUNS:-2}" --max-tokens "$maxt" --cases "$cases" >>"$out" 2>&1 || true
     stop_server
     {
         echo "---- engine log"
@@ -111,14 +113,13 @@ if [ "${ARC_PROFILE_SWEEP:-0}" = 1 ]; then
     run G-heads 10k 16 STRATA_GDN_REC_HEADS=1
     run G-nopipe 10k 16 STRATA_GDN_PIPELINE=0
 fi
-BASE_ARGS="--prefill-borrow --prefill auto"   # ./arc start's flags: STRATA_EXTRA_ARGS replaces them, so a run repeats them
+# ./arc start's flags (STRATA_EXTRA_ARGS replaces them, so a run repeats them; the engine keeps a flag's last value)
+BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
 run R512 short,prose,10k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --vram-reserve-mib 512"
+run S4 short,prose,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 4"
+run DN32 short,prose 128 STRATA_DOWN_LANES=32
+run DN4 short,prose 128 STRATA_DOWN_LANES=4
 run GU16 short,prose 128 STRATA_GU_LANES=16
-run GU32 short,prose 128 STRATA_GU_LANES=32
-run GU4 short,prose 128 STRATA_GU_LANES=4
-run DN16 short,prose 128 STRATA_DOWN_LANES=16
-run S5 short,prose,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 5"
-run S6 short,prose,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 6"
 run A 10k 128 STRATA_PREFILL_TIMING=1 STRATA_DRAFT_TIMING=1
 if [ -n "$unitrace" ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
     run D short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.D.unitrace"
