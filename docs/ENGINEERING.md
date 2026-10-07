@@ -217,6 +217,18 @@ These came from the first runs on the target machine (2x A770 16 GB, i915, 48 GB
   own. Free memory becomes the smaller of the driver's answer and "total minus what this process holds".
   `./arc probe` now prints both numbers with 2 GiB allocated on each card.
 
+- **Then the first prompt hung the GPU** (`verify: timed out at layer 0 ... (#267)`, and in the kernel log
+  `i915 ... GPU HANG ... context reset`). With the VRAM count fixed, the split moved to K=37 and GPU 1's cache held
+  5579 of its 5632 pairs: 53 short, because the split search's estimate is a few slots off once the drafter and the
+  head land after it. One unheld pair turned `NO_HOST=auto` off. The window then took the per-layer host path, where
+  the GPU spin-waits on host flag stores it does not reliably see (upstream's #667), and i915's hang check resets a
+  kernel that spins that long.
+
+  Patch 11: a later stage mirrors the pairs its cache could not hold. The pinned host memory is allocated in that
+  device's own SYCL context, since dpct gives every device one and CUDA0's mirror is not usable from GPU 1. The stage
+  also gets its own address table, and `resident_plan`'s mirror is now a registry per residency table. `NO_HOST=auto`
+  then counts the stage as covered and stays on.
+
 ## What was verified here, and what was not
 
 | Check | Status |

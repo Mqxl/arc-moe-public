@@ -1,0 +1,226 @@
+From de4974c18cdc4c462c21c4cdde5d5c8af0627ae6 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 08:03:49 +0000
+Subject: [PATCH 11/11] sycl: a later stage mirrors the pairs its cache could
+ not hold
+
+With the free-VRAM count fixed, the split put layers 37-47 on GPU 1 and its
+cache held 5579 of the 5632 pairs (53 short, ~75 MB): the split search's
+estimate is a few slots off once the drafter and the head land after it.
+One unheld pair turned STRATA_VERIFY_NO_HOST=auto off, the window took the
+per-layer host path, whose GPU spin-waits on host flags i915's hang check
+resets: 'verify: timed out at layer 0', GPU HANG, context reset.
+
+- after the stage caches are filled, each later stage reads the pairs of its
+  layers its cache does not hold into pinned host memory allocated in its own
+  SYCL context (dpct gives every device one), 1 GiB chunks, and gets its own
+  device table of their addresses
+- resident_plan's mirror is a registry per residency table (d_res, size,
+  table) instead of one global pair, so every stage's plan finds its own
+- NO_HOST=auto counts a stage covered when every pair is cached or mirrored;
+  its 'off' line says how many are uncovered on CUDA0 and on the later GPUs
+---
+ .../strata/kernels/resident_plan_mirror.hpp   |   4 +-
+ sycl/src/kernels/cuda/verify_kernels.dp.cpp   |  20 ++--
+ sycl/src/program/generate.cpp                 | 101 +++++++++++++++---
+ 3 files changed, 105 insertions(+), 20 deletions(-)
+
+diff --git a/sycl/include/strata/kernels/resident_plan_mirror.hpp b/sycl/include/strata/kernels/resident_plan_mirror.hpp
+index b28a089..a20b166 100644
+--- a/sycl/include/strata/kernels/resident_plan_mirror.hpp
++++ b/sycl/include/strata/kernels/resident_plan_mirror.hpp
+@@ -6,5 +6,7 @@ namespace strata::kernels {
+ /// that is not in the VRAM cache but has a non-zero entry in `mirror_table` ([n_layers][n_expert] device-readable
+ /// addresses, 0 = none) as planned: the expert kernels read it from that address, over PCIe. `d_res` is the residency
+ /// table whose per-layer slices resident_plan receives, so the layer of a call is found from its pointer.
+-void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table);
++/// arc-moe: one registration per residency table (n_entries = n_layers * n_expert), so every device of a layer split
++/// can have its own mirror; registering the same `d_res` again replaces its table.
++void resident_plan_set_mirror(const int32_t* d_res, int64_t n_entries, const unsigned long long* mirror_table);
+ }
+diff --git a/sycl/src/kernels/cuda/verify_kernels.dp.cpp b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+index 660e211..f91a0e1 100644
+--- a/sycl/src/kernels/cuda/verify_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+@@ -1121,19 +1121,25 @@ __dpct_inline__ void copy_or_zero_kernel(sycl::float4 *__restrict__ dst,
+ }  // namespace
+ 
+ namespace {
+-const int32_t* g_mirror_res = nullptr;
+-const unsigned long long* g_mirror_table = nullptr;
++// arc-moe: one mirror per device of a layer split (each device has its own residency table and its own SYCL
++// context, so its own pinned mirror); a call's layer slice is matched to the table it lies in
++struct MirrorReg { const int32_t* res; int64_t n; const unsigned long long* table; };
++MirrorReg g_mirrors[8];
++int g_n_mirrors = 0;
+ }
+-void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table) {
+-    g_mirror_res = d_res;
+-    g_mirror_table = mirror_table;
++void resident_plan_set_mirror(const int32_t* d_res, int64_t n_entries, const unsigned long long* mirror_table) {
++    for (int i = 0; i < g_n_mirrors; ++i)
++        if (g_mirrors[i].res == d_res) { g_mirrors[i] = {d_res, n_entries, mirror_table}; return; }
++    if (g_n_mirrors < 8) g_mirrors[g_n_mirrors++] = {d_res, n_entries, mirror_table};
+ }
+ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
+     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
+-    if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
+-        mir = g_mirror_table + (res_layer - g_mirror_res);
++    for (int i = 0; i < g_n_mirrors; ++i) {
++        const MirrorReg& m = g_mirrors[i];
++        if (m.table != nullptr && res_layer >= m.res && res_layer < m.res + m.n) { mir = m.table + (res_layer - m.res); break; }
++    }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+             STRATA_ROOT_SYNC_PROP};
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 5925612..368645a 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -891,6 +891,10 @@ struct GpuStage {
+     dpct::event_ptr adapt_ev = nullptr;
+     bool adapt_live = false;                             ///< swaps of this request are in flight on it
+     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
++    // arc-moe: the pairs of its layers its cache could not hold, pinned in RAM in this device's own context
++    unsigned long long* mirror_table_d = nullptr;        ///< [n_layers][n_expert] device-readable addresses, 0 = none
++    std::vector<uint8_t*> mirror_chunks;                 ///< USM host chunks behind it (live for the process)
++    int64_t uncovered = -1;                              ///< pairs neither cached nor mirrored (-1: not counted)
+ };
+ 
+ // ---- issue #31: what the watchdog prints before it stops a stalled engine
+@@ -3924,20 +3928,84 @@ int main(int argc, char **argv) try {
+     }
+     if (multi_gpu)
+         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
++    // arc-moe: a later stage whose cache could not hold every pair of its layers (the split search's estimate is a
++    // few slots off when the drafter and the head land after it) mirrors the rest in pinned RAM - in its own SYCL
++    // context, since each device has one - and its verify plan reads them over PCIe like CUDA0's. Without this one
++    // missing pair turns the host-free window off, and the per-layer host path's GPU spin-waits are what i915's
++    // hang check resets.
++    if (o.stream_experts && srcp == &gguf_src) {
++        const auto& lay = strata::kernels::cpu::expert_layout();
++        for (auto& stp : stages) {
++            GpuStage& st = *stp;
++            std::vector<std::pair<int64_t, int64_t>> miss;
++            uint64_t need = 0;
++            for (int64_t l = st.lb; l < st.le; ++l)
++                for (int64_t e = 0; e < g.n_expert; ++e)
++                    if (st.cache.slot_of(l, e) == strata::core::kNotResident) {
++                        miss.push_back({l, e});
++                        need += (lay.bytes[(size_t) l] + 255) / 256 * 256;
++                    }
++            st.uncovered = (int64_t) miss.size();
++            if (miss.empty()) continue;
++            const strata::core::OnDevice on(st.dev);
++            std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
++            uint8_t* at = nullptr;
++            uint64_t left = 0, done = 0;
++            int64_t got = 0;
++            for (const auto& [l, e] : miss) {
++                const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
++                if (at == nullptr || b > left) {
++                    const uint64_t sz = std::max<uint64_t>(b, std::min<uint64_t>(1ull << 30, need - done));
++                    uint8_t* c = nullptr;
++                    try {
++                        c = (uint8_t*) sycl::malloc_host(sz, dpct::get_in_order_queue());
++                    } catch (const sycl::exception&) {
++                        c = nullptr;
++                    }
++                    if (c == nullptr) break;
++                    st.mirror_chunks.push_back(c);
++                    at = c;
++                    left = sz;
++                }
++                if (!gguf_src.read_into(l, e, at, (size_t) lay.bytes[(size_t) l])) break;
++                tab[(size_t) (l * g.n_expert + e)] = (unsigned long long) at;
++                at += b;
++                left -= b;
++                done += b;
++                ++got;
++            }
++            if (got > 0) {
++                st.mirror_table_d = sycl::malloc_device<unsigned long long>(tab.size(), dpct::get_in_order_queue());
++                if (st.mirror_table_d == nullptr) got = 0;
++                else
++                    dpct::get_in_order_queue()
++                        .memcpy(st.mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long))
++                        .wait();
++            }
++            st.uncovered = (int64_t) miss.size() - got;
++            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %lld of the %zu experts its cache could not hold "
++                                 "mirrored in its pinned host memory (%.2f GiB); the GPU reads them over PCIe\n",
++                         st.dev, (long long) got, miss.size(), (double) done / 1073741824.0);
++        }
++    }
+     // arc-moe: STRATA_VERIFY_NO_HOST=auto. The host-free window (the host waits for the whole window, not per layer)
+     // is the fast path on Arc, but it is only valid when the GPUs never need the host for an expert: every pair of
+     // CUDA0's layers in VRAM or in the pinned mirror, and every later stage holding all of its layers' pairs.
+     // Decided here, after the placement and before the first window (verify.cpp reads the variable per window).
+     if (const char* nh = std::getenv("STRATA_VERIFY_NO_HOST"); nh != nullptr && std::string(nh) == "auto") {
+         bool covered = o.stream_experts && unmirrored_misses == 0;
+-        for (auto& stp : stages)
+-            covered = covered && stp->cache.slots() > 0 &&
+-                      [&] {
+-                          for (int64_t l = stp->lb; l < stp->le; ++l)
+-                              for (int64_t e = 0; e < g.n_expert; ++e)
+-                                  if (stp->cache.slot_of(l, e) == strata::core::kNotResident) return false;
+-                          return true;
+-                      }();
++        int64_t stage_uncovered = 0;
++        for (auto& stp : stages) {
++            const int64_t u = stp->uncovered >= 0 ? stp->uncovered : [&] {
++                int64_t n = 0;
++                for (int64_t l = stp->lb; l < stp->le; ++l)
++                    for (int64_t e = 0; e < g.n_expert; ++e)
++                        if (stp->cache.slot_of(l, e) == strata::core::kNotResident) ++n;
++                return n;
++            }();
++            stage_uncovered += u;
++            covered = covered && stp->cache.slots() > 0 && u == 0;
++        }
+         if (covered) {
+             setenv("STRATA_VERIFY_NO_HOST", "1", 1);
+             std::fprintf(stderr, "strata generate: STRATA_VERIFY_NO_HOST=auto -> on: every expert is in VRAM or in the "
+@@ -3945,8 +4013,9 @@ int main(int argc, char **argv) try {
+         } else {
+             unsetenv("STRATA_VERIFY_NO_HOST");
+             std::fprintf(stderr, "strata generate: STRATA_VERIFY_NO_HOST=auto -> off: some experts are neither in VRAM "
+-                                 "nor mirrored (%lld on CUDA0); raise STRATA_MIRROR_MIB / free RAM, or shorten the "
+-                                 "context, for the host-free path\n", (long long) unmirrored_misses);
++                                 "nor mirrored (%lld on CUDA0, %lld on the later GPUs); raise STRATA_MIRROR_MIB / free "
++                                 "RAM, or shorten the context, for the host-free path\n", (long long) unmirrored_misses,
++                         (long long) stage_uncovered);
+         }
+     }
+ 
+@@ -5460,7 +5529,11 @@ int main(int argc, char **argv) try {
+         strata::core::Verifier ver;
+         strata::core::VerifyHits vh;
+         vh.d_res = thits.d_res;
+-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
++        if (mirror_table_d)
++            strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d);
++        for (auto& stp : stages)   // arc-moe: a later stage's own mirror of the pairs its cache could not hold
++            if (stp->mirror_table_d)
++                strata::kernels::resident_plan_set_mirror(stp->d_res, g.n_layers * g.n_expert, stp->mirror_table_d);
+         vh.cache_base = thits.cache_base;
+         vh.blob = thits.blob;
+         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
+@@ -7836,7 +7909,11 @@ int main(int argc, char **argv) try {
+         strata::core::Verifier ver;
+         strata::core::VerifyHits vh;
+         vh.d_res = thits.d_res;
+-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
++        if (mirror_table_d)
++            strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d);
++        for (auto& stp : stages)   // arc-moe: a later stage's own mirror of the pairs its cache could not hold
++            if (stp->mirror_table_d)
++                strata::kernels::resident_plan_set_mirror(stp->d_res, g.n_layers * g.n_expert, stp->mirror_table_d);
+         vh.cache_base = thits.cache_base;
+         vh.blob = thits.blob;
+         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
+-- 
+2.43.0
+

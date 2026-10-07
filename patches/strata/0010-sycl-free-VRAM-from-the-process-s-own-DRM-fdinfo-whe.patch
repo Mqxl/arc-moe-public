@@ -1,7 +1,7 @@
-From c445bd224e15f93796d6d8ff9ddc62f25383398a Mon Sep 17 00:00:00 2001
+From 0b9f70b619ca361e14b85907976e2603cfaaa320 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 07:31:26 +0000
-Subject: [PATCH 10/10] sycl: free VRAM from the process's own DRM fdinfo when
+Subject: [PATCH 10/11] sycl: free VRAM from the process's own DRM fdinfo when
  the driver hides it
 
 i915 reports a memory region's unallocated size only to CAP_PERFMON; an

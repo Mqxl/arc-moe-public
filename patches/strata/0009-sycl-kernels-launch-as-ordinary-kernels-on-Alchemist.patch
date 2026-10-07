@@ -1,7 +1,7 @@
-From 18e48878364eb834a36fd06b2af200bb47b1d150 Mon Sep 17 00:00:00 2001
+From 653cd639ad27052e97efec4e375e5fa7107fb42c Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 07:18:32 +0000
-Subject: [PATCH 09/10] sycl: kernels launch as ordinary kernels on Alchemist
+Subject: [PATCH 09/11] sycl: kernels launch as ordinary kernels on Alchemist
  (no use_root_sync)
 
 dpct gave all 318 kernel launches sycl::ext::oneapi::experimental::
