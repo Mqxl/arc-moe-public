@@ -34,7 +34,7 @@ for l in lines:
         cur = [l[17:].split(":")[0].strip(), l.split(":", 1)[1].strip() if ":" in l else "", []]
         runs.append(cur)
     elif cur is not None:
-        m = re.match(r"(short code|short prose \(ru\)|0.7K code|2K code|8K code|10K code|sampled code|agent \(stream\))\s+\d+\s+\d+\s+\d+\s+([0-9.]+)\s+([0-9.]+)", l)
+        m = re.match(r"(short code|short prose \(ru\)|0.7K code|1.5K code|2K code|8K code|10K code|sampled code|agent \(stream\))\s+\d+\s+\d+\s+\d+\s+([0-9.]+)\s+([0-9.]+)", l)
         if m:
             cur[2].append(f"{m.group(1).replace('short ', '').replace(' (ru)', '')} {m.group(2)}/{m.group(3)}")
 if runs:

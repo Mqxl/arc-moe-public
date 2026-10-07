@@ -414,6 +414,38 @@ because its MTP drafts are accepted far less often (~35 of 100 against ~85).
     21 of 32 GB held experts.
   - `./arc profile` adds a one-card run (G1) on two-card machines.
 
+### Round 11 (2026-10-08): prompt crossover after grouped experts
+
+The focused `ARC_PROFILE_SHORT_READ_SWEEP=1 ./arc profile` run
+(`profile-20261008-012913.txt`, patch 31, two replies per case) compares complete reply times:
+
+| short-read | agent, 311/314 tokens | code, 730/733 | code, 1425/1428 | code, 2125/2128 |
+|---|---|---|---|---|
+| 64 | 4.0 / 3.3 s | 7.5 / 7.0 s | 9.4 / 9.3 s | 11.9 / 11.8 s |
+| 256 | 4.0 / 3.3 s | 7.5 / 7.0 s | 9.4 / 9.3 s | 11.9 / 11.8 s |
+| 512 | 8.0 / 7.9 s | 7.9 / 7.0 s | 9.6 / 9.3 s | 11.9 / 11.8 s |
+| 1536 | 8.1 / 8.0 s | 15.5 / 15.3 s | 28.0 / 28.0 s | 12.4 / 11.9 s |
+
+64 and 256 select the same batched path for these cases and tie. The default is now 64. The old 1536 threshold
+was fitted to the FP16/oneMKL expert path; it is too high after patch 30.
+
+Patch 32 adds a SYCL prompt-only entry point and `STRATA_PF_EXPERT_KERNEL=dp4a|tile8|tile16`.
+The larger DP4A tiles reuse decoded weights across 8/16 activation rows, with the original four-row tail.
+The decode entry point keeps its existing kernels. The diagnostic pack uses Q2_0 down in all layers, so this first
+profile isolates the IQ2_S gate/up change (34 of 48 layers); the wider IQ4_NL down kernels are not selected here. IGC dumps for acm-g10 with the large register file report
+SIMD32, 256 GRFs and no spill/private-memory fields for both gate/up and down variants.
+
+With the timer off, `profile-20261008-020158.txt` measures 10K prompt reading at 363.9/370.2 tok/s (DP4A),
+376.2/382.4 (tile8) and 382.5/389.7 (tile16). The first complete reply check
+(`check-20261008-015237.txt`, tile8) passes all 14 requests in base, own-buffers and one-gpu.
+
+`tools/build-prefill-parity.sh` builds a focused numerical check from the patched kernel library.
+`test-logs/prefill-parity <shard1.gguf>` picks one real expert layer per gate/up format, compares against ggml's
+float dequantization and FP64 dot products, and tests 7/17/65/160 entries with shuffled input and output mappings.
+Its 3% L1 tolerance is the upstream native-expert test's (activation quantization differs from the float reference).
+DP4A, tile8 and tile16 pass with about 1.1-1.2% relative error. This test is correctness-only; timings come from
+`./arc profile`.
+
 ## What was verified here, and what was not
 
 | Check | Status |

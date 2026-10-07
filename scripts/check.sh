@@ -36,11 +36,12 @@ case "$log" in /*) ;; *) log="$STRATA/$log" ;; esac
 out="$ROOT/check-$(date +%Y%m%d-%H%M%S).txt"
 
 srv_pid=""
+failures=0
 stop_server() {
     [ -n "$srv_pid" ] || return 0
     local py
-    py=$(pgrep -g "$srv_pid" -f "server.py" | head -1 || true)
-    [ -n "$py" ] && kill -INT "$py" 2>/dev/null || true
+    py=$(pgrep -g "$srv_pid" -f "serve/server(_intel)?\.py" | head -1 || true)
+    [ -n "$py" ] && kill -TERM "$py" 2>/dev/null || true
     for _ in $(seq 1 60); do pgrep -g "$srv_pid" >/dev/null || break; sleep 1; done
     kill -TERM -- "-$srv_pid" 2>/dev/null || true
     for _ in $(seq 1 20); do pgrep -g "$srv_pid" >/dev/null || break; sleep 1; done
@@ -66,7 +67,11 @@ run() {   # run <name> <env...>
         [ $t -lt 900 ] || { warn "not loaded after 15 minutes"; break; }
     done
     echo "================ $name: $*" >>"$out"
-    python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" "${pass[@]}" 2>&1 | tee -a "$out" || true
+    if python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" "${pass[@]}" 2>&1 | tee -a "$out"; then
+        :
+    else
+        failures=$((failures + 1))
+    fi
     stop_server
     {
         echo "---- engine log"
@@ -87,4 +92,8 @@ run own-buffers "STRATA_EXTRA_ARGS=$BASE_ARGS --no-prefill-borrow"
 if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then run one-gpu ARC_GPUS=0; fi
 trap - EXIT
 rm -f "$out".*.start
+if [ "$failures" -gt 0 ]; then
+    warn "$failures configuration(s) failed: $out"
+    exit 3
+fi
 ok "written: $out (send this file)"

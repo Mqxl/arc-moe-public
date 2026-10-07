@@ -7,12 +7,14 @@
 #         2K / 10K prompts and on a sampled request and an agent harness's (tools, streaming); every reply checked
 #   PS1   STRATA_PLAN_STAGE=1: the device plan stages mirrored experts in VRAM (patch 21; off by default since round 9)
 #   PG0   STRATA_PF_GROUPED=0: the prompt path's experts dequantized to FP16 + oneMKL (before patch 30)
-#   SR768 --short-read 768: round 9's threshold (1536 by default: up to 1536 new tokens go through the windows)
+#   SR768 --short-read 768: old threshold against the current 64-token default
 #   SR64  --short-read 64: upstream's threshold (short prompt parts batched)
 #   G1    one card only (ARC_GPUS=0), on a machine with two: the single-GPU mode
 #   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
 #   D   decode, eager, under unitrace: the GPU time of every kernel by name   (ARC_PROFILE_TRACE=1)
 #   E   the 10K prompt under unitrace                                          (ARC_PROFILE_TRACE=1)
+#   ARC_PROFILE_SHORT_READ_SWEEP=1: thresholds 64/256/512/1536 on agent/730/1425/2125 tokens
+#   ARC_PROFILE_EXPERT_SWEEP=1: DP4A baseline versus 8/16-row prefill tiles
 #   ARC_PROFILE_SWEEP=1 adds round 4's kernel-variant runs (K*: decode, G*: the GDN recurrence)
 #
 # D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: cmake + network, ~5 min).
@@ -47,11 +49,12 @@ if [ $use_unitrace = 1 ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
 fi
 
 srv_pid=""
-stop_server() {   # Ctrl+C to the server only: it sends the engine QUIT, so a traced engine writes its summary
+failures=0
+stop_server() {   # SIGTERM to Python only sends the engine QUIT; background jobs may inherit SIGINT ignored
     [ -n "$srv_pid" ] || return 0
     local py
-    py=$(pgrep -g "$srv_pid" -f "server.py" | head -1 || true)
-    [ -n "$py" ] && kill -INT "$py" 2>/dev/null || true
+    py=$(pgrep -g "$srv_pid" -f "serve/server(_intel)?\.py" | head -1 || true)
+    [ -n "$py" ] && kill -TERM "$py" 2>/dev/null || true
     for _ in $(seq 1 90); do pgrep -g "$srv_pid" >/dev/null || break; sleep 1; done
     kill -TERM -- "-$srv_pid" 2>/dev/null || true
     for _ in $(seq 1 20); do pgrep -g "$srv_pid" >/dev/null || break; sleep 1; done
@@ -78,7 +81,11 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
         [ $t -lt 900 ] || { warn "not loaded after 15 minutes"; break; }
     done
     echo "================ $name: $*" >>"$out"
-    python3 "$ROOT/tools/bench.py" --url "$url" "${keyarg[@]}" --runs "${ARC_PROFILE_RUNS:-2}" --max-tokens "$maxt" --cases "$cases" >>"$out" 2>&1 || true
+    if python3 "$ROOT/tools/bench.py" --url "$url" "${keyarg[@]}" --runs "${ARC_PROFILE_RUNS:-2}" --max-tokens "$maxt" --cases "$cases" >>"$out" 2>&1; then
+        :
+    else
+        failures=$((failures + 1))
+    fi
     stop_server
     {
         echo "---- engine log"
@@ -100,6 +107,17 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     echo
 } >"$out"
 
+# A focused sweep uses the same loader, reply checks and final report as the full profile.
+if [ "${ARC_PROFILE_SHORT_READ_SWEEP:-0}" = 1 ]; then
+    BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
+    for sr in 64 256 512 1536; do
+        run "SR$sr" agent,1k,1.5k,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --short-read $sr"
+    done
+elif [ "${ARC_PROFILE_EXPERT_SWEEP:-0}" = 1 ]; then
+    for kernel in dp4a tile8 tile16; do
+        run "PF-$kernel" 2k,10k 128 "STRATA_PF_EXPERT_KERNEL=$kernel"
+    done
+else
 run N short,prose,1k,2k,10k,sampled,agent 128 ARC_PROFILE_RUN=N
 if [ "${ARC_PROFILE_SWEEP:-0}" = 1 ]; then
     run K-sg16 short,prose 128 STRATA_MMVQ_SG=16
@@ -132,7 +150,12 @@ if [ -n "$unitrace" ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
         { echo "================ $(basename "$f")"; head -c 60000 "$f"; echo; } >>"$out"
     done
 fi
+fi
 trap - EXIT
 python3 "$ROOT/tools/profile_summary.py" "$out" || true
 rm -f "$out".*.start
+if [ "$failures" -gt 0 ]; then
+    warn "$failures profile run(s) failed reply checks: $out"
+    exit 3
+fi
 ok "written: $out (send this file)"

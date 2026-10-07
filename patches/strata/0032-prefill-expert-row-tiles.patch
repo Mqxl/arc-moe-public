@@ -1,0 +1,248 @@
+From 5de994fb28fa493b0c406783807a385eecce5cbf Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 01:32:54 +0500
+Subject: [PATCH] sycl: opt-in 8/16-row prefill expert weight reuse
+
+---
+ .../include/strata/kernels/native_prefill.hpp |  8 ++
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp       | 82 +++++++++++++++----
+ sycl/src/prefill/prefill.cpp                  |  5 +-
+ 3 files changed, 79 insertions(+), 16 deletions(-)
+ create mode 100644 sycl/include/strata/kernels/native_prefill.hpp
+
+diff --git a/sycl/include/strata/kernels/native_prefill.hpp b/sycl/include/strata/kernels/native_prefill.hpp
+new file mode 100644
+index 0000000..6badb0b
+--- /dev/null
++++ b/sycl/include/strata/kernels/native_prefill.hpp
+@@ -0,0 +1,8 @@
++#pragma once
++#include "strata/kernels/iq_kernels.hpp"
++namespace strata::kernels {
++// SYCL prompt-only entry point; native_expert_grouped retains decode behavior.
++void native_prefill_expert_grouped(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
++                                   const int32_t*, const int32_t*, const int32_t*, int64_t, int64_t,
++                                   const void*, void*, float*, void*);
++}
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index e04a11c..665c028 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -22,6 +22,7 @@
+ #include <type_traits>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ 
+ namespace strata::kernels {
+ namespace {
+@@ -1335,12 +1336,26 @@ __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const*
+ }
+ 
+ // The entries e0..e1 of one row: chunks of 4 through the multi-entry dot, the rest one at a time.
+-template <int TY, int LANES>
++template <int TY, int LANES, int E = 4>
+ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_stride, const int32_t* ent_idx,
+                                  int e0, int e1, int nb, int sub, float* dst, size_t dst_stride,
+                                  const void* grid = nullptr) {
+     int e = e0;
+     if constexpr (Multi<TY>::has) {
++        // Prefill reuses each decoded weight part across 8/16 activation rows.
++        // Decode keeps E=4; the remainder keeps its original summation order.
++        if constexpr (E > 4) {
++            for (; e + E <= e1; e += E) {
++                const block_q8_1* xs[E];
++#pragma unroll
++                for (int i = 0; i < E; ++i) xs[i] = x + (size_t) ent_idx[e + i] * x_stride;
++                float o[E];
++                row_dot_multi<TY, LANES, E>(wr, xs, nb, sub, o, grid);
++                if (sub == 0)
++#pragma unroll
++                    for (int i = 0; i < E; ++i) dst[(size_t) (e + i) * dst_stride] = o[i];
++            }
++        }
+         for (; e + 4 <= e1; e += 4) {
+             const block_q8_1* xs[4] = {x + (size_t) ent_idx[e] * x_stride, x + (size_t) ent_idx[e + 1] * x_stride,
+                                        x + (size_t) ent_idx[e + 2] * x_stride, x + (size_t) ent_idx[e + 3] * x_stride};
+@@ -1366,7 +1381,7 @@ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_s
+ 
+ constexpr int GU_ROWS = 8;     // rows per block (one warp each)
+ 
+-template <int TG, int LN = kExpertLanes>
++template <int TG, int LN = kExpertLanes, int E = 4>
+ __dpct_inline__ void native_gu_kernel(
+     const unsigned long long *__restrict__ grp_ptr,
+     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+@@ -1403,7 +1418,7 @@ __dpct_inline__ void native_gu_kernel(
+     for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
+         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+-        row_entries<TG, LN>(wr, xq, xb, ent_tok, e0, e1, nb, sub, (is_up ? up : gate) + r, (size_t) L.n_ff, grid);
++        row_entries<TG, LN, E>(wr, xq, xb, ent_tok, e0, e1, nb, sub, (is_up ? up : gate) + r, (size_t) L.n_ff, grid);
+     }
+ }
+ 
+@@ -1461,7 +1476,7 @@ __dpct_inline__ void swiglu_entries_kernel(const float *__restrict__ gate,
+     h[i] = (g / (1.0f + sycl::native::exp(-g))) * up[i];
+ }
+ 
+-template <int TD, int LN = kExpertLanes>
++template <int TD, int LN = kExpertLanes, int E = 4>
+ __dpct_inline__ void native_down_kernel(
+     const unsigned long long *__restrict__ grp_ptr,
+     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+@@ -1481,6 +1496,18 @@ __dpct_inline__ void native_down_kernel(
+         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+         int e = e0;
+         if constexpr (Multi<TD>::has) {
++            if constexpr (E > 4) {
++                for (; e + E <= e1; e += E) {
++                    const block_q8_1* xs[E];
++#pragma unroll
++                    for (int i = 0; i < E; ++i) xs[i] = hq + (size_t) (e + i) * hb;
++                    float o[E];
++                    row_dot_multi<TD, LN, E>(wr, xs, nb, sub, o);
++                    if (sub == 0)
++#pragma unroll
++                        for (int i = 0; i < E; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
++                }
++            }
+             for (; e + 4 <= e1; e += 4) {
+                 const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
+                 float o[4];
+@@ -2196,17 +2223,17 @@ inline int lanes_env(const char* name) {
+ }
+ inline int gu_lanes() { static const int v = lanes_env("STRATA_GU_LANES"); return v; }
+ inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); return v; }
+-template <int TG, int LN>
++template <int TG, int LN, int E = 4>
+ void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
+                     const NativeExpertLayout &L, float *gate, float *up) {
+     constexpr int ROWS = 256 / LN;
+     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
+     auto exp_props = sycl::ext::oneapi::experimental::properties{STRATA_ROOT_SYNC_PROP};
+-    s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>>>(
++    s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<E>>>(
+         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+-            native_gu_kernel<TG, LN>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++            native_gu_kernel<TG, LN, E>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         });
+ }
+ template <int TG>
+@@ -2220,17 +2247,17 @@ void launch_gu_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long lon
+         default: launch_gu_port<TG, 8>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+     }
+ }
+-template <int TD, int LN>
++template <int TD, int LN, int E = 4>
+ void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                       const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
+                       const NativeExpertLayout &L, float *out) {
+     constexpr int ROWS = 256 / LN;
+     const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
+     auto exp_props = sycl::ext::oneapi::experimental::properties{STRATA_ROOT_SYNC_PROP};
+-    s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>>>(
++    s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<E>>>(
+         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+-            native_down_kernel<TD, LN>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++            native_down_kernel<TD, LN, E>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         });
+ }
+ template <int TD>
+@@ -2553,10 +2580,10 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
+ 
+ void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+ 
+-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
++static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+-                           int64_t grid_groups) {
++                           int64_t grid_groups, bool prefill) {
+     if (cap_groups <= 0 || cap_entries <= 0) return;
+     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
+     dpct::queue_ptr s = strata::q_of(stream);
+@@ -2567,12 +2594,24 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+     const auto* X = (const block_q8_1*) x_q8_1;
+     const bool v1 = g_grouped_v1;
++    // Only the dedicated prompt entry point selects wider tiles.
++    // Decode caps count token-expert pairs (up to 80), not tokens.
++    static const int pf_rows = [] {
++        const char* v = std::getenv("STRATA_PF_EXPERT_KERNEL");
++        if (v && std::strcmp(v, "tile8") == 0) return 8;
++        if (v && std::strcmp(v, "tile16") == 0) return 16;
++        return 4; // dp4a: measured baseline, wider kernels opt-in
++    }();
++    const int rows = prefill && !v1 ? pf_rows : 4;
+     // #363: a verify window's PCIe call usually has no group: `grid_groups` block rows stride over the groups instead
+     // of one row per possible group (the results do not depend on it)
+     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
+                          (unsigned)gy);
+-    switch (L.gu_type) {
++    if (rows > 4 && L.gu_type == 22) {
++        if (rows == 8) launch_gu_port<22, 32, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        else launch_gu_port<22, 32, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++    } else switch (L.gu_type) {
+ #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+         STRATA_GU_FMTS(STRATA_GU)
+ #undef STRATA_GU
+@@ -2628,7 +2667,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     }
+     check("native_expert_grouped/swiglu");
+     const dpct::dim3 gd((unsigned)((L.n_embd + kExpertRows - 1) / kExpertRows), (unsigned)gy);
+-    switch (L.d_type) {
++    if (rows > 4 && L.d_type == 20) {
++        if (rows == 8) launch_down_port<20, 8, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++        else launch_down_port<20, 8, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++    } else switch (L.d_type) {
+ #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+         STRATA_D_FMTS(STRATA_DOWN)
+ #undef STRATA_DOWN
+@@ -2638,6 +2680,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+ }
+ 
+ 
++void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* ptr, const int32_t* start,
++                           const int32_t* ng, const int32_t* dst, const int32_t* tok, int64_t groups,
++                           int64_t entries, const void* x, void* scratch, float* out, void* stream, int64_t gy) {
++    native_expert_grouped_impl(L, ptr, start, ng, dst, tok, groups, entries, x, scratch, out, stream, gy, false);
++}
++void native_prefill_expert_grouped(const NativeExpertLayout& L, const unsigned long long* ptr, const int32_t* start,
++                                   const int32_t* ng, const int32_t* dst, const int32_t* tok, int64_t groups,
++                                   int64_t entries, const void* x, void* scratch, float* out, void* stream) {
++    native_expert_grouped_impl(L, ptr, start, ng, dst, tok, groups, entries, x, scratch, out, stream, 0, true);
++}
++
++
+ #if !defined(STRATA_SYCL_NO_XMX)   // arc-moe: 16x16x16 FP16 joint_matrix crashes IGC for Alchemist (acm-g10)
+ // ================================================================ SYCL port: XMX GEMM straight from the quantized rows
+ //
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index bb42bfc..e11cd6a 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1,3 +1,4 @@
++#include "strata/kernels/native_prefill.hpp"
+ // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
+@@ -3426,9 +3427,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 const int32_t* d_start = d_n + 4;
+                                 const unsigned long long* d_ptr = (const unsigned long long*) (gdev + al(16 + (kGrpMax + 1) * 4));
+                                 try {
+-                                    strata::kernels::native_expert_grouped(NL, d_ptr, d_start, d_n, iota, m.src_dev + row0, ng,
++                                    strata::kernels::native_prefill_expert_grouped(NL, d_ptr, d_start, d_n, iota, m.src_dev + row0, ng,
+                                                                            row1 - row0, xq, scratch, m.Dm + (size_t) row0 * N,
+-                                                                           m.cs, 0);
++                                                                           m.cs);
+                                 } catch (const std::exception& ex) {
+                                     err = std::string("prefill (grouped experts): ") + ex.what();
+                                     return false;
+-- 
+2.43.0
+

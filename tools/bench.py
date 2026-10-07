@@ -110,7 +110,7 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--long", action="store_true", help="also the ~2K-token code prompt")
     ap.add_argument("--json", help="write the raw rows here")
-    ap.add_argument("--cases", help="comma list of short, prose, 1k, 2k, 8k, 10k, sampled, agent "
+    ap.add_argument("--cases", help="comma list of short, prose, 1k, 1.5k, 2k, 8k, 10k, sampled, agent "
                                     "(default: short,prose, and 2k with --long)")
     ap.add_argument("--show", action="store_true", help="print every reply's start")
     a = ap.parse_args()
@@ -123,7 +123,8 @@ def main() -> int:
         return 1
 
     known = {"short": ("short code", lambda: SHORT_CODE, None), "prose": ("short prose (ru)", lambda: SHORT_PROSE, None),
-             "1k": ("0.7K code", lambda: long_code(2400), None),   # under --short-read 768: the windows
+             "1k": ("0.7K code", lambda: long_code(2400), None),
+             "1.5k": ("1.5K code", lambda: long_code(5000), None),
              "2k": ("2K code", long_code, None), "8k": ("8K code", lambda: long_code(28000), None),
              "10k": ("10K code", lambda: long_code(36000), None),
              # temperature / top_p / top_k / penalties: the sampled path every OpenAI-style client takes
