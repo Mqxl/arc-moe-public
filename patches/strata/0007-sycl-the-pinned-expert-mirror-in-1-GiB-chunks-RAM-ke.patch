@@ -1,0 +1,237 @@
+From 51e8b3b251f571679be622dee3f134074eeab16f Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 06:54:32 +0000
+Subject: [PATCH 7/7] sycl: the pinned expert mirror in 1 GiB chunks; RAM kept
+ free after it
+
+The mirror was one sycl::malloc_host of every mirrored expert - 10.5 GB for
+IQ2_XS on 2x A770. Arc A-series reports a max_mem_alloc_size of ~4 GB and
+Level Zero's relaxed allocation limits cover device and shared memory only,
+so the allocation failed, the mirror was empty, STRATA_VERIFY_NO_HOST=auto
+turned off, and the next host allocation (the MTP drafter's load) ended the
+engine with UR_RESULT_ERROR_OUT_OF_HOST_MEMORY.
+
+- GgufExpertSource::mirror allocates chunks of at most 1 GiB (and never
+  above the device's max_mem_alloc_size), filled in profile order; a chunk
+  the driver refuses only drops the mirror's coldest tail. Each mirrored
+  expert has its own pointer instead of an offset into one base.
+- STRATA_MIRROR_RESERVE_MIB (default 4096, as before): the RAM the mirror
+  leaves free for what loads after it. setup_intel.py writes 8192: the MTP
+  drafter reads its files into RAM, then the image encoder and the server.
+---
+ .../strata/core/gguf_expert_source.hpp        |  9 +-
+ sycl/setup_intel.py                           |  1 +
+ sycl/src/core/gguf_expert_source.cpp          | 91 ++++++++++++-------
+ sycl/src/program/generate.cpp                 |  6 +-
+ 4 files changed, 68 insertions(+), 39 deletions(-)
+
+diff --git a/sycl/include/strata/core/gguf_expert_source.hpp b/sycl/include/strata/core/gguf_expert_source.hpp
+index 678a754..308179f 100644
+--- a/sycl/include/strata/core/gguf_expert_source.hpp
++++ b/sycl/include/strata/core/gguf_expert_source.hpp
+@@ -69,10 +69,13 @@ private:
+     std::mutex mu_;
+     int64_t n_layers_ = 0, n_expert_ = 0;
+     int64_t reads_ = 0;
+-    uint8_t* mirror_ = nullptr;                    ///< USM host (pinned, device-readable)
++    // arc-moe: the mirror is several USM host allocations of at most kMirrorChunk bytes, not one. A single
++    // malloc_host of 10+ GB is refused on Arc A-series (its max_mem_alloc_size is ~4 GB, and Level Zero's relaxed
++    // limits cover device and shared allocations only).
++    std::vector<uint8_t*> mirror_chunks_;          ///< USM host (pinned, device-readable)
+     uint64_t mirror_bytes_ = 0;
+-    std::vector<int64_t> mirror_off_;              ///< per (layer, expert): offset in mirror_, -1 = not mirrored
+-    std::vector<int64_t> layer_first_;             ///< per layer: offset of its first mirrored blob, -1 = none
++    std::vector<uint8_t*> mirror_ptr_;             ///< per (layer, expert): its mirrored blob, nullptr = not mirrored
++    std::vector<uint8_t*> layer_first_;            ///< per layer: its first mirrored blob, nullptr = none
+ };
+ 
+ }  // namespace strata::core
+diff --git a/sycl/setup_intel.py b/sycl/setup_intel.py
+index 5c1919e..0e72d0e 100644
+--- a/sycl/setup_intel.py
++++ b/sycl/setup_intel.py
+@@ -149,6 +149,7 @@ def arc_env(cfg: dict, n_gpus: int) -> dict:
+            "SYCL_CACHE_PERSISTENT": "0",                 # the persistent JIT cache crashed (an AOT build does not JIT)
+            "ZES_ENABLE_SYSMAN": "1",                     # free-VRAM queries through Level Zero Sysman
+            "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1",   # the expert cache is one 10-15 GB allocation (> 4 GB)
++           "STRATA_MIRROR_RESERVE_MIB": "8192",          # RAM kept free after the pinned mirror (MTP, images, server)
+            # "arc": strata-sycl-native.sh resolves it to the discrete Arcs (never the CPU's integrated GPU)
+            "ONEAPI_DEVICE_SELECTOR": "arc"}
+     if n_gpus > 1:
+diff --git a/sycl/src/core/gguf_expert_source.cpp b/sycl/src/core/gguf_expert_source.cpp
+index 8c228f3..c427b97 100644
+--- a/sycl/src/core/gguf_expert_source.cpp
++++ b/sycl/src/core/gguf_expert_source.cpp
+@@ -2,6 +2,7 @@
+ #include "strata/core/gguf_expert_source.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ 
++#include <cstdio>
+ #include <cstring>
+ #include <fcntl.h>
+ #include <unistd.h>
+@@ -19,8 +20,9 @@ constexpr size_t kRing = 512;   // blobs alive at once: the prompt path holds a
+ GgufExpertSource::~GgufExpertSource() { close(); }
+ 
+ void GgufExpertSource::close() {
+-    if (mirror_) { sycl::free(mirror_, dpct::get_in_order_queue()); mirror_ = nullptr; }
+-    mirror_bytes_ = 0; mirror_off_.clear(); layer_first_.clear();
++    for (uint8_t* c : mirror_chunks_) sycl::free(c, dpct::get_in_order_queue());
++    mirror_chunks_.clear();
++    mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
+     for (int fd : fds_) if (fd >= 0) ::close(fd);
+     fds_.clear(); names_.clear(); layer_fd_.clear(); ring_.clear(); ring_key_.clear(); where_.clear();
+     ring_next_ = 0;
+@@ -75,9 +77,8 @@ int GgufExpertSource::fd_of(int64_t layer, int role, std::string& err) {
+ 
+ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
+     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_ || ring_.empty()) return nullptr;
+-    if (mirror_ != nullptr) {
+-        const int64_t o = mirror_off_[(size_t) (layer * n_expert_ + expert)];
+-        if (o >= 0) return mirror_ + o;
++    if (!mirror_ptr_.empty()) {
++        if (uint8_t* m = mirror_ptr_[(size_t) (layer * n_expert_ + expert)]) return m;
+     }
+     const auto& lay = strata::kernels::cpu::expert_layout();
+     const auto& fm = lay.fmt[(size_t) layer];
+@@ -115,70 +116,90 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
+ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
+                                  std::string& err) {
+     const auto& lay = strata::kernels::cpu::expert_layout();
+-    std::vector<std::pair<int64_t, int64_t>> take;
+-    std::vector<uint64_t> offs;
++    // arc-moe: chunks of at most 1 GiB (and never above the device's max_mem_alloc_size), filled in the pairs' order -
++    // the most-routed first - so a chunk the driver refuses only shortens the mirror's cold tail
++    uint64_t chunk_cap = 1ull << 30;
++    try {
++        const uint64_t mx = dpct::get_in_order_queue().get_device().get_info<sycl::info::device::max_mem_alloc_size>();
++        if (mx >= (64ull << 20) && mx < chunk_cap) chunk_cap = mx;
++    } catch (const sycl::exception&) {
++    }
++    struct Take { int64_t l, e; size_t chunk; uint64_t off; };
++    std::vector<Take> take;
++    std::vector<uint64_t> chunk_size;
+     uint64_t total = 0;
+     for (const auto& [l, e] : pairs) {
+         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
+         if (total + b > cap) break;
+-        take.push_back({l, e});
+-        offs.push_back(total);
++        if (chunk_size.empty() || chunk_size.back() + b > chunk_cap) chunk_size.push_back(0);
++        take.push_back({l, e, chunk_size.size() - 1, chunk_size.back()});
++        chunk_size.back() += b;
+         total += b;
+     }
+     if (take.empty()) return 0;
+-    uint8_t* base = nullptr;
+-    try {
+-        base = (uint8_t*) sycl::malloc_host(total, dpct::get_in_order_queue());
+-    } catch (const sycl::exception& ex) {
+-        err = std::string("mirror: ") + ex.what();
++    std::vector<uint8_t*> chunks;
++    for (const uint64_t sz : chunk_size) {
++        uint8_t* c = nullptr;
++        try {
++            c = (uint8_t*) sycl::malloc_host(sz, dpct::get_in_order_queue());
++        } catch (const sycl::exception& ex) {
++            err = std::string("mirror: ") + ex.what();
++        }
++        if (c == nullptr) break;
++        chunks.push_back(c);
+     }
+-    if (base == nullptr) {
+-        if (err.empty()) err = "mirror: no pinned host memory for " + std::to_string(total >> 20) + " MiB";
++    if (chunks.empty()) {
++        if (err.empty()) err = "mirror: no pinned host memory for " + std::to_string(chunk_size[0] >> 20) + " MiB";
+         return -1;
+     }
++    if (chunks.size() < chunk_size.size()) {   // a partial mirror: the experts of the chunks that were allocated
++        std::fprintf(stderr, "strata: the pinned mirror got %zu of %zu chunks (%s); the rest of the experts stay on "
++                             "the SSD\n", chunks.size(), chunk_size.size(), err.empty() ? "the driver refused" : err.c_str());
++        err.clear();
++        while (!take.empty() && take.back().chunk >= chunks.size()) take.pop_back();
++    }
+     std::atomic<size_t> next{0};
+     std::atomic<bool> bad{false};
+     std::vector<std::thread> ts;
+     for (int i = 0; i < std::max(1, threads); ++i)
+         ts.emplace_back([&] {
+             for (size_t j; (j = next.fetch_add(1)) < take.size() && !bad.load();) {
+-                const auto [l, e] = take[j];
+-                if (!read_into(l, e, base + offs[j], (size_t) lay.bytes[(size_t) l])) bad.store(true);
++                const Take& t = take[j];
++                if (!read_into(t.l, t.e, chunks[t.chunk] + t.off, (size_t) lay.bytes[(size_t) t.l])) bad.store(true);
+             }
+         });
+     for (auto& th : ts) th.join();
+     if (bad.load()) {
+-        sycl::free(base, dpct::get_in_order_queue());
++        for (uint8_t* c : chunks) sycl::free(c, dpct::get_in_order_queue());
+         err = "mirror: reading an expert from the GGUF failed";
+         return -1;
+     }
+-    if (mirror_) sycl::free(mirror_, dpct::get_in_order_queue());
+-    mirror_ = base;
+-    mirror_bytes_ = total;
+-    mirror_off_.assign((size_t) (n_layers_ * n_expert_), -1);
+-    layer_first_.assign((size_t) n_layers_, -1);
+-    for (size_t j = 0; j < take.size(); ++j) {
+-        const auto [l, e] = take[j];
+-        mirror_off_[(size_t) (l * n_expert_ + e)] = (int64_t) offs[j];
+-        if (layer_first_[(size_t) l] < 0) layer_first_[(size_t) l] = (int64_t) offs[j];
++    for (uint8_t* c : mirror_chunks_) sycl::free(c, dpct::get_in_order_queue());
++    mirror_chunks_ = std::move(chunks);
++    mirror_bytes_ = 0;
++    mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
++    layer_first_.assign((size_t) n_layers_, nullptr);
++    for (const Take& t : take) {
++        uint8_t* p = mirror_chunks_[t.chunk] + t.off;
++        mirror_ptr_[(size_t) (t.l * n_expert_ + t.e)] = p;
++        if (layer_first_[(size_t) t.l] == nullptr) layer_first_[(size_t) t.l] = p;
++        mirror_bytes_ += (lay.bytes[(size_t) t.l] + 255) / 256 * 256;
+     }
+     return (int64_t) take.size();
+ }
+ 
+ bool GgufExpertSource::pinned(int64_t layer, int64_t expert) const {
+-    if (mirror_ == nullptr || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
+-    return mirror_off_[(size_t) (layer * n_expert_ + expert)] >= 0;
++    if (mirror_ptr_.empty() || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return false;
++    return mirror_ptr_[(size_t) (layer * n_expert_ + expert)] != nullptr;
+ }
+ 
+ const uint8_t* GgufExpertSource::device_alias(int64_t layer, int64_t expert) const {
+-    if (mirror_ == nullptr || layer < 0 || layer >= n_layers_) return nullptr;
++    if (mirror_ptr_.empty() || layer < 0 || layer >= n_layers_) return nullptr;
+     if (expert >= 0 && expert < n_expert_) {
+-        const int64_t o = mirror_off_[(size_t) (layer * n_expert_ + expert)];
+-        if (o >= 0) return mirror_ + o;
++        if (uint8_t* m = mirror_ptr_[(size_t) (layer * n_expert_ + expert)]) return m;
+     }
+-    const int64_t f = layer_first_[(size_t) layer];
+-    return f >= 0 ? mirror_ + f : nullptr;
++    return layer_first_[(size_t) layer];
+ }
+ 
+ bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, size_t bytes) const {
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 64dbed7..5925612 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -3828,7 +3828,11 @@ int main(int argc, char **argv) try {
+             std::fclose(f);
+         }
+         const char* mv = std::getenv("STRATA_MIRROR_MIB");
+-        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
++        // arc-moe: STRATA_MIRROR_RESERVE_MIB is the RAM left free after the mirror (default 4096, upstream's) for
++        // what loads after it - the MTP drafter reads its files into RAM, the image encoder, the server
++        const char* rv = std::getenv("STRATA_MIRROR_RESERVE_MIB");
++        const uint64_t reserve = rv ? (uint64_t) std::atoll(rv) << 20 : (4ull << 30);
++        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > reserve ? avail - reserve : 0);
+         if (!miss.empty() && cap > 0) {
+             const auto tm = Clock::now();
+             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
+-- 
+2.43.0
+

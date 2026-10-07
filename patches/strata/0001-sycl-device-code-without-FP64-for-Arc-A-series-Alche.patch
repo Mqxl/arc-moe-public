@@ -1,7 +1,7 @@
-From d79252de8e55b56166a3bffc571067755990cc07 Mon Sep 17 00:00:00 2001
+From 2405960fc4aeeb49af5a303f573656e0d9a89548 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:18:15 +0000
-Subject: [PATCH 1/6] sycl: device code without FP64 for Arc A-series
+Subject: [PATCH 1/7] sycl: device code without FP64 for Arc A-series
  (Alchemist)
 
 Xe-HPG (DG2: A770/A750/A580/A380) has no FP64 unit. Eight kernel files
