@@ -3,8 +3,8 @@
 # engine's profilers on, sends prompts, stops it, and writes everything worth reading into one file
 # (profile-<time>.txt).
 #
-#   N     the defaults (./arc start's: lib.sh arc_engine_env), nothing traced: the real speeds on short prompts and on
-#         2K / 10K prompts
+#   N     the defaults (./arc start's: lib.sh arc_engine_env), nothing traced: the real speeds on short prompts, on
+#         2K / 10K prompts and on a sampled request and an agent harness's (tools, streaming); every reply checked
 #   R512  the defaults with --vram-reserve-mib 512 (768 by default)
 #   S4    the defaults with --spec 4 (6 by default: 8-token windows)
 #   DN32 / DN4  the experts' down GEMV with 32 / 4 lanes per row (8 by default; gate/up runs 32)
@@ -62,7 +62,7 @@ stop_server() {   # Ctrl+C to the server only: it sends the engine QUIT, so a tr
 trap stop_server EXIT
 
 keep='prefill timing|prompt chunk|prompt path|borrow|serve: prompt|verify stages|window: since|split|mirror|expert cache'
-keep+='|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
+keep+='|strata dbg|head sampling|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
 
 run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model, bench, stop, keep the engine's lines
     local name=$1 cases=$2 maxt=$3; shift 3
@@ -100,7 +100,7 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     echo
 } >"$out"
 
-run N short,prose,2k,10k 128 ARC_PROFILE_RUN=N
+run N short,prose,2k,10k,sampled,agent 128 ARC_PROFILE_RUN=N
 if [ "${ARC_PROFILE_SWEEP:-0}" = 1 ]; then
     run K-sg16 short,prose 128 STRATA_MMVQ_SG=16
     run K-sg3 short,prose 128 STRATA_MMVQ_SG=3
