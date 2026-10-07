@@ -1,0 +1,71 @@
+From 2b5a23cb5cffaa08ec11da7ba36d8a982d00d602 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 09:25:05 +0000
+Subject: [PATCH] sycl: STRATA_PREFILL_TIMING on host clocks; STRATA_WRAP runs
+ the engine under a tool
+
+The prompt path's phase timer read command_start/command_end from events
+of queues created without enable_profiling: the first fold threw and its
+catch called exit(1), so every timed prompt ended the engine (HTTP 503).
+Each mark now waits for the GPU and charges the host time since the
+previous mark to that phase.
+
+The native runner execs the engine under STRATA_WRAP when set (unitrace -d
+for per-kernel GPU time in ./arc profile).
+---
+ sycl/serve/strata-sycl-native.sh |  6 ++++++
+ sycl/src/prefill/prefill.cpp     | 16 ++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
+index b665e9c..ab21c83 100755
+--- a/sycl/serve/strata-sycl-native.sh
++++ b/sycl/serve/strata-sycl-native.sh
+@@ -44,4 +44,10 @@ if [ -n "${STRATA_EXTRA_ARGS:-}" ]; then
+ fi
+ set -- "${args[@]}"
+ cd "$here"
++# arc-moe: STRATA_WRAP runs the engine under a tool (./arc profile: unitrace for per-kernel GPU time)
++if [ -n "${STRATA_WRAP:-}" ]; then
++    read -r -a wrap <<< "$STRATA_WRAP"
++    echo "strata-sycl-native: engine under: ${wrap[*]}" >&2
++    exec "${wrap[@]}" "$bin" "$@"
++fi
+ exec "$bin" "$@"
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index a4fac2c..5303693 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1501,6 +1501,9 @@ struct PfTimer {
+     // names the stage that never completes
+     bool sync = std::getenv("STRATA_PREFILL_SYNC") != nullptr;
+     long long n_sync = 0;
++    const bool host_clock = true;                         // arc-moe: see mark
++    int host_last = -1;
++    std::chrono::steady_clock::time_point host_t{};
+     void mark(int phase, dpct::queue_ptr s) {
+         if (sync) {
+             const auto t0 = std::chrono::steady_clock::now();
+@@ -1510,6 +1513,19 @@ struct PfTimer {
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+         }
+         if (!on) return;
++        // arc-moe: host clocks. The event path below reads command_start/command_end, which only a queue created
++        // with enable_profiling has - these are not, so the first fold threw and exit(1) ended the engine. Each mark
++        // waits for the GPU (the phases then run back to back, a little slower than without the timer) and charges
++        // the time since the previous mark to that mark's phase - the same accounting as the events.
++        if (host_clock) {
++            s->wait();
++            const auto now = std::chrono::steady_clock::now();
++            if (host_last >= 0)
++                ms[host_last] += std::chrono::duration<double, std::milli>(now - host_t).count();
++            host_last = phase;
++            host_t = now;
++            return;
++        }
+         if (used == ev.size()) {
+             dpct::event_ptr e = nullptr;
+             e = new sycl::event();
+-- 
+2.43.0
+

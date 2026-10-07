@@ -254,6 +254,32 @@ These came from the first runs on the target machine (2x A770 16 GB, i915, 48 GB
   are uniform over the work-group: they test the group index or a value the whole group reads, so the whole group
   leaves together.
 
+## 9. First measurements on the A770s, and where the time goes
+
+`bb19834`, IQ2_XS, 32K context: decode 16.8 tok/s on code and 11.9 on prose, prompt reading ~50 tok/s. The
+prompt rate is flat from 2K to 10K tokens.
+
+**Decode.** Eager verify windows with a host clock at every stage (`./arc profile`, run B) average 400 ms on GPU 0
+(37 layers) and 113 ms on GPU 1 (11 layers and the head). Real graph windows take about 55% of that. Per layer, a
+trivial stage costs ~0.3 ms (the host's wait). Four stages cost 5-7x more on both cards:
+
+| stage (per GDN layer, eager) | GPU 0 | GPU 1 | what runs |
+|---|---|---|---|
+| `VRAM hits` | 2.0 ms | 0.6 ms | the routed experts, GPU 0's misses read from the pinned mirror over PCIe |
+| `shared+quant` | 1.7 ms | 1.8 ms | the shared expert (q8_1, 3 GEMVs, SwiGLU, BF16 gate) |
+| `hc-read1+router` | 1.5 ms | 1.6 ms | the fused hyper-connection read and the router GEMV + top-10 |
+| `hc-read0` | 1.4 ms | 1.3 ms | the fused hyper-connection read |
+
+Over 48 layers those four come to about 190 ms of a ~280 ms window. The excess in `VRAM hits` on GPU 0 is the
+mirror, roughly 50 ms per window. Run C shows that borrowing for the prompt path also gives GPU 0 18% more cache
+slots (7,761 instead of 6,592), because its prompt buffers no longer take their own VRAM.
+
+**Prompt.** The phase timer (`STRATA_PREFILL_TIMING`) ended the engine at the first prompt: it read event
+profiling info from queues created without `enable_profiling`. Patch 15 times the phases with host clocks.
+
+The next profile adds per-kernel GPU time (`unitrace -d`, built by `scripts/get-unitrace.sh`), a real decode baseline,
+and two Level Zero runtime switches as A/B runs: the v2 adapter, and the driver's in-order lists.
+
 ## What was verified here, and what was not
 
 | Check | Status |
