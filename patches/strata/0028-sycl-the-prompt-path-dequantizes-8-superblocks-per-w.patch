@@ -1,0 +1,122 @@
+From d09d240387c6936597d7fbf59763932a3d684a83 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 17:29:19 +0000
+Subject: [PATCH] sycl: the prompt path dequantizes 8 superblocks per
+ work-group; the device plan's PCIe staging is opt-in
+
+The batched prompt dequantizes every routed expert of a chunk (~17K per 8K-token chunk on one A770): 30% of
+the prompt path (STRATA_PREFILL_TIMING), ~40 GB/s written, one 32-thread work-group per superblock. The
+same per-thread work in 256-thread work-groups (bit-identical); STRATA_DQ_WG=32: as before.
+
+Patch 21's staging of mirrored experts by the device plan measured slower on 2x A770 (code decode 34.2 tok/s
+without it, 30.5 with it): STRATA_PLAN_STAGE=1 turns it on.
+---
+ sycl/src/core/verify.cpp                | 16 +++++++--
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 43 +++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 60e0505..601497f 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -52,6 +52,14 @@
+ #include <exception>
+ #include <immintrin.h>
+ 
++namespace {
++// arc-moe: STRATA_PLAN_STAGE=1 stages the device plan's mirrored experts in VRAM (patch 21); default off
++bool plan_stage() {
++    static const bool v = [] { const char* e = std::getenv("STRATA_PLAN_STAGE"); return e && e[0] == '1'; }();
++    return v;
++}
++}  // namespace
++
+ namespace strata::core {
+ namespace {
+ 
+@@ -910,9 +918,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+                           (uint32_t) ((l - lb_) * G + grp + 1), cs, nullptr,
+-                          // arc-moe: the mirrored experts go to the PCIe groups, which post() copies into this
+-                          // group's share of the VRAM staging (fetch_blobs) - in the copy-kernel mode only
+-                          sink_.pcie_mode == 2 ? (int) (G == 2 ? kStagingBlobs / 2 : kStagingBlobs) : 0);
++                          // arc-moe: STRATA_PLAN_STAGE=1 - the mirrored experts go to the PCIe groups, which post()
++                          // copies into this group's share of the VRAM staging (fetch_blobs), in the copy-kernel mode.
++                          // Off by default: measured on 2x A770, code decode 34.2 tok/s without it (round 7), 30.5
++                          // with it (round 8); the expert GEMVs read the pinned mirror over PCIe themselves.
++                          plan_stage() && sink_.pcie_mode == 2 ? (int) (G == 2 ? kStagingBlobs / 2 : kStagingBlobs) : 0);
+         if (device_plan_ && steplog) {   // arc-moe: did the device plan the group (skip == ring) or refuse (0)?
+             step_sync(l, 17, grp, "resident_plan");
+             uint32_t sk = 0;
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 19c0e9c..2efe64b 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -1983,6 +1983,33 @@ __dpct_inline__ void dequant_gu_kernel(
+                             item_ct1.get_local_id(2));
+ }
+ 
++// arc-moe: the same two kernels with 8 superblocks per 256-thread work-group (32 threads each, as above): the prompt
++// path dequantizes every routed expert of a chunk (~17K per 8K-token chunk on one A770), and one 32-thread work-group
++// per superblock left Alchemist's dispatcher the bottleneck (~40 GB/s written). Per thread the work is unchanged, so
++// the output is bit-identical. STRATA_DQ_WG=32: the one-superblock work-groups.
++__dpct_inline__ void dequant_flat_kernel_wide(int ty, const void *__restrict__ vx, sycl::half *__restrict__ y,
++                                              int64_t n_blocks) {
++    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++    const int64_t g = (int64_t) item_ct1.get_global_id(2);
++    const int64_t i = g >> 5;
++    if (i >= n_blocks) return;
++    dq_dispatch<sycl::half>(ty, vx, i, y + i * QK_K, (int) (g & 31));
++}
++__dpct_inline__ void dequant_gu_kernel_wide(int ty, const void *__restrict__ gate, const void *__restrict__ up,
++                                            int64_t per_row, sycl::half *__restrict__ y, int64_t n_blocks) {
++    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++    const int64_t g = (int64_t) item_ct1.get_global_id(2);
++    const int64_t i = g >> 5;
++    if (i >= n_blocks) return;
++    const int parity = item_ct1.get_group(1);
++    const int64_t r = i / per_row, c = i % per_row;
++    dq_dispatch<sycl::half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, (int) (g & 31));
++}
++bool dq_wide() {
++    static const bool v = [] { const char* e = std::getenv("STRATA_DQ_WG"); return !(e && std::atoi(e) == 32); }();
++    return v;
++}
++
+ // the types dq_dispatch dequantizes
+ bool is_iq(int t) {
+     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+@@ -2352,6 +2379,14 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
+ 
+ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
+     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
++    if (dq_wide()) {
++        const int64_t nb = n / 256, threads = (nb * 32 + 255) / 256 * 256;
++        strata::q_of(stream)->parallel_for<dpct_kernel_name<class dequant_flat_wide_a1>>(
++            sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t) threads), sycl::range<3>(1, 1, 256)),
++            [=](sycl::nd_item<3>) { dequant_flat_kernel_wide(t, src, (sycl::half *) dst, nb); });
++        check("iq_dequant_f16");
++        return;
++    }
+     {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+@@ -2452,6 +2487,14 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
+     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
+     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
+     const int64_t per_row = n_embd / 256;
++    if (dq_wide()) {
++        const int64_t nb = n_ff * per_row, threads = (nb * 32 + 255) / 256 * 256;
++        strata::q_of(stream)->parallel_for<dpct_kernel_name<class dequant_gu_wide_a1>>(
++            sycl::nd_range<3>(sycl::range<3>(1, 2, (size_t) threads), sycl::range<3>(1, 1, 256)),
++            [=](sycl::nd_item<3>) { dequant_gu_kernel_wide(t, gate, up, per_row, (sycl::half *) dst, nb); });
++        check("iq_dequant_gu_f16");
++        return;
++    }
+     {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-- 
+2.43.0
+
