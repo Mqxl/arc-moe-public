@@ -1,7 +1,7 @@
-From ce49672a84d772fffd360ec98198f1e760259f02 Mon Sep 17 00:00:00 2001
+From c006fa515e88926f879bb4156b28c70bac2beb8c Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:19:52 +0000
-Subject: [PATCH 4/7] sycl serve: Monitor readings for every Arc, on i915 as
+Subject: [PATCH 4/8] sycl serve: Monitor readings for every Arc, on i915 as
  well as xe
 
 The xe reader took the first card with tile0/ for every index, so a layer

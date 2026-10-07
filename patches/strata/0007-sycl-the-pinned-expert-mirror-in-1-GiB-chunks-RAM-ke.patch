@@ -1,7 +1,7 @@
-From 51e8b3b251f571679be622dee3f134074eeab16f Mon Sep 17 00:00:00 2001
+From a7ab496e7e99f585507a0d4a08dbf1ae2eca1cba Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 06:54:32 +0000
-Subject: [PATCH 7/7] sycl: the pinned expert mirror in 1 GiB chunks; RAM kept
+Subject: [PATCH 7/8] sycl: the pinned expert mirror in 1 GiB chunks; RAM kept
  free after it
 
 The mirror was one sycl::malloc_host of every mirrored expert - 10.5 GB for

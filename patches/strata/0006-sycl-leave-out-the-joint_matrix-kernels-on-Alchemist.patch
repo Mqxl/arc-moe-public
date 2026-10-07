@@ -1,7 +1,7 @@
-From 04e8e550a5ef58fc543e1157424a6dd1cdcbfdd7 Mon Sep 17 00:00:00 2001
+From 481a6bcb8bf31c55403fa5ba727fa9803ea4d4b0 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:26:16 +0000
-Subject: [PATCH 6/7] sycl: leave out the joint_matrix kernels on Alchemist
+Subject: [PATCH 6/8] sycl: leave out the joint_matrix kernels on Alchemist
 
 qsa_prompt_attn_xmx (6 instances) and xmx_gemm_iq use 16x16x16 FP16
 joint_matrix tiles, Xe2's DPAS shape. Alchemist's DPAS is 8x8x16 for FP16, and

@@ -1,0 +1,97 @@
+From 7a578e6bf48bf13a16f148f64fd179f22a2af9b9 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 07:07:15 +0000
+Subject: [PATCH 8/8] sycl: MtpDrafter::bind names the step and the GPU that
+ failed
+
+The bind's catch printed only the exception and its own line (mtp.cpp:551)
+and exited, whatever had thrown. On 2x A770 it reports
+UR_RESULT_ERROR_OUT_OF_HOST_MEMORY with 45 GiB of RAM free and the expert
+mirror allocated - so the failing operation has to be named:
+
+- every step of bind is labelled; a sycl::exception returns false with
+  'mtp bind on GPU <n>: <step>: <what>', which strata serve prints
+- bind first waits for the device's earlier work, so an asynchronous error
+  of an earlier step of the load surfaces there, labelled as such, instead
+  of being blamed on the draft head
+---
+ sycl/src/core/mtp.cpp | 25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/sycl/src/core/mtp.cpp b/sycl/src/core/mtp.cpp
+index 554afd4..905c853 100644
+--- a/sycl/src/core/mtp.cpp
++++ b/sycl/src/core/mtp.cpp
+@@ -501,8 +501,16 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
+ }  // namespace
+ 
+ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
+-                      const float *window_R, std::string &err) try {
++                      const float *window_R, std::string &err) {
++    // arc-moe: every step is named, so an exception says which operation on which GPU failed - the catch at the
++    // end used to print only the exception and its own line (`mtp.cpp, line:551`), whatever had thrown
++    const char* step = "select the drafter's device";
++    try {
+     const OnDevice on_device(device_);
++    // An error of an earlier asynchronous operation on this device surfaces at the first wait below; draw it out
++    // here, so it is not blamed on the draft head.
++    step = "wait for the device's earlier work (an error here belongs to an earlier step of the load)";
++    dpct::get_current_device().queues_wait_and_throw();
+     wt_ = &wt;
+     head_ = head;
+     window_R_ = window_R;
+@@ -510,6 +518,7 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
+     if (!wo) { err = "mtp: output.weight is missing"; return false; }
+     n_vocab_ = wo->ne1;
+     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
++    step = "allocate the draft logits";
+     if (head_logits_ == nullptr &&
+         DPCT_CHECK_ERROR(head_logits_ = sycl::malloc_device<float>(
+                              (size_t)max_t_ * (size_t)n_vocab_,
+@@ -519,10 +528,12 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
+     }
+     // the draft head's token subset, when tools/draft_vocab.py wrote one
+     if (dhead_ == nullptr) {
++        step = "read draft_vocab.bin";
+         std::vector<uint8_t> raw;
+         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
+             n_dvocab_ = (int64_t) (raw.size() / 4);
+             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
++            step = "allocate the draft head";
+             if (DPCT_CHECK_ERROR(dvocab_ = (int32_t *)sycl::malloc_device(
+                                      raw.size(), dpct::get_in_order_queue())) !=
+                     0 ||
+@@ -533,9 +544,11 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
+                 draft_head_hint(n_dvocab_, row_bytes);
+                 return false;
+             }
++            step = "upload the draft vocabulary";
+             dpct::get_in_order_queue()
+                 .memcpy(dvocab_, raw.data(), raw.size())
+                 .wait();
++            step = "gather the draft head's rows (gather_rows)";
+             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+             dpct::get_current_device().queues_wait_and_throw();
+             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+@@ -543,13 +556,13 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
+                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
+         }
+     }
++    step = "set up coupled drafting";
+     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+     return true;
+-}
+-catch (sycl::exception const &exc) {
+-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+-            << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++    } catch (sycl::exception const &exc) {
++        err = std::string("mtp bind on GPU ") + std::to_string(device_) + ": " + step + ": " + exc.what();
++        return false;
++    }
+ }
+ 
+ // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
+-- 
+2.43.0
+
