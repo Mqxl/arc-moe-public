@@ -377,6 +377,21 @@ The lanes change the summation order, so greedy text can differ: prose ran to 12
 `--spec 6` (lib.sh `arc_engine_env`). Round 7 measures that combination twice per prompt and A/Bs it against
 512, `--spec 4`, and 32 / 4 down lanes.
 
+### Round 7 (089cb18): the combination, two requests per prompt
+
+`./arc start`'s defaults (32 gate/up lanes, 768 MiB reserve, `--spec 6`, 8K borrowed chunks, no first chunk):
+
+| prompt | prompt tok/s | decode tok/s |
+|---|---|---|
+| short code | 42-54 | **34.2** (33.7 / 34.6) |
+| short prose (ru) | 55 | 19.4 (18.9 / 19.8) |
+| 2K code | 456 / 717 | 26.4 |
+| 10.7K code | 814 / **997** | 26.2 |
+
+None of the single changes against it beats noise: reserve 512 34.5 / 19.5 (first 10K prompt 749), `--spec 4`
+33.2 / 19.8, 32 or 4 down lanes 33.2 / 18.8 and 33.8 / 19.1, 16 gate/up lanes 31.4 / 18.5. Prose stays below code
+because its MTP drafts are accepted far less often (~35 of 100 against ~85).
+
 ## What was verified here, and what was not
 
 | Check | Status |
