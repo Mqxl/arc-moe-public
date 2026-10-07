@@ -4,13 +4,16 @@
 # (profile-<time>.txt).
 #
 #   N   the defaults (./arc start's), nothing traced: the real speeds on short prompts and on 2K / 10K prompts
+#   R512  --vram-reserve-mib 512 (1,536 by default): ~750 more expert slots per card, fewer reads over PCIe
+#   GU*/DN16  lanes per row of the expert kernels (STRATA_GU_LANES / STRATA_DOWN_LANES, 8 by default)
+#   S5/S6 --spec 5 / 6: windows of 7 / 8 tokens (6 by default) - code accepts 93% of the drafts
 #   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
-#   D   decode, eager, under unitrace: the GPU time of every kernel by name
-#   E   the 10K prompt under unitrace
+#   D   decode, eager, under unitrace: the GPU time of every kernel by name   (ARC_PROFILE_TRACE=1)
+#   E   the 10K prompt under unitrace                                          (ARC_PROFILE_TRACE=1)
 #   ARC_PROFILE_SWEEP=1 adds round 4's kernel-variant runs (K*: decode, G*: the GDN recurrence)
 #
 # D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: cmake + network, ~5 min).
-# The server must be stopped first (the run starts its own). About 15 minutes (each run reloads the model).
+# The server must be stopped first (the run starts its own). About 25 minutes (each run reloads the model).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 use_unitrace=1
@@ -35,7 +38,7 @@ out="$ROOT/profile-$(date +%Y%m%d-%H%M%S).txt"
 keyarg=(); [ "$key" != "-" ] && keyarg=(--api-key "$key")
 
 unitrace=""
-if [ $use_unitrace = 1 ]; then
+if [ $use_unitrace = 1 ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
     if "$ROOT/scripts/get-unitrace.sh"; then unitrace="$ROOT/third_party/pti-gpu/tools/unitrace/build/unitrace"
     else warn "no unitrace: runs D and E are skipped (./arc profile --no-unitrace to not try)"; fi
 fi
@@ -108,8 +111,16 @@ if [ "${ARC_PROFILE_SWEEP:-0}" = 1 ]; then
     run G-heads 10k 16 STRATA_GDN_REC_HEADS=1
     run G-nopipe 10k 16 STRATA_GDN_PIPELINE=0
 fi
+BASE_ARGS="--prefill-borrow --prefill auto"   # ./arc start's flags: STRATA_EXTRA_ARGS replaces them, so a run repeats them
+run R512 short,prose,10k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --vram-reserve-mib 512"
+run GU16 short,prose 128 STRATA_GU_LANES=16
+run GU32 short,prose 128 STRATA_GU_LANES=32
+run GU4 short,prose 128 STRATA_GU_LANES=4
+run DN16 short,prose 128 STRATA_DOWN_LANES=16
+run S5 short,prose,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 5"
+run S6 short,prose,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 6"
 run A 10k 128 STRATA_PREFILL_TIMING=1 STRATA_DRAFT_TIMING=1
-if [ -n "$unitrace" ]; then
+if [ -n "$unitrace" ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
     run D short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.D.unitrace"
     run E 10k 1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.E.unitrace"
     for f in "$out".D.unitrace* "$out".E.unitrace*; do

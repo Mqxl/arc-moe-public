@@ -1,0 +1,78 @@
+From dd7f36d11e16a6a409e86f5ccb9326cc90902445 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 12:52:32 +0000
+Subject: [PATCH] sycl: resident_plan holds 128 entries (windows of 8 tokens
+ with the device plan)
+
+The device-built plan staged at most 64 entries (one 64-item work-group),
+enough for --spec 4's 6-token windows. --spec 6 with the suffix drafter
+makes windows of 8 (kVerifyMaxT): 80 entries, which the kernel refused -
+and in a host-free window (STRATA_VERIFY_NO_HOST) a refused plan is one
+nobody sends. One work-group of 128 and local arrays of 128.
+---
+ sycl/src/kernels/cuda/verify_kernels.dp.cpp | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/verify_kernels.dp.cpp b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+index f91a0e1..6301392 100644
+--- a/sycl/src/kernels/cuda/verify_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+@@ -926,6 +926,10 @@ inline bool plan_parallel() {   // STRATA_PLAN_PARALLEL=0: thread 0 groups the e
+     static const bool v = std::getenv("STRATA_PLAN_PARALLEL") == nullptr || std::atoi(std::getenv("STRATA_PLAN_PARALLEL")) != 0;
+     return v;
+ }
++// arc-moe: the plan's local capacity (entries = window tokens x 10). It was 64, enough for the 6-token windows of
++// --spec 4; a window of 8 (--spec 6 with the suffix drafter, kVerifyMaxT) has 80 entries, which the kernel refused -
++// and a refused plan in a host-free window (STRATA_VERIFY_NO_HOST) is a plan nobody sends. One work-group of 128.
++constexpr int kPlanCap = 128;
+ __dpct_inline__ void resident_plan_kernel(
+     const int32_t *__restrict__ ids, int n, int k,
+     const int32_t *__restrict__ res, int n_expert, const uint8_t *cache_base,
+@@ -947,14 +951,14 @@ __dpct_inline__ void resident_plan_kernel(
+     // memory for every compare (n^2 of them) took 87 us per layer on the B70 - 4% of a decode round; a work-group
+     // of 64 loads the n <= 60 entries once, then thread 0 groups them from local memory.
+     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+-    auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[64]>(item.get_group());
+-    auto &s_res = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[64]>(item.get_group());
++    auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kPlanCap]>(item.get_group());
++    auto &s_res = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kPlanCap]>(item.get_group());
+     auto &s_bad = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(item.get_group());
+-    auto &s_mir = *sycl::ext::oneapi::group_local_memory_for_overwrite<unsigned long long[64]>(item.get_group());
++    auto &s_mir = *sycl::ext::oneapi::group_local_memory_for_overwrite<unsigned long long[kPlanCap]>(item.get_group());
+     const int tid = (int) item.get_local_id(2);
+     if (tid == 0) s_bad = 0;
+     item.barrier(sycl::access::fence_space::local_space);
+-    for (int i = tid; i < n && i < 64; i += 64) {
++    for (int i = tid; i < n && i < kPlanCap; i += kPlanCap) {
+         const int32_t e = ids[i];
+         const bool valid = e >= 0 && e < n_expert;
+         const int32_t sl = valid ? res[e] : -1;
+@@ -965,14 +969,14 @@ __dpct_inline__ void resident_plan_kernel(
+         if (!valid || (sl < 0 && ma == 0)) s_bad = 1;
+     }
+     item.barrier(sycl::access::fence_space::local_space);
+-    if (s_bad || n > 64) { if (tid == 0) refuse(); return; }   // n > 64 never happens (kVerifyMaxT * 10 = 60); refuse rather than read past
++    if (s_bad || n > kPlanCap) { if (tid == 0) refuse(); return; }   // arc-moe: kPlanCap = 128 (kVerifyMaxT 8 x 10 = 80 entries)
+     if (par) {
+         // SYCL port: the grouping in parallel, one thread per entry (unitrace: thread 0 alone took 73 us per layer,
+         // ~3.5 ms of a decode round). The plan is the host loop's exactly: groups in order of first occurrence,
+         // entries in a group in index order. Entry i: L = its expert's first index; its group = the number of
+         // first occurrences before L; the group starts at the number of entries whose leader is before L; its
+         // place in the group = the number of earlier entries with the same leader.
+-        auto &s_lead = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[64]>(item.get_group());
++        auto &s_lead = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kPlanCap]>(item.get_group());
+         if (tid < n) {
+             int L = tid;
+             for (int j = 0; j < tid; ++j) if (s_ids[j] == s_ids[tid]) { L = j; break; }
+@@ -1147,7 +1151,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
+         const bool par = plan_parallel();
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class resident_plan_kernel_db6b7a>>(
+-                sycl::nd_range<3>(sycl::range(1, 1, STRATA_PLAN_LOCAL ? 64 : 1), sycl::range(1, 1, STRATA_PLAN_LOCAL ? 64 : 1)),
++                sycl::nd_range<3>(sycl::range(1, 1, STRATA_PLAN_LOCAL ? kPlanCap : 1), sycl::range(1, 1, STRATA_PLAN_LOCAL ? kPlanCap : 1)),
+                 exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                     resident_plan_kernel(ids, n_entries, k, res_layer, n_expert,
+                                          cache_base, slot_off, blob, plan, capx,
+-- 
+2.43.0
+

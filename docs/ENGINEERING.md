@@ -344,6 +344,22 @@ and two Level Zero runtime switches as A/B runs: the v2 adapter, and the driver'
 - **Prompt trace, next targets:** `gdn_recurrence` takes 36.8 ms per call (8K sequential steps; a chunk-parallel
   form is the fix). Prompt attention runs through the FP32 `qsa_decode_attn_batch` at 724 us x 4,032 calls.
 
+### Round 5 (e819263)
+
+- **Speeds:** decode 25.1 tok/s on code (from 21.5) and 17.6 on prose (from 13.9). The 10.7K prompt reads at 789 tok/s
+  (from 589). The batched draft pass takes 128 ms per 8K chunk (from 2.9 s). GDN recurrence 1.05 s (from 3.3 s),
+  which the large register file sped up too.
+- **Decode kernels now:** about 108 ms of kernel time per ~188 ms window. The rest is gaps between ~2,900 small
+  kernels.
+  - `gr_up_multi` takes 110 us (from 269).
+  - The expert GEMVs lead: `launch_gu_port<IQ2_S>` 368 us per call, but between 3.7 us and 4,350 us. The B70 measured
+    52.5 us for it. The spread fits GPU 0's calls reading their misses over PCIe from inside the kernel.
+- **Round 6 A/B:**
+  - `--vram-reserve-mib 512`, for ~750 more expert slots per card (1.4 GB stayed free after loading).
+  - The expert kernels' lanes per row (`STRATA_GU_LANES` / `STRATA_DOWN_LANES`).
+  - `--spec 5/6`: windows of 7/8 tokens, since code accepts 93% of the drafts. This needed patch 20: the device plan
+    held 64 entries and refused the 80 of an 8-token window, which in a host-free window means a plan nobody sends.
+
 ## What was verified here, and what was not
 
 | Check | Status |
