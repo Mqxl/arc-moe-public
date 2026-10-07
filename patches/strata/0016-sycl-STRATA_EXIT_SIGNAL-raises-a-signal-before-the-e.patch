@@ -1,0 +1,41 @@
+From 083156aa70714b046d0754187036a1df6140d966 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 10:48:50 +0000
+Subject: [PATCH] sycl: STRATA_EXIT_SIGNAL raises a signal before the engine's
+ _Exit
+
+The engine leaves through std::_Exit(0) (its GPU objects' destructors abort
+against a runtime already shutting down), which skips every exit handler -
+so a tool the engine runs under never wrote its report. With
+STRATA_EXIT_SIGNAL=<signum> the engine raises it first; unitrace
+--teardown-on-signal <signum> writes the per-kernel times from its handler.
+---
+ sycl/src/program/generate.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 368645a..6896c4d 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -105,6 +105,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
+ #include <cmath>
+ #include <limits>
+ #include <cstdio>
++#include <csignal>
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+@@ -7491,6 +7492,10 @@ int main(int argc, char **argv) try {
+         try { dpct::get_current_device().queues_wait_and_throw(); } catch (...) {}
+         std::fflush(stdout);
+         std::fflush(stderr);
++        // arc-moe: STRATA_EXIT_SIGNAL=<signum> raises it first - a tool the engine runs under (unitrace
++        // --teardown-on-signal) writes its report from its handler, which _Exit would skip with the destructors
++        if (const char* sig = std::getenv("STRATA_EXIT_SIGNAL"); sig != nullptr && std::atoi(sig) > 0)
++            std::raise(std::atoi(sig));
+         std::_Exit(0);
+     }
+ 
+-- 
+2.43.0
+

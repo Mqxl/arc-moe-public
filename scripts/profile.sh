@@ -3,16 +3,16 @@
 # engine's profilers on, sends prompts, stops it, and writes everything worth reading into one file
 # (profile-<time>.txt).
 #
-#   N   the defaults (./arc start's: 8K prompt chunks borrowing cache slots, no short first chunk), nothing traced:
-#       the real speeds on short prompts and on 2K / 10K-token prompts
-#   P16 16K prompt chunks (--prefill auto:16384): a 10K prompt in one walk over the experts instead of two
-#   SA  the stream-all walk (STRATA_PREFILL_STREAM_ALL=1): every non-resident expert through a 384-slot ring
-#   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) on the 10K prompt
+#   N   the defaults (./arc start's), nothing traced: the real speeds on short prompts and on 2K / 10K prompts
+#   K*  decode knobs, one run each (short code + prose): kernel variants upstream tuned on the B70 (Xe2) that may suit
+#       the A770 (Xe-HPG) better - SIMD16 GEMVs, the hyper-connection read's variants
+#   G*  prompt knobs, one run each (10K prompt): the GDN recurrence's kernel variants (same bits)
+#   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
 #   D   decode, eager, under unitrace: the GPU time of every kernel by name
 #   E   the 10K prompt under unitrace
 #
 # D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: cmake + network, ~5 min).
-# The server must be stopped first (the run starts its own). About 25 minutes.
+# The server must be stopped first (the run starts its own). About 45 minutes (each run reloads the model).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 use_unitrace=1
@@ -58,7 +58,7 @@ stop_server() {   # Ctrl+C to the server only: it sends the engine QUIT, so a tr
 trap stop_server EXIT
 
 keep='prefill timing|prompt chunk|prompt path|borrow|serve: prompt|verify stages|window: since|split|mirror|expert cache'
-keep+='|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
+keep+='|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
 
 run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model, bench, stop, keep the engine's lines
     local name=$1 cases=$2 maxt=$3; shift 3
@@ -97,12 +97,21 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
 } >"$out"
 
 run N short,prose,2k,10k 128 ARC_PROFILE_RUN=N
-run P16 10k 128 "STRATA_EXTRA_ARGS=--prefill-borrow --prefill auto:16384"
-run SA 10k 128 STRATA_PREFILL_STREAM_ALL=1
-run A 10k 128 STRATA_PREFILL_TIMING=1
+run K-sg16 short,prose 128 STRATA_MMVQ_SG=16
+run K-sg3 short,prose 128 STRATA_MMVQ_SG=3
+run K-rpw2 short,prose 128 STRATA_MMVQ_RPW=2
+run K-grv3 short,prose 128 STRATA_GR_V3=1
+run K-sliced0 short,prose 128 STRATA_GR_DOWN_SLICED=0
+run K-normsplit0 short,prose 128 STRATA_GR_NORM_SPLIT=0
+run K-hcsplit1 short,prose 128 STRATA_HC_SPLIT=1
+run K-hcsplit0 short,prose 128 STRATA_HC_SPLIT=0
+run G-keyhead 10k 16 STRATA_GDN_KEYHEAD=1
+run G-heads 10k 16 STRATA_GDN_REC_HEADS=1
+run G-nopipe 10k 16 STRATA_GDN_PIPELINE=0
+run A 10k 128 STRATA_PREFILL_TIMING=1 STRATA_DRAFT_TIMING=1
 if [ -n "$unitrace" ]; then
-    run D short,prose 128 STRATA_VERIFY_EAGER=1 "STRATA_WRAP=$unitrace -d -o $out.D.unitrace"
-    run E 10k 1 "STRATA_WRAP=$unitrace -d -o $out.E.unitrace"
+    run D short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.D.unitrace"
+    run E 10k 1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.E.unitrace"
     for f in "$out".D.unitrace* "$out".E.unitrace*; do
         [ -f "$f" ] || continue
         { echo "================ $(basename "$f")"; head -c 60000 "$f"; echo; } >>"$out"

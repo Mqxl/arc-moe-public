@@ -296,6 +296,21 @@ and two Level Zero runtime switches as A/B runs: the v2 adapter, and the driver'
   stream-all walk and per-kernel times (`unitrace` builds without `libze-dev`, since its CMake fetches the Level
   Zero headers itself).
 
+### Round 3 (23394f0)
+
+- **Defaults:** 2K prompt 497 tok/s, 10.7K prompt 589 tok/s (18 s), decode 21.6 tok/s on code and 14.0 on prose.
+- **A/B runs:** 16K chunks were slower (437 tok/s): lending 6.7 GiB per card streams more experts. The stream-all walk
+  was slower too (363 tok/s). The 8K chunks stay.
+- **Prompt phases now:** the experts are no longer the problem. On GPU 0, GDN recurrence takes 31% (3.3 s per 10.7K
+  tokens, ~6x the B70's per-token cost) and prompt attention 22%. GPU 1 adds ~4.4 s after its chunks for the MTP
+  draft layer's K/V pass, which on its own costs about as much as GPU 1's 13 layers.
+- **unitrace:** it was built, but it wrote nothing. The engine leaves through `std::_Exit(0)` (its GPU objects'
+  destructors abort against a runtime that is already shutting down), which skips the tool's teardown. With
+  `STRATA_EXIT_SIGNAL=10`, the engine raises SIGUSR1 first, and `unitrace --teardown-on-signal 10` writes its
+  report from the handler (patch 16).
+- **Round 4** sweeps the kernel variants upstream tuned on the B70: SIMD16 GEMVs, the hyper-connection read's
+  variants and the GDN recurrence's variants, one run each. It also adds `STRATA_DRAFT_TIMING` and unitrace.
+
 ## What was verified here, and what was not
 
 | Check | Status |

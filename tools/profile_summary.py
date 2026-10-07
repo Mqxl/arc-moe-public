@@ -27,5 +27,19 @@ for name, sel in (("first GPU (no head)", [l for l in st if " head " not in l]),
     out.append(f"verify stages averaged, {name}, {len(sel)} windows (ms per window, summed over the GPU's layers):")
     for k, v in sorted(acc.items(), key=lambda x: -x[1]):
         out.append(f"  {k:32s} {v / len(sel):8.2f}")
+# one line per run: its bench rows (case: prompt tok/s / decode tok/s)
+runs, cur = [], None
+for l in lines:
+    if l.startswith("================ ") and not l.startswith("================ summary"):
+        cur = [l[17:].split(":")[0].strip(), l.split(":", 1)[1].strip() if ":" in l else "", []]
+        runs.append(cur)
+    elif cur is not None:
+        m = re.match(r"(short code|short prose \(ru\)|2K code|8K code|10K code)\s+\d+\s+\d+\s+\d+\s+([0-9.]+)\s+([0-9.]+)", l)
+        if m:
+            cur[2].append(f"{m.group(1).replace('short ', '').replace(' (ru)', '')} {m.group(2)}/{m.group(3)}")
+if runs:
+    out.append("runs (case prompt tok/s / decode tok/s):")
+    for name, what, rows in runs:
+        out.append(f"  {name:12s} {' | '.join(rows) or '(no rows)':70s} {what[:70]}")
 with open(path, "a", encoding="utf-8") as f:
     f.write("\n================ summary\n" + "\n".join(out) + "\n")
