@@ -1,7 +1,7 @@
-From df89ff1e3ac7b58bc11911f384439cfdcb62eaa4 Mon Sep 17 00:00:00 2001
+From 8c4a21ea6f23d900d5217c533590ccb069b0669d Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:19:52 +0000
-Subject: [PATCH 3/8] sycl setup: native runner, CPU image encoder, every Arc
+Subject: [PATCH 3/9] sycl setup: native runner, CPU image encoder, every Arc
  in the layer split
 
 - STRATA_SYCL_NATIVE (default when the strata-sycl-dev image is absent):

@@ -177,6 +177,31 @@ nothing defines. (The 2x B60 report ran `6f32ec0`, a commit that is no longer on
 gives the SYCL definition the parameter and #871's behaviour when there is no skip flag: an empty plan and the error
 flag with a system-scope fence, instead of a null store.
 
+## 8. First runs on 2x A770: what the hardware showed
+
+These came from the first runs on the target machine (2x A770 16 GB, i915, 48 GB RAM, IQ2_XS at 32K).
+
+- **The setup crashed** (`write_run_script() takes 3 positional arguments but 4 were given`). setup.py at the pin
+  passes `open_browser`, and upstream fixed `setup_intel.py` for it only after the pin (#870). The wrapper now
+  forwards every argument.
+- **The engine stopped at `unknown argument: --remote-expert-opt`.** setup.py adds #578's switch to every
+  multi-GPU config, at setup and again on its start path, and server.py adds `--batch N` for `"parallel"`. The SYCL
+  engine parses neither. The config drops them and writes `"remote_expert_opt": false`, and the native runner strips
+  them from the command line as well.
+- **The mirror was refused** (`no pinned host memory for 10496 MiB`). It was one `malloc_host`, and A770's
+  `max_mem_alloc_size` is ~4 GB; the relaxed limits cover device memory only. It is now 1 GiB chunks. On the next
+  run: `7721 of 7721 experts ... mirrored (10.25 GiB, 4.8 s)` and `STRATA_VERIFY_NO_HOST=auto -> on`.
+- **`UR_RESULT_ERROR_OUT_OF_HOST_MEMORY` at `mtp.cpp:551`**, with 45 GiB of RAM free. The line is the catch of
+  `MtpDrafter::bind`, not of the drafter's load. Labelled steps (patch 8) placed it at the `gather_rows` kernel on
+  GPU 1. The wait on that device's earlier work right before it was clean. `gather_rows` is the first kernel the
+  engine launches on the second GPU; until then that GPU only received allocations and copies.
+
+  dpct gave all 318 kernel launches `use_root_sync`, so DPC++ submits every kernel as a **cooperative** kernel.
+  No kernel uses a root-group barrier. The 2x B60 that ran this code were on the `xe` driver; the A770s are on
+  `i915`. Patch 9 makes the property a macro that is empty on Alchemist, so the same kernels launch the ordinary way.
+  `./arc probe` checks this hypothesis in a minute: it launches the same 384 x 256 gather on every GPU, both ways, plus
+  a kernel that reads pinned host memory.
+
 ## What was verified here, and what was not
 
 | Check | Status |

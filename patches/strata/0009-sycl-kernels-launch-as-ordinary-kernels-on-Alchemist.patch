@@ -1,0 +1,3142 @@
+From a3278dc692e0f7a6069ef1c79e15977216f35f0d Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 07:18:32 +0000
+Subject: [PATCH 9/9] sycl: kernels launch as ordinary kernels on Alchemist (no
+ use_root_sync)
+
+dpct gave all 318 kernel launches sycl::ext::oneapi::experimental::
+use_root_sync, which makes DPC++ submit them as cooperative kernels
+(zeCommandListAppendLaunchCooperativeKernel). No kernel uses a root-group
+barrier, so the property buys only the cooperative path's constraints. On
+2x Arc A770 (i915) the first kernel launched on the second GPU of the layer
+split - gather_rows in MtpDrafter::bind, 384 x 256 - fails with
+UR_RESULT_ERROR_OUT_OF_HOST_MEMORY right after a clean wait on that device.
+
+The property is now the macro STRATA_ROOT_SYNC_PROP, empty when
+STRATA_SYCL_NO_ROOT_SYNC (ON by default for Alchemist targets): the same
+kernels, launched the ordinary way. Battlemage builds keep the property.
+---
+ sycl/CMakeLists.txt                           | 10 +++
+ sycl/src/core/device.dp.cpp                   |  2 +-
+ sycl/src/kernels/cuda/bf16_gemv.dp.cpp        |  8 +--
+ sycl/src/kernels/cuda/cvec.dp.cpp             |  2 +-
+ sycl/src/kernels/cuda/dequant_bf16.dp.cpp     |  2 +-
+ sycl/src/kernels/cuda/dequant_s2.dp.cpp       |  2 +-
+ sycl/src/kernels/cuda/elementwise.dp.cpp      | 32 ++++-----
+ sycl/src/kernels/cuda/fused_gdn.dp.cpp        |  6 +-
+ sycl/src/kernels/cuda/fused_gr.dp.cpp         | 38 +++++-----
+ sycl/src/kernels/cuda/gdn.dp.cpp              | 10 +--
+ sycl/src/kernels/cuda/gr.dp.cpp               | 20 +++---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp       | 36 +++++-----
+ sycl/src/kernels/cuda/kv_q4.dp.cpp            |  8 +--
+ sycl/src/kernels/cuda/kv_q8.dp.cpp            |  4 +-
+ sycl/src/kernels/cuda/kv_stream.dp.cpp        |  8 +--
+ sycl/src/kernels/cuda/native_bf16.dp.cpp      |  6 +-
+ .../src/kernels/cuda/native_flash_attn.dp.cpp |  2 +-
+ sycl/src/kernels/cuda/native_gdn.dp.cpp       |  2 +-
+ .../kernels/cuda/native_gdn_preprocess.dp.cpp | 10 +--
+ sycl/src/kernels/cuda/native_gr_norm.dp.cpp   |  4 +-
+ .../src/kernels/cuda/native_gr_postops.dp.cpp |  8 +--
+ sycl/src/kernels/cuda/native_mmvq.dp.cpp      | 36 +++++-----
+ sycl/src/kernels/cuda/native_moe.dp.cpp       |  4 +-
+ .../kernels/cuda/native_ple_postops.dp.cpp    | 20 +++---
+ sycl/src/kernels/cuda/native_qsa.dp.cpp       |  6 +-
+ .../kernels/cuda/native_qsa_indexer.dp.cpp    | 14 ++--
+ sycl/src/kernels/cuda/native_qsa_score.dp.cpp |  2 +-
+ sycl/src/kernels/cuda/native_rope.dp.cpp      |  4 +-
+ sycl/src/kernels/cuda/native_router.dp.cpp    |  4 +-
+ sycl/src/kernels/cuda/ple.dp.cpp              | 20 +++---
+ sycl/src/kernels/cuda/qsa.dp.cpp              | 16 ++---
+ sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp  | 20 +++---
+ sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp  |  4 +-
+ sycl/src/kernels/cuda/qsa_select.dp.cpp       | 14 ++--
+ sycl/src/kernels/cuda/quantize_act.dp.cpp     | 10 +--
+ sycl/src/kernels/cuda/rope.dp.cpp             |  2 +-
+ sycl/src/kernels/cuda/router_top10.dp.cpp     |  2 +-
+ .../src/kernels/cuda/s2_expert_grouped.dp.cpp | 42 +++++------
+ sycl/src/kernels/cuda/s2_gemv.dp.cpp          |  2 +-
+ sycl/src/kernels/cuda/s2_gemv_fast.dp.cpp     |  4 +-
+ sycl/src/kernels/cuda/s2_gemv_q8.dp.cpp       |  2 +-
+ sycl/src/kernels/cuda/s2_gemv_quads.dp.cpp    |  2 +-
+ sycl/src/kernels/cuda/s_gemv.dp.cpp           | 24 +++----
+ sycl/src/kernels/cuda/sampler.dp.cpp          | 18 ++---
+ sycl/src/kernels/cuda/shared_expert.dp.cpp    | 22 +++---
+ sycl/src/kernels/cuda/verify_kernels.dp.cpp   | 50 ++++++-------
+ sycl/src/prefill/kernels.dp.cpp               | 72 +++++++++----------
+ sycl/src/prefill/moe_mmq.dp.cpp               | 10 +--
+ 48 files changed, 328 insertions(+), 318 deletions(-)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index a49a50d..3c00736 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -34,6 +34,16 @@ if(STRATA_SYCL_NO_FP64)
+ endif()
+ # The opt-in XMX kernels (qsa_prompt_attn_xmx, xmx_gemm_iq) use 16x16x16 FP16 joint_matrix tiles, Xe2's shape;
+ # Alchemist's DPAS is 8x8x16 and IGC crashes on them for acm-g10. Off by default on Alchemist (the callers fall back).
++# dpct marked every kernel launch with use_root_sync, so DPC++ submits each one as a cooperative kernel
++# (zeCommandListAppendLaunchCooperativeKernel). No kernel here uses a root-group barrier, so the property only buys
++# the cooperative path's limits - on Arc A-series (i915) the first kernel on the second GPU of a layer split
++# (gather_rows, 384 x 256) fails with UR_RESULT_ERROR_OUT_OF_HOST_MEMORY. Off by default on Alchemist.
++option(STRATA_SYCL_NO_ROOT_SYNC "Launch kernels as ordinary (not cooperative) kernels" ${_strata_alchemist})
++if(STRATA_SYCL_NO_ROOT_SYNC)
++  add_compile_definitions(STRATA_ROOT_SYNC_PROP=)
++else()
++  add_compile_definitions(STRATA_ROOT_SYNC_PROP=sycl::ext::oneapi::experimental::use_root_sync)
++endif()
+ option(STRATA_SYCL_NO_XMX "Leave out the joint_matrix kernels (required on Arc A-series / Alchemist)" ${_strata_alchemist})
+ if(STRATA_SYCL_NO_XMX)
+   add_compile_definitions(STRATA_SYCL_NO_XMX=1)
+diff --git a/sycl/src/core/device.dp.cpp b/sycl/src/core/device.dp.cpp
+index 09485d5..0ca8ba0 100644
+--- a/sycl/src/core/device.dp.cpp
++++ b/sycl/src/core/device.dp.cpp
+@@ -395,7 +395,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
+             const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
+             {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
+                     auto float_base__b_threads_ct0 =
+diff --git a/sycl/src/kernels/cuda/bf16_gemv.dp.cpp b/sycl/src/kernels/cuda/bf16_gemv.dp.cpp
+index 42996b2..70bd3ca 100644
+--- a/sycl/src/kernels/cuda/bf16_gemv.dp.cpp
++++ b/sycl/src/kernels/cuda/bf16_gemv.dp.cpp
+@@ -140,7 +140,7 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
+         const unsigned grid = (unsigned) ((n_out + warps - 1) / warps);
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -163,7 +163,7 @@ void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int
+     const unsigned grid = (unsigned) ((n_out + THREADS - 1) / THREADS);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -189,7 +189,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
+         const unsigned grid = (unsigned) ((n_out + warps - 1) / warps);
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -219,7 +219,7 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/cvec.dp.cpp b/sycl/src/kernels/cuda/cvec.dp.cpp
+index c118d51..968cc19 100644
+--- a/sycl/src/kernels/cuda/cvec.dp.cpp
++++ b/sycl/src/kernels/cuda/cvec.dp.cpp
+@@ -265,7 +265,7 @@ void cvec_apply(float *R, int64_t layer, int64_t T, int64_t r_ld,
+     const dpct::dim3 grid((unsigned)g_cvec.hc, (unsigned)T);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/dequant_bf16.dp.cpp b/sycl/src/kernels/cuda/dequant_bf16.dp.cpp
+index 272e954..0c91b75 100644
+--- a/sycl/src/kernels/cuda/dequant_bf16.dp.cpp
++++ b/sycl/src/kernels/cuda/dequant_bf16.dp.cpp
+@@ -231,7 +231,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
+ #define STRATA_DQ(TY)                                                          \
+     {                                                                          \
+         auto exp_props = sycl::ext::oneapi::experimental::properties{          \
+-            sycl::ext::oneapi::experimental::use_root_sync};                   \
++            STRATA_ROOT_SYNC_PROP};                   \
+                                                                                \
+         st->submit([&](sycl::handler &cgh) {                                   \
+             auto p_ct0 = p;                                                    \
+diff --git a/sycl/src/kernels/cuda/dequant_s2.dp.cpp b/sycl/src/kernels/cuda/dequant_s2.dp.cpp
+index 787a033..c45e124 100644
+--- a/sycl/src/kernels/cuda/dequant_s2.dp.cpp
++++ b/sycl/src/kernels/cuda/dequant_s2.dp.cpp
+@@ -49,7 +49,7 @@ void dequant_s2(const uint8_t *codes, const float *scales, float *out,
+     const long long blocks = (n_blocks + threads - 1) / threads;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         dpct::get_in_order_queue()
+             .parallel_for<dpct_kernel_name<class dequant_s2_kernel_bdb833>>(
+diff --git a/sycl/src/kernels/cuda/elementwise.dp.cpp b/sycl/src/kernels/cuda/elementwise.dp.cpp
+index b1b4cc5..a4b6203 100644
+--- a/sycl/src/kernels/cuda/elementwise.dp.cpp
++++ b/sycl/src/kernels/cuda/elementwise.dp.cpp
+@@ -209,7 +209,7 @@ void embedding_gather(const uint8_t* codes, const float* scales, const float* of
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -232,7 +232,7 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
+     const int64_t n = n_tokens * h_v;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_gate_kernel_de22c0>>(
+@@ -251,7 +251,7 @@ void scale_inplace(float* x, int64_t n, float s, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class scale_kernel_501571>>(
+@@ -270,7 +270,7 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class add_kernel_95886e>>(
+@@ -289,7 +289,7 @@ void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class to_f16_kernel_ba0968>>(
+@@ -308,7 +308,7 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class to_bf16_kernel_7b22d1>>(
+@@ -327,7 +327,7 @@ void silu_inplace(float* x, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -394,7 +394,7 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream)
+     if (d_flag == nullptr || d_seq == nullptr) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class doorbell_wait_kernel_47b360>>(
+@@ -488,7 +488,7 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -516,7 +516,7 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -546,7 +546,7 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
+     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -652,7 +652,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -677,7 +677,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights,
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -705,7 +705,7 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -724,7 +724,7 @@ void doorbell_ring(uint32_t* d_seq, void* stream) {
+     if (d_seq == nullptr) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class doorbell_ring_kernel_b862a4>>(
+@@ -745,7 +745,7 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
+     const unsigned grid = (unsigned) ((rows + warps_per_block - 1) / warps_per_block);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+diff --git a/sycl/src/kernels/cuda/fused_gdn.dp.cpp b/sycl/src/kernels/cuda/fused_gdn.dp.cpp
+index eca2bab..2f34bb6 100644
+--- a/sycl/src/kernels/cuda/fused_gdn.dp.cpp
++++ b/sycl/src/kernels/cuda/fused_gdn.dp.cpp
+@@ -239,7 +239,7 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_conv_l2_kernel_44cd0c>>(
+@@ -274,7 +274,7 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_ab_kernel_c211b9>>(
+@@ -316,7 +316,7 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_step_norm_kernel_51bed3>>(
+diff --git a/sycl/src/kernels/cuda/fused_gr.dp.cpp b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+index d5aa4cb..a68a062 100644
+--- a/sycl/src/kernels/cuda/fused_gr.dp.cpp
++++ b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+@@ -1348,7 +1348,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+     const int n_tok = m.T;
+     if (variant >= kHcSplit) {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_norm_split_kernel_200589>>(
+             sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
+@@ -1360,7 +1360,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d93>>(
+             sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
+@@ -1401,7 +1401,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+         if (staged) {
+             if (max4) {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 st->submit([&](sycl::handler &cgh) {
+                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1425,7 +1425,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                 });
+             } else {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 st->submit([&](sycl::handler &cgh) {
+                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1454,7 +1454,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+         } else if (tv == 1280) {
+             if (max4) {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 st->submit([&](sycl::handler &cgh) {
+                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1478,7 +1478,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                 });
+             } else {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 st->submit([&](sycl::handler &cgh) {
+                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1508,7 +1508,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+         } else {
+             if (max4) {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 st->submit([&](sycl::handler &cgh) {
+                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1532,7 +1532,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                 });
+             } else {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 st->submit([&](sycl::handler &cgh) {
+                     sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1564,7 +1564,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_up_multi_kernel_1a7280>>(
+             sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+@@ -1670,7 +1670,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+         if (split == 2) {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1693,7 +1693,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+             });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+@@ -1718,7 +1718,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+         if (split == 2) {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_6e945c,
+                                               dpct_kernel_scalar<2>>>(
+@@ -1732,7 +1732,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                     });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_716779,
+                                               dpct_kernel_scalar<1>>>(
+@@ -1757,7 +1757,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+     m.part = down_partials(st);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         if (gr_norm_split())
+             st->parallel_for<dpct_kernel_name<class gr_norm_split_k>>(
+@@ -1812,7 +1812,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_multi_direct_kernel(m); });
+     } else if (chunk_tok >= n_tok) {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         st->submit([&](sycl::handler &cgh) {
+             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                 sycl::range((size_t)n_tok * TILE * sizeof(float)), cgh);
+@@ -1839,7 +1839,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+             for (int k = 0; k < ct; ++k) c.a[k] = a[c0 + k];
+             c.part = m.part;
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             st->submit([&](sycl::handler &cgh) {
+                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                     sycl::range((size_t)ct * TILE * sizeof(float)), cgh);
+@@ -1862,7 +1862,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_up_multi_kernel_1a727f>>(
+             sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
+@@ -1912,7 +1912,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71>>(
+             sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
+@@ -1925,7 +1925,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258>>(
+             sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
+diff --git a/sycl/src/kernels/cuda/gdn.dp.cpp b/sycl/src/kernels/cuda/gdn.dp.cpp
+index 7829936..1e4998d 100644
+--- a/sycl/src/kernels/cuda/gdn.dp.cpp
++++ b/sycl/src/kernels/cuda/gdn.dp.cpp
+@@ -231,7 +231,7 @@ void gdn_step(float *state, const float *q, const float *k, const float *v,
+                           (unsigned)((s.h_v + MAX_H - 1) / MAX_H));
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_step_kernel_34b62e>>(
+@@ -260,7 +260,7 @@ void gdn_conv_step(float *conv_state, const float *x, const float *kW,
+     const int blocks = (int) ((channels + 255) / 256);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_b12e73>>(
+@@ -292,7 +292,7 @@ void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -343,7 +343,7 @@ void gdn_beta_gate(float *beta, int64_t h_v, void *stream) try {
+     const int n = (int) h_v;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_beta_gate_kernel_e2ab3e>>(
+@@ -372,7 +372,7 @@ void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
+     if (h_v <= 0 || S <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+diff --git a/sycl/src/kernels/cuda/gr.dp.cpp b/sycl/src/kernels/cuda/gr.dp.cpp
+index e6d172a..8fcb915 100644
+--- a/sycl/src/kernels/cuda/gr.dp.cpp
++++ b/sycl/src/kernels/cuda/gr.dp.cpp
+@@ -501,7 +501,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+     } else if (use_fp32) {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -519,7 +519,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<
+                 dpct_kernel_name<class gr_down_kernel_f016b0, float>>(
+@@ -535,7 +535,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<
+                 dpct_kernel_name<class gr_gate_kernel_4b823d, float>>(
+@@ -553,7 +553,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+     } else {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -571,7 +571,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<
+                 dpct_kernel_name<class gr_down_kernel_cbf49c, uint16_t>>(
+@@ -587,7 +587,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<
+                 dpct_kernel_name<class gr_gate_kernel_75fce5, uint16_t>>(
+@@ -606,7 +606,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+     if (!use_native)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class gr_mean_kernel_f4c4e8>>(
+             sycl::nd_range<3>(
+@@ -632,7 +632,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+             */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<
+                 dpct_kernel_name<class gr_inject_kernel_182d54, float>>(
+@@ -653,7 +653,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<
+                 dpct_kernel_name<class gr_inject_kernel_500b2a, uint16_t>>(
+@@ -695,7 +695,7 @@ void gr_write(const float *R, const float *block_out, const float *inject,
+         native_gr_post(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, stream);
+     else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 08bee42..19c0e9c 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2030,7 +2030,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
+     if constexpr (!kSplit<TY>) {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2051,7 +2051,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
+     else if (g_old_kernels) {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2072,7 +2072,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
+     else if (ncols <= 1) {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2095,7 +2095,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
+     else if (ncols == 2) {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2118,7 +2118,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
+     else if (ncols <= 4) {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2141,7 +2141,7 @@ void launch_mmvq(const uint8_t *W, size_t rb, const block_q8_1 *X, float *y,
+     else {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2174,7 +2174,7 @@ void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long
+                     const NativeExpertLayout &L, float *gate, float *up) {
+     constexpr int ROWS = 256 / LN;
+     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
+-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
++    auto exp_props = sycl::ext::oneapi::experimental::properties{STRATA_ROOT_SYNC_PROP};
+     s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>>>(
+         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+@@ -2198,7 +2198,7 @@ void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long lo
+                       const NativeExpertLayout &L, float *out) {
+     constexpr int ROWS = 256 / LN;
+     const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
+-    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
++    auto exp_props = sycl::ext::oneapi::experimental::properties{STRATA_ROOT_SYNC_PROP};
+     s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>>>(
+         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+@@ -2232,7 +2232,7 @@ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+     } else {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2265,7 +2265,7 @@ void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
+     } else {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+ 
+@@ -2319,7 +2319,7 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class quantize_q8_1_kernel_9d62b4>>(
+@@ -2355,7 +2355,7 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
+     {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp16});
+@@ -2397,7 +2397,7 @@ void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* to
+     {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp16});
+@@ -2426,7 +2426,7 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
+     {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp16});
+@@ -2455,7 +2455,7 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
+     {
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp16});
+@@ -2539,7 +2539,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     if (v1) {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<
+                 dpct_kernel_name<class swiglu_entries_kernel_a4959c>>(
+@@ -2553,7 +2553,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<
+                 dpct_kernel_name<class quantize_q8_1_kernel_cfb6c5>>(
+@@ -2569,7 +2569,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+         }
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->parallel_for<
+             dpct_kernel_name<class swiglu_q8_1_entries_kernel_115291>>(
+diff --git a/sycl/src/kernels/cuda/kv_q4.dp.cpp b/sycl/src/kernels/cuda/kv_q4.dp.cpp
+index 630fe2e..607e703 100644
+--- a/sycl/src/kernels/cuda/kv_q4.dp.cpp
++++ b/sycl/src/kernels/cuda/kv_q4.dp.cpp
+@@ -245,7 +245,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
+     const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -273,7 +273,7 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
+                           2);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -308,7 +308,7 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
+     for (int is_v = 0; is_v < 2; ++is_v)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->parallel_for<
+             dpct_kernel_name<class kv_append_q4_batch_kernel_11c37a>>(
+@@ -334,7 +334,7 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t*
+     const unsigned num_blocks = (unsigned) ((total_blocks + rows_per_block - 1) / rows_per_block);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class kv_gather_q4_kernel_300c16>>(
+diff --git a/sycl/src/kernels/cuda/kv_q8.dp.cpp b/sycl/src/kernels/cuda/kv_q8.dp.cpp
+index 215ea94..34c4faa 100644
+--- a/sycl/src/kernels/cuda/kv_q8.dp.cpp
++++ b/sycl/src/kernels/cuda/kv_q8.dp.cpp
+@@ -151,7 +151,7 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
+                           (unsigned)(s.head_dim / KV_Q8_GROUP), 2);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -184,7 +184,7 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
+     const unsigned blocks = (unsigned) ((total + 255) / 256);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class kv_gather_q8_kernel_84cbb3>>(
+diff --git a/sycl/src/kernels/cuda/kv_stream.dp.cpp b/sycl/src/kernels/cuda/kv_stream.dp.cpp
+index 5c8566e..2688722 100644
+--- a/sycl/src/kernels/cuda/kv_stream.dp.cpp
++++ b/sycl/src/kernels/cuda/kv_stream.dp.cpp
+@@ -308,7 +308,7 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
+ void kv_stream_reset(const KvStreamMap& m, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class reset_kernel_f02a82>>(
+@@ -345,7 +345,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class resolve_kernel_148a81>>(
+@@ -360,7 +360,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
+     check("resolve");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -382,7 +382,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
+ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class ring_kernel_f9df1d>>(
+diff --git a/sycl/src/kernels/cuda/native_bf16.dp.cpp b/sycl/src/kernels/cuda/native_bf16.dp.cpp
+index 61f0590..1b2e4e9 100644
+--- a/sycl/src/kernels/cuda/native_bf16.dp.cpp
++++ b/sycl/src/kernels/cuda/native_bf16.dp.cpp
+@@ -190,7 +190,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
+     case N:                                                                    \
+         if (n_tok <= 4) {                                                      \
+             auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+-                sycl::ext::oneapi::experimental::use_root_sync};               \
++                STRATA_ROOT_SYNC_PROP};               \
+                                                                                \
+             st->submit([&](sycl::handler &cgh) {                               \
+                 auto x_ct0 = x;                                                \
+@@ -217,7 +217,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
+             });                                                                \
+         } else {                                                               \
+             auto exp_props = sycl::ext::oneapi::experimental::properties{      \
+-                sycl::ext::oneapi::experimental::use_root_sync};               \
++                STRATA_ROOT_SYNC_PROP};               \
+                                                                                \
+             st->submit([&](sycl::handler &cgh) {                               \
+                 auto x_ct0 = x;                                                \
+@@ -286,7 +286,7 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
+ #define STRATA_MMVF_CASE(N)                                                    \
+     case N: {                                                                  \
+         auto exp_props = sycl::ext::oneapi::experimental::properties{          \
+-            sycl::ext::oneapi::experimental::use_root_sync};                   \
++            STRATA_ROOT_SYNC_PROP};                   \
+                                                                                \
+         st->submit([&](sycl::handler &cgh) {                                   \
+             auto x_ct0 = x;                                                    \
+diff --git a/sycl/src/kernels/cuda/native_flash_attn.dp.cpp b/sycl/src/kernels/cuda/native_flash_attn.dp.cpp
+index 33e19c8..796df01 100644
+--- a/sycl/src/kernels/cuda/native_flash_attn.dp.cpp
++++ b/sycl/src/kernels/cuda/native_flash_attn.dp.cpp
+@@ -338,7 +338,7 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
+     validate_spans(spans, mask ? 7 : 6);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             ((sycl::queue *)(strata::q_of(stream)))
+                 ->get_device(),
+diff --git a/sycl/src/kernels/cuda/native_gdn.dp.cpp b/sycl/src/kernels/cuda/native_gdn.dp.cpp
+index 4faf25a..a2ba530 100644
+--- a/sycl/src/kernels/cuda/native_gdn.dp.cpp
++++ b/sycl/src/kernels/cuda/native_gdn.dp.cpp
+@@ -129,7 +129,7 @@ void native_gdn_step(float* state, const float* q, const float* k, const float*
+     const float scale = 1.0f / sqrtf(float(S));
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class step_134598>>(
+diff --git a/sycl/src/kernels/cuda/native_gdn_preprocess.dp.cpp b/sycl/src/kernels/cuda/native_gdn_preprocess.dp.cpp
+index 5e7d693..4efb8bc 100644
+--- a/sycl/src/kernels/cuda/native_gdn_preprocess.dp.cpp
++++ b/sycl/src/kernels/cuda/native_gdn_preprocess.dp.cpp
+@@ -242,7 +242,7 @@ void native_gdn_conv_silu(float* history, const float* input, const float* weigh
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class conv_silu_1ba4e6>>(
+@@ -262,7 +262,7 @@ void native_gdn_l2_norm(float* input, int64_t rows, int64_t cols, float epsilon,
+     valid({input, size_t(rows) * S * sizeof(float)});
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -287,7 +287,7 @@ void native_gdn_beta_gate(float* beta, int64_t heads, void* stream) {
+     valid({beta, size_t(heads) * sizeof(float)});
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class beta_sigmoid_fcf68f>>(
+@@ -313,7 +313,7 @@ void native_gdn_gate(const float* alpha, const float* dt, const float* ssm_a,
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class gate_softplus_a95cee>>(
+@@ -340,7 +340,7 @@ void native_gdn_out_norm(const float* output, const float* z, const float* gamma
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class out_norm_a49e35>>(
+diff --git a/sycl/src/kernels/cuda/native_gr_norm.dp.cpp b/sycl/src/kernels/cuda/native_gr_norm.dp.cpp
+index 63258c3..455ad38 100644
+--- a/sycl/src/kernels/cuda/native_gr_norm.dp.cpp
++++ b/sycl/src/kernels/cuda/native_gr_norm.dp.cpp
+@@ -108,7 +108,7 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float*
+     if (n_cols < 1024)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cuda_stream->parallel_for<dpct_kernel_name<
+             class weighted_rms_norm_46d94c, dpct_kernel_scalar<256>>>(
+@@ -127,7 +127,7 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float*
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cuda_stream->parallel_for<dpct_kernel_name<
+             class weighted_rms_norm_11a6fe, dpct_kernel_scalar<1024>>>(
+diff --git a/sycl/src/kernels/cuda/native_gr_postops.dp.cpp b/sycl/src/kernels/cuda/native_gr_postops.dp.cpp
+index 436af20..dc951b2 100644
+--- a/sycl/src/kernels/cuda/native_gr_postops.dp.cpp
++++ b/sycl/src/kernels/cuda/native_gr_postops.dp.cpp
+@@ -158,7 +158,7 @@ void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {
+     check_pointer(lo);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -182,7 +182,7 @@ void native_gr_pre_gated(const float* xn, float* gate, float* mixed,
+     if (fused_layer)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -200,7 +200,7 @@ void native_gr_pre_gated(const float* xn, float* gate, float* mixed,
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -225,7 +225,7 @@ void native_gr_post(const float* residual, const float* block_out, const float*
+     check_pointer(residual); check_pointer(block_out); check_pointer(inject); check_pointer(output);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/native_mmvq.dp.cpp b/sycl/src/kernels/cuda/native_mmvq.dp.cpp
+index d44715a..54672a0 100644
+--- a/sycl/src/kernels/cuda/native_mmvq.dp.cpp
++++ b/sycl/src/kernels/cuda/native_mmvq.dp.cpp
+@@ -1832,7 +1832,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+             s->parallel_for<dpct_kernel_name<
+@@ -1880,7 +1880,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+             s->parallel_for<dpct_kernel_name<
+@@ -1902,7 +1902,7 @@ void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+         s->parallel_for<dpct_kernel_name<
+@@ -2002,7 +2002,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
+             iq4nl_values.init(*s);
+ 
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->submit([&](sycl::handler &cgh) {
+                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
+@@ -2029,7 +2029,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
+         iq4nl_values.init(*s);
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
+@@ -2097,7 +2097,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
+     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<
+@@ -2142,7 +2142,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+             s->parallel_for<
+@@ -2162,7 +2162,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+         s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_4061e4,
+@@ -2217,7 +2217,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<
+                 dpct_kernel_name<class native_q2_0_mmvq_kernel_b58485,
+@@ -2236,7 +2236,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_42f157,
+                                          dpct_kernel_scalar<false>>>(
+@@ -2289,7 +2289,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<
+                 dpct_kernel_name<class native_q3_k_mmvq_kernel_616146,
+@@ -2308,7 +2308,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_72056c,
+                                          dpct_kernel_scalar<false>>>(
+@@ -2364,7 +2364,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
+             iq4nl_values.init(*s);
+ 
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->submit([&](sycl::handler &cgh) {
+                 auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
+@@ -2391,7 +2391,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
+         iq4nl_values.init(*s);
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+             auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
+@@ -2452,7 +2452,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+             s->parallel_for<
+@@ -2472,7 +2472,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
+ 
+         s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_1ca3b8,
+@@ -2555,7 +2555,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<
+                 dpct_kernel_name<class native_q6_k_mmvq_kernel_902936,
+@@ -2574,7 +2574,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_239e8f,
+                                          dpct_kernel_scalar<false>>>(
+diff --git a/sycl/src/kernels/cuda/native_moe.dp.cpp b/sycl/src/kernels/cuda/native_moe.dp.cpp
+index 3212e3c..ae21ecb 100644
+--- a/sycl/src/kernels/cuda/native_moe.dp.cpp
++++ b/sycl/src/kernels/cuda/native_moe.dp.cpp
+@@ -81,7 +81,7 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
+         throw std::invalid_argument("native MoE combine requires aligned spans and disjoint output");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class combine_d6d46b>>(
+@@ -120,7 +120,7 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
+         throw std::invalid_argument("native MoE combine (multi) requires a stream, width, 1..15 experts, tokens");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class combine_eee9de>>(
+diff --git a/sycl/src/kernels/cuda/native_ple_postops.dp.cpp b/sycl/src/kernels/cuda/native_ple_postops.dp.cpp
+index a55748b..6b6daf4 100644
+--- a/sycl/src/kernels/cuda/native_ple_postops.dp.cpp
++++ b/sycl/src/kernels/cuda/native_ple_postops.dp.cpp
+@@ -345,7 +345,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->submit([&](sycl::handler &cgh) {
+             auto std_sqrt_float_N_ct3 = 1.0f / std::sqrt(float(N));
+@@ -363,7 +363,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class broadcast_kernel_50d78d>>(
+             sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
+@@ -377,7 +377,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
+     native_gr_rms_norm_weighted(b.gated,w.norm_conv,b.normalized,N,H,NG_RMS_EPS,stream);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class conv_residual_kernel_6182eb>>(
+             sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
+@@ -405,7 +405,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class rms_rep_kernel_dde36c>>(
+             sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
+@@ -422,7 +422,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class rms_rep_kernel_9b5d94>>(
+             sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
+@@ -439,7 +439,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->submit([&](sycl::handler &cgh) {
+             auto std_sqrt_float_N_ct3 = 1.0f / std::sqrt(float(N));
+@@ -458,7 +458,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class broadcast_batch_kernel_24ebaf>>(
+             sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+@@ -475,7 +475,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class rms_rep_kernel_e4e0bd>>(
+             sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
+@@ -487,7 +487,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<
+             dpct_kernel_name<class conv_residual_batch_kernel_3906fe>>(
+@@ -501,7 +501,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class history_batch_kernel_8243c6>>(
+             sycl::nd_range<3>(sycl::range(1, 1, D / 256) *
+diff --git a/sycl/src/kernels/cuda/native_qsa.dp.cpp b/sycl/src/kernels/cuda/native_qsa.dp.cpp
+index 2218314..265777d 100644
+--- a/sycl/src/kernels/cuda/native_qsa.dp.cpp
++++ b/sycl/src/kernels/cuda/native_qsa.dp.cpp
+@@ -149,7 +149,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
+     if (n_cols < 1024)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<
+@@ -170,7 +170,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<
+@@ -192,7 +192,7 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
+     buffers(attn, count * 4, q_full, count * 8, output, stream);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class gate_148967>>(
+diff --git a/sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp b/sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp
+index 52f01cc..6d813f4 100644
+--- a/sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp
++++ b/sycl/src/kernels/cuda/native_qsa_indexer.dp.cpp
+@@ -360,7 +360,7 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
+     if (rt.cos != nullptr)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -383,7 +383,7 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -444,7 +444,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
+         if (rt.cos != nullptr)
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class append_first_ea2d1f,
+                                               dpct_kernel_scalar<true>>>(
+@@ -459,7 +459,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
+                     });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class append_first_ea2d1f,
+                                               dpct_kernel_scalar<false>>>(
+@@ -480,7 +480,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
+     if (hi >= first && rt.cos != nullptr)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class append_blocks_a6c94e,
+                                           dpct_kernel_scalar<true>>>(
+@@ -497,7 +497,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
+     } else if (hi >= first)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class append_blocks_a6c94e,
+                                           dpct_kernel_scalar<false>>>(
+@@ -514,7 +514,7 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class append_tail_e0658e>>(
+             sycl::nd_range<3>(sycl::range(1, 1, R - 1) * sycl::range(1, 1, D),
+diff --git a/sycl/src/kernels/cuda/native_qsa_score.dp.cpp b/sycl/src/kernels/cuda/native_qsa_score.dp.cpp
+index fe729bc..9ade93c 100644
+--- a/sycl/src/kernels/cuda/native_qsa_score.dp.cpp
++++ b/sycl/src/kernels/cuda/native_qsa_score.dp.cpp
+@@ -288,7 +288,7 @@ void native_qsa_score(const float* pooled,const float* query,const float* bias,
+ #else
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class score_kernel_59cd1b>>(
+diff --git a/sycl/src/kernels/cuda/native_rope.dp.cpp b/sycl/src/kernels/cuda/native_rope.dp.cpp
+index 9f67374..7cc1e14 100644
+--- a/sycl/src/kernels/cuda/native_rope.dp.cpp
++++ b/sycl/src/kernels/cuda/native_rope.dp.cpp
+@@ -152,7 +152,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
+     if (rt.cos != nullptr)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+@@ -171,7 +171,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/native_router.dp.cpp b/sycl/src/kernels/cuda/native_router.dp.cpp
+index d0d3616..ed61cfc 100644
+--- a/sycl/src/kernels/cuda/native_router.dp.cpp
++++ b/sycl/src/kernels/cuda/native_router.dp.cpp
+@@ -158,7 +158,7 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
+         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class route_60b296>>(
+@@ -196,7 +196,7 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
+         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class route_64c24f>>(
+diff --git a/sycl/src/kernels/cuda/ple.dp.cpp b/sycl/src/kernels/cuda/ple.dp.cpp
+index 13b68ce..f599cf6 100644
+--- a/sycl/src/kernels/cuda/ple.dp.cpp
++++ b/sycl/src/kernels/cuda/ple.dp.cpp
+@@ -293,7 +293,7 @@ void ple_history_advance(float* hist, const float* normalized, void* stream) {
+         throw std::invalid_argument("ple_history_advance: history and normalized input overlap");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -425,7 +425,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+     if (!native_postops) {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -446,7 +446,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -473,7 +473,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+     } else {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class to_bf16_kernel_ab93ff>>(
+                 sycl::nd_range<3>(
+@@ -486,7 +486,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -512,7 +512,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+     } else {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -533,7 +533,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class bcast_kernel_79d1c2>>(
+                 sycl::nd_range<3>(
+@@ -546,7 +546,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp64});
+ 
+@@ -567,7 +567,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->submit([&](sycl::handler &cgh) {
+                 auto PLE_CONV_KERNEL_ct5 = PLE_CONV_KERNEL;
+@@ -588,7 +588,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             st->parallel_for<dpct_kernel_name<class add3_kernel_26c4c6>>(
+                 sycl::nd_range<3>(
+diff --git a/sycl/src/kernels/cuda/qsa.dp.cpp b/sycl/src/kernels/cuda/qsa.dp.cpp
+index 266cfae..99f6366 100644
+--- a/sycl/src/kernels/cuda/qsa.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa.dp.cpp
+@@ -871,7 +871,7 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
+     const long long n = s.n_head_kv * s.head_dim;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -910,7 +910,7 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias,
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -948,7 +948,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
+     // One block, so the launch is already constant; the kernel reads `n_kv` and `width` from `step`.
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class topk_kernel_97d5c9>>(
+@@ -973,7 +973,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
+     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class kv_gather_kernel_3473e7>>(
+@@ -1043,7 +1043,7 @@ void qsa_attend_step(const float *q, const uint16_t *k_scratch,
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -1126,7 +1126,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -1230,7 +1230,7 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
+     const long long n = s.n_head * s.head_dim;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -1255,7 +1255,7 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s,
+     const long long n = s.n_head * s.head_dim;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+diff --git a/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp b/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp
+index 39981a3..b976742 100644
+--- a/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp
+@@ -321,7 +321,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     if (kv_mode == 3)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_dfacfc,
+@@ -337,7 +337,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     } else if (kv_mode == 2)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_b0d448,
+@@ -353,7 +353,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     } else if (kv_mode == 1)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_2ad0a4,
+@@ -368,7 +368,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_5c04f7,
+@@ -384,7 +384,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class attn_merge_kernel_2cdaf7>>(
+             sycl::nd_range<3>(
+@@ -434,7 +434,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     if (kv_mode == 3)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f262e6,
+@@ -450,7 +450,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     } else if (kv_mode == 2)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_4fd923,
+@@ -466,7 +466,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     } else if (kv_mode == 1)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f6855e,
+@@ -481,7 +481,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
+ 
+         st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_7c8e09,
+@@ -497,7 +497,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         st->parallel_for<dpct_kernel_name<class attn_merge_kernel_4bb902>>(
+             sycl::nd_range<3>(sycl::range(1, 1, (unsigned)s.n_head) *
+diff --git a/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp b/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp
+index 0744998..ec0043c 100644
+--- a/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp
+@@ -1122,7 +1122,7 @@ bool launch_i8(const float *q, const QsaAttnPools &pools, const int32_t *ids,
+         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp16});
+ 
+@@ -1204,7 +1204,7 @@ bool launch(const float *q, const QsaAttnPools &pools, const int32_t *ids,
+         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(st->get_device(),
+                                          {sycl::aspect::fp16});
+ 
+diff --git a/sycl/src/kernels/cuda/qsa_select.dp.cpp b/sycl/src/kernels/cuda/qsa_select.dp.cpp
+index a4ed9bf..c462528 100644
+--- a/sycl/src/kernels/cuda/qsa_select.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa_select.dp.cpp
+@@ -1295,7 +1295,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
+     if (multi && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1330,7 +1330,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
+                           (unsigned)nq);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class block_scores_kernel_925c9d>>(
+@@ -1438,7 +1438,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
+                           (unsigned)((nq + TC_QT - 1) / TC_QT));
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -1460,7 +1460,7 @@ bool qsa_block_scores_tc(const float *pooled, const float *dead,
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1505,7 +1505,7 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class block_topk_kernel_213104>>(
+@@ -1719,7 +1719,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
+         */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_652097,
+@@ -1741,7 +1741,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class block_topk_reg_kernel_652098,
+diff --git a/sycl/src/kernels/cuda/quantize_act.dp.cpp b/sycl/src/kernels/cuda/quantize_act.dp.cpp
+index d4b504b..b04a635 100644
+--- a/sycl/src/kernels/cuda/quantize_act.dp.cpp
++++ b/sycl/src/kernels/cuda/quantize_act.dp.cpp
+@@ -270,7 +270,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
+     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -312,7 +312,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
+     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -341,7 +341,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
+     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class dequant_q8_0_kernel_154e61>>(
+@@ -373,7 +373,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
+     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class quantize_q8_K_kernel_7aadb2>>(
+@@ -401,7 +401,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
+     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class dequant_q8_K_kernel_e03426>>(
+diff --git a/sycl/src/kernels/cuda/rope.dp.cpp b/sycl/src/kernels/cuda/rope.dp.cpp
+index bfe7ecf..82812a9 100644
+--- a/sycl/src/kernels/cuda/rope.dp.cpp
++++ b/sycl/src/kernels/cuda/rope.dp.cpp
+@@ -135,7 +135,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
+     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/router_top10.dp.cpp b/sycl/src/kernels/cuda/router_top10.dp.cpp
+index 30ee2ef..71063bc 100644
+--- a/sycl/src/kernels/cuda/router_top10.dp.cpp
++++ b/sycl/src/kernels/cuda/router_top10.dp.cpp
+@@ -523,7 +523,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+diff --git a/sycl/src/kernels/cuda/s2_expert_grouped.dp.cpp b/sycl/src/kernels/cuda/s2_expert_grouped.dp.cpp
+index ff8bd90..82b35bf 100644
+--- a/sycl/src/kernels/cuda/s2_expert_grouped.dp.cpp
++++ b/sycl/src/kernels/cuda/s2_expert_grouped.dp.cpp
+@@ -735,7 +735,7 @@ void launch_hit_gu(bool fast, const uint8_t *blob_base,
+         const long long pairs = cap * (long long) FF;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class gu_pair_kernel_787004>>(
+                 sycl::nd_range<3>(
+@@ -754,7 +754,7 @@ void launch_hit_gu(bool fast, const uint8_t *blob_base,
+         const long long rows = cap * 2LL * FF;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class gu_kernel_55bc52>>(
+                 sycl::nd_range<3>(
+@@ -782,7 +782,7 @@ void launch_hit_down(bool fast, const uint8_t *blob_base,
+         const long long pairs = cap * (long long) (H / 2);
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class down_pair_kernel_7d15d9>>(
+                 sycl::nd_range<3>(
+@@ -801,7 +801,7 @@ void launch_hit_down(bool fast, const uint8_t *blob_base,
+         const long long rows = cap * (long long) H;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class down_kernel_b3587f>>(
+                 sycl::nd_range<3>(
+@@ -861,7 +861,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
+         const unsigned blocks = (unsigned) ((pairs + THREADS - 1) / THREADS);
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_30a435>>(
+                 sycl::nd_range<3>(sycl::range(1, 1, blocks) *
+@@ -983,7 +983,7 @@ void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_exp
+     if (k < 1 || k > 32) { std::fprintf(stderr, "moe_hit_select: k must be 1..32\n"); std::exit(1); }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class hit_select_kernel_f87f42>>(
+@@ -1018,7 +1018,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
+         const long long pairs = cap * (long long) FF;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_e17ecb>>(
+                 sycl::nd_range<3>(
+@@ -1046,7 +1046,7 @@ void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int
+     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_hit_select_multi: n must be 1..128\n"); std::exit(1); }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1083,7 +1083,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
+         const long long pairs = cap * (long long) FF;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_3a6551>>(
+                 sycl::nd_range<3>(
+@@ -1512,7 +1512,7 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
+     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1545,7 +1545,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
+         if (fast)
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<
+                 dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(
+@@ -1560,7 +1560,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                     });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class gu_grouped_kernel_c9eb4d>>(
+                 sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
+@@ -1579,7 +1579,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
+         const long long pairs = cap_entries * (long long) FF;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5018f2>>(
+                 sycl::nd_range<3>(
+@@ -1601,7 +1601,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
+         if (fast)
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<
+                 dpct_kernel_name<class down_grouped_t_kernel_12b16d>>(
+@@ -1615,7 +1615,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                     });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<
+                 dpct_kernel_name<class down_grouped_kernel_ea4417>>(
+@@ -1640,7 +1640,7 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
+         (unsigned)cap);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class add_hits_kernel_50cbcb>>(
+@@ -1676,7 +1676,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
+     float* xh = (float*) ((uint8_t*) hh + scale_bytes);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->submit([&](sycl::handler &cgh) {
+             auto H_ct3 = H / 32;
+@@ -1696,7 +1696,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
+     const int rows_per_block = THREADS / 8;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->parallel_for<
+             dpct_kernel_name<class cpu_order_projection_kernel_6ed29b,
+@@ -1729,7 +1729,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->submit([&](sycl::handler &cgh) {
+             auto int_n_hits_FF_ct1 = (int)n_hits * FF;
+@@ -1750,7 +1750,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
+     check("cpu_order/swiglu", stream);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->submit([&](sycl::handler &cgh) {
+             auto int_n_hits_FF_ct4 = (int)n_hits * (FF / 32);
+@@ -1772,7 +1772,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
+     check("cpu_order/intermediate_quantize", stream);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->parallel_for<
+             dpct_kernel_name<class cpu_order_projection_kernel_c67875,
+diff --git a/sycl/src/kernels/cuda/s2_gemv.dp.cpp b/sycl/src/kernels/cuda/s2_gemv.dp.cpp
+index d7e2faf..a6207ce 100644
+--- a/sycl/src/kernels/cuda/s2_gemv.dp.cpp
++++ b/sycl/src/kernels/cuda/s2_gemv.dp.cpp
+@@ -62,7 +62,7 @@ void s2_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
+     const long long blocks = (n_out + threads - 1) / threads;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         dpct::get_in_order_queue()
+             .parallel_for<dpct_kernel_name<class s2_gemv_kernel_163eb8>>(
+diff --git a/sycl/src/kernels/cuda/s2_gemv_fast.dp.cpp b/sycl/src/kernels/cuda/s2_gemv_fast.dp.cpp
+index 0da3d67..b6f1c8c 100644
+--- a/sycl/src/kernels/cuda/s2_gemv_fast.dp.cpp
++++ b/sycl/src/kernels/cuda/s2_gemv_fast.dp.cpp
+@@ -182,7 +182,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
+         c_codes.init();
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
+                                      {sycl::aspect::fp16});
+ 
+@@ -214,7 +214,7 @@ void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
+         c_codes.init();
+ 
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
+                                      {sycl::aspect::fp16});
+ 
+diff --git a/sycl/src/kernels/cuda/s2_gemv_q8.dp.cpp b/sycl/src/kernels/cuda/s2_gemv_q8.dp.cpp
+index f8cf26f..c8b1802 100644
+--- a/sycl/src/kernels/cuda/s2_gemv_q8.dp.cpp
++++ b/sycl/src/kernels/cuda/s2_gemv_q8.dp.cpp
+@@ -107,7 +107,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+diff --git a/sycl/src/kernels/cuda/s2_gemv_quads.dp.cpp b/sycl/src/kernels/cuda/s2_gemv_quads.dp.cpp
+index 1e4a5a5..0a43fad 100644
+--- a/sycl/src/kernels/cuda/s2_gemv_quads.dp.cpp
++++ b/sycl/src/kernels/cuda/s2_gemv_quads.dp.cpp
+@@ -104,7 +104,7 @@ void s2_gemv_quads(const uint16_t *x, const uint8_t *codes, const float *scales,
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
+                                      {sycl::aspect::fp16});
+ 
+diff --git a/sycl/src/kernels/cuda/s_gemv.dp.cpp b/sycl/src/kernels/cuda/s_gemv.dp.cpp
+index 98b4d00..d56a193 100644
+--- a/sycl/src/kernels/cuda/s_gemv.dp.cpp
++++ b/sycl/src/kernels/cuda/s_gemv.dp.cpp
+@@ -419,7 +419,7 @@ void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
+     switch (form.code_bits) {
+     case 2: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         dpct::get_in_order_queue()
+             .parallel_for<dpct_kernel_name<class s_gemv_kernel_4f63f9,
+@@ -435,7 +435,7 @@ void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
+     } break;
+     case 4: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         dpct::get_in_order_queue()
+             .parallel_for<dpct_kernel_name<class s_gemv_kernel_9c529a,
+@@ -451,7 +451,7 @@ void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
+     } break;
+     case 8: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         dpct::get_in_order_queue()
+             .parallel_for<dpct_kernel_name<class s_gemv_kernel_e40e1f,
+@@ -653,7 +653,7 @@ static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
+             */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(stream->get_device(),
+                                          {sycl::aspect::fp16});
+ 
+@@ -687,7 +687,7 @@ static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
+             */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(stream->get_device(),
+                                          {sycl::aspect::fp16});
+ 
+@@ -721,7 +721,7 @@ static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
+             */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(stream->get_device(),
+                                          {sycl::aspect::fp16});
+ 
+@@ -825,7 +825,7 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
+     switch (form.code_bits) {
+     case 4: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class s_gemv_q8k_kernel_9b1637,
+@@ -841,7 +841,7 @@ void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales,
+     } break;
+     case 8: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class s_gemv_q8k_kernel_adeed5,
+@@ -892,7 +892,7 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
+     switch (form.code_bits) {
+     case 4: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_19ad26,
+@@ -911,7 +911,7 @@ void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* s
+     } break;
+     case 8: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_4da4f5,
+@@ -969,7 +969,7 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
+     switch (form.code_bits) {
+     case 4: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_147ee4,
+@@ -988,7 +988,7 @@ void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float*
+     } break;
+     case 8: {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_bac5c0,
+diff --git a/sycl/src/kernels/cuda/sampler.dp.cpp b/sycl/src/kernels/cuda/sampler.dp.cpp
+index e4a77ec..ee73cc9 100644
+--- a/sycl/src/kernels/cuda/sampler.dp.cpp
++++ b/sycl/src/kernels/cuda/sampler.dp.cpp
+@@ -1494,7 +1494,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+             */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->submit([&](sycl::handler &cgh) {
+@@ -1529,7 +1529,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -1569,7 +1569,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+         if (scratch != nullptr) {
+             {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+ 
+                 strata::q_of(stream)
+                     ->parallel_for<dpct_kernel_name<
+@@ -1589,7 +1589,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+             }
+             {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+                 dpct::has_capability_or_fail(
+                     strata::q_of(stream)->get_device(),
+                     {sycl::aspect::fp64});
+@@ -1616,7 +1616,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
+             needed.
+             */
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+             dpct::has_capability_or_fail(
+                 strata::q_of(stream)->get_device(),
+                 {sycl::aspect::fp64});
+@@ -1678,7 +1678,7 @@ void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapp
+                          int32_t* ring, int cap, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class coupled_stage_kernel_113245>>(
+@@ -1708,7 +1708,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+             /*
+@@ -1738,7 +1738,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
+     // since the request's top_k is only known on the device), penalties already applied above
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->parallel_for<
+             dpct_kernel_name<class sampler_split_part_kernel_cc5674>>(
+@@ -1755,7 +1755,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
+     coupled_check("coupled_draft split part");
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp64});
+ 
+         s->parallel_for<dpct_kernel_name<class coupled_merge_kernel_1fbeb1>>(
+diff --git a/sycl/src/kernels/cuda/shared_expert.dp.cpp b/sycl/src/kernels/cuda/shared_expert.dp.cpp
+index c45688b..faba5b2 100644
+--- a/sycl/src/kernels/cuda/shared_expert.dp.cpp
++++ b/sycl/src/kernels/cuda/shared_expert.dp.cpp
+@@ -241,7 +241,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
+     const int n = (int) (n_ff * n_tok);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->parallel_for<dpct_kernel_name<class native_swiglu_kernel_93d137>>(
+             sycl::nd_range<3>(
+@@ -264,7 +264,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
+         */
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             cs->parallel_for<dpct_kernel_name<
+                 class native_scalar_sigmoid_multi_kernel_e0530d>>(
+@@ -281,7 +281,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
+                 {
+                     auto exp_props =
+                         sycl::ext::oneapi::experimental::properties{
+-                            sycl::ext::oneapi::experimental::use_root_sync};
++                            STRATA_ROOT_SYNC_PROP};
+ 
+                     cs->submit([&](sycl::handler &cgh) {
+                         auto g_t_ct0 = g + t;
+@@ -297,7 +297,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
+                 }
+         } else {
+                 auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                    sycl::ext::oneapi::experimental::use_root_sync};
++                    STRATA_ROOT_SYNC_PROP};
+                 dpct::has_capability_or_fail(cs->get_device(),
+                                              {sycl::aspect::fp64});
+ 
+@@ -322,7 +322,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         cs->parallel_for<dpct_kernel_name<class scale_rows_kernel_4f17ec>>(
+             sycl::nd_range<3>(
+@@ -438,7 +438,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
+     if (native_projection)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class native_swiglu_kernel_5e9503>>(
+@@ -450,7 +450,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
+                 });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -496,7 +496,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
+         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<dpct_kernel_name<
+@@ -509,7 +509,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
+         }
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+@@ -527,7 +527,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class scale_kernel_a41a71>>(
+@@ -562,7 +562,7 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
+     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+         dpct::has_capability_or_fail(
+             strata::q_of(stream)->get_device(),
+             {sycl::aspect::fp64});
+diff --git a/sycl/src/kernels/cuda/verify_kernels.dp.cpp b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+index 7d16003..660e211 100644
+--- a/sycl/src/kernels/cuda/verify_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+@@ -551,7 +551,7 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst,
+     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -574,7 +574,7 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst,
+ void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class rebase_ptrs_kernel_436f27>>(
+@@ -591,7 +591,7 @@ void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64
+ void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -617,7 +617,7 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class ident_hits_kernel_287489>>(
+@@ -634,7 +634,7 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const
+                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class mtp_select_kernel_4611fe>>(
+@@ -654,7 +654,7 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
+     if (row_bytes % 16 == 0)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+             long long row_bytes_ct1 = row_bytes / 16;
+@@ -672,7 +672,7 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
+     } else if (row_bytes % 4 == 0)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->submit([&](sycl::handler &cgh) {
+             long long row_bytes_ct1 = row_bytes / 4;
+@@ -689,7 +689,7 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
+         });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         s->parallel_for<
+             dpct_kernel_name<class gather_rows_kernel_6148af, uint8_t>>(
+@@ -706,7 +706,7 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
+ void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class map_ids_kernel_43a113>>(
+@@ -726,7 +726,7 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class row_top_prob_kernel_6adbe2>>(
+@@ -771,7 +771,7 @@ __dpct_inline__ void window_ids_kernel(int32_t *steps, int window, int32_t *ids,
+ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class window_ids_kernel_581536>>(
+@@ -789,7 +789,7 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
+ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class dense_steps_kernel_fd7245>>(
+@@ -809,7 +809,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -832,7 +832,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
+ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -856,7 +856,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_ab_multi_kernel_34dcce>>(
+@@ -889,7 +889,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const
+     */
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1136,7 +1136,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
+         mir = g_mirror_table + (res_layer - g_mirror_res);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         const bool par = plan_parallel();
+         strata::q_of(stream)
+@@ -1153,7 +1153,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
+ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1170,7 +1170,7 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n,
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1191,7 +1191,7 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
+     const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class copy_or_zero_kernel_5ef081>>(
+@@ -1210,7 +1210,7 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
+ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class wait_flag_ge_kernel_d7debf>>(
+@@ -1227,7 +1227,7 @@ void embedding_gather_dev(const uint8_t* codes, const float* scales, const float
+                           uint64_t row_groups, float* out, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1248,7 +1248,7 @@ void embedding_gather_dev(const uint8_t* codes, const float* scales, const float
+ void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1269,7 +1269,7 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
+     const unsigned blocks = (unsigned) ((n + 255) / 256 < 64 ? (n + 255) / 256 : 64);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class copy_indexed_kernel_b12e23>>(
+@@ -1299,7 +1299,7 @@ namespace {
+ } }
+ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
+     auto exp_props = sycl::ext::oneapi::experimental::properties{
+-        sycl::ext::oneapi::experimental::use_root_sync};
++        STRATA_ROOT_SYNC_PROP};
+ 
+     strata::q_of(stream)
+         ->parallel_for<dpct_kernel_name<class gpu_stamp_kernel_76ad79>>(
+diff --git a/sycl/src/prefill/kernels.dp.cpp b/sycl/src/prefill/kernels.dp.cpp
+index 36f064f..e2c2507 100644
+--- a/sycl/src/prefill/kernels.dp.cpp
++++ b/sycl/src/prefill/kernels.dp.cpp
+@@ -1391,7 +1391,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
+     if (T <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -1424,7 +1424,7 @@ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class to_f16_kernel_c8575f>>(
+@@ -1444,7 +1444,7 @@ void round_f16(const float* x, float* y, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class round_f16_kernel_877aa1>>(
+@@ -1464,7 +1464,7 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class to_bf16_kernel_44d81a>>(
+@@ -1485,7 +1485,7 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
+              uint16_t* xn16_lo) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gr_norm_kernel_f38542>>(
+@@ -1504,7 +1504,7 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
+                 uint16_t* xn16_lo) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gr_norm_rs_kernel_6c01ba>>(
+@@ -1523,7 +1523,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
+               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gr_mix_r_kernel_a64dc1>>(
+@@ -1541,7 +1541,7 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
+                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<
+@@ -1561,7 +1561,7 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
+ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -1582,7 +1582,7 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
+             uint16_t* mixed_h, uint16_t* mixed16_lo) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gr_mix_kernel_d9dd98>>(
+@@ -1599,7 +1599,7 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
+ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gr_write_kernel_b96cec>>(
+@@ -1615,7 +1615,7 @@ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64
+ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gr_broadcast_kernel_3dedc6>>(
+@@ -1631,7 +1631,7 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
+ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_gates_kernel_e66d35>>(
+@@ -1648,7 +1648,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
+     static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+     if (serial || T <= CONV_TILE) {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_df787b>>(
+@@ -1661,7 +1661,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
+     } else {
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1678,7 +1678,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1693,7 +1693,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
+     }
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_l2_kernel_d82250>>(
+@@ -1718,7 +1718,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
+         info::device::max_work_group_size. Adjust the work-group size if needed.
+         */
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gdn_rec_kernel_923fed>>(
+@@ -1736,7 +1736,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
+         if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1752,7 +1752,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
+             if (pipe) // the software-pipelined loads (same bits)
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1765,7 +1765,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
+                     });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1779,7 +1779,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
+         }
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             strata::q_of(stream)
+                 ->parallel_for<
+@@ -1800,7 +1800,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
+     if (n_expert == 512)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class route_kernel_4f80f3,
+@@ -1816,7 +1816,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
+     } else if (n_expert == 256)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class route_kernel_c02f30,
+@@ -1836,7 +1836,7 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
+ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_50ffea,
+@@ -1854,7 +1854,7 @@ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* s
+ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class blob_dequant_kernel_cd530c,
+@@ -1873,7 +1873,7 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class swiglu_il_kernel_98d495>>(
+@@ -1889,7 +1889,7 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
+ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class swiglu_pair_kernel_ab28da>>(
+@@ -1921,7 +1921,7 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
+     const int64_t b = (n + 255) / 256;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class copy_i32_kernel_1c95ea>>(
+@@ -1939,7 +1939,7 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gather_rows16_kernel_d9d697>>(
+@@ -1957,7 +1957,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
+                  int64_t T, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class moe_combine_kernel_60f865>>(
+@@ -1974,7 +1974,7 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld,
+     if (rows <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class rms_rows_kernel_c88408>>(
+@@ -2003,7 +2003,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
+     if (rt.cos != nullptr)
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -2024,7 +2024,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->submit([&](sycl::handler &cgh) {
+@@ -2049,7 +2049,7 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
+ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class split_q_kernel_83c16c>>(
+@@ -2065,7 +2065,7 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
+ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class gate_attn_kernel_3fc329>>(
+diff --git a/sycl/src/prefill/moe_mmq.dp.cpp b/sycl/src/prefill/moe_mmq.dp.cpp
+index bf74e77..098de6d 100644
+--- a/sycl/src/prefill/moe_mmq.dp.cpp
++++ b/sycl/src/prefill/moe_mmq.dp.cpp
+@@ -200,7 +200,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
+         const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<dpct_kernel_name<class copy16_kernel_b12127>>(
+                 sycl::nd_range<3>(sycl::range(1, 1, blocks(2 * na + nc)) *
+@@ -217,7 +217,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
+         const int64_t na = (int64_t) gu_half_bytes, nc = (int64_t) d_bytes;
+         {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+-                sycl::ext::oneapi::experimental::use_root_sync};
++                STRATA_ROOT_SYNC_PROP};
+ 
+             s->parallel_for<dpct_kernel_name<class copy1_kernel_c557f3>>(
+                 sycl::nd_range<3>(sycl::range(1, 1, blocks(2 * na + nc)) *
+@@ -241,7 +241,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
+ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class strata_q2_kernel_793a65>>(
+@@ -266,7 +266,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
+     if (rows <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class swiglu_kernel_3f7a6f>>(
+@@ -289,7 +289,7 @@ void iota(int32_t* dst, int64_t n, void* stream) {
+     if (n <= 0) return;
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+-            sycl::ext::oneapi::experimental::use_root_sync};
++            STRATA_ROOT_SYNC_PROP};
+ 
+         strata::q_of(stream)
+             ->parallel_for<dpct_kernel_name<class iota_kernel_9245a0>>(
+-- 
+2.43.0
+

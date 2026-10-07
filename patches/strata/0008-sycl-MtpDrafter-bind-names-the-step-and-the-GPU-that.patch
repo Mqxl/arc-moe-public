@@ -1,7 +1,7 @@
-From 7a578e6bf48bf13a16f148f64fd179f22a2af9b9 Mon Sep 17 00:00:00 2001
+From 0f8ff4354a01ca93e72b30e4bf76b12fd0e8284f Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 07:07:15 +0000
-Subject: [PATCH 8/8] sycl: MtpDrafter::bind names the step and the GPU that
+Subject: [PATCH 8/9] sycl: MtpDrafter::bind names the step and the GPU that
  failed
 
 The bind's catch printed only the exception and its own line (mtp.cpp:551)
