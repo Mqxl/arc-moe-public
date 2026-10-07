@@ -1,4 +1,4 @@
-From 64583cf280afb82201417c557ce51b9f28123158 Mon Sep 17 00:00:00 2001
+From 42f013eacae5872e8cbb846e8741945c21cc341c Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:26:16 +0000
 Subject: [PATCH 6/6] sycl: leave out the joint_matrix kernels on Alchemist

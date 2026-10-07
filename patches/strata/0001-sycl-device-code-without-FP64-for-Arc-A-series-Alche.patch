@@ -1,4 +1,4 @@
-From 358f7e589d23e05e67c84321aa86c00ae3ae73d5 Mon Sep 17 00:00:00 2001
+From d79252de8e55b56166a3bffc571067755990cc07 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:18:15 +0000
 Subject: [PATCH 1/6] sycl: device code without FP64 for Arc A-series

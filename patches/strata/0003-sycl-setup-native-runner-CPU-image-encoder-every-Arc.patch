@@ -1,4 +1,4 @@
-From 0dce1190fcb0262ed4059581867a92dafec3f234 Mon Sep 17 00:00:00 2001
+From 75ad28ddd2cf4c06c720556d2116725ebbfad0dd Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:19:52 +0000
 Subject: [PATCH 3/6] sycl setup: native runner, CPU image encoder, every Arc
@@ -18,17 +18,17 @@ The device selector "arc" is resolved by the runner to the discrete Arcs as
 Level Zero numbers them, so an Intel CPU's integrated GPU never takes a
 card's place in the split.
 ---
- sycl/serve/strata-sycl-native.sh |  29 +++++++++
- sycl/setup_intel.py              | 106 +++++++++++++++++++++++++++----
- 2 files changed, 123 insertions(+), 12 deletions(-)
+ sycl/serve/strata-sycl-native.sh |  40 +++++++++++
+ sycl/setup_intel.py              | 115 +++++++++++++++++++++++++++----
+ 2 files changed, 143 insertions(+), 12 deletions(-)
  create mode 100755 sycl/serve/strata-sycl-native.sh
 
 diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
 new file mode 100755
-index 0000000..d7f047f
+index 0000000..2c49e25
 --- /dev/null
 +++ b/sycl/serve/strata-sycl-native.sh
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,40 @@
 +#!/usr/bin/env bash
 +# strata-sycl-native.sh (arc-moe): the SYCL engine as serve/server.py's `exe`, run on the host - no Docker.
 +# The serve protocol is lines on stdin/stdout; stderr goes to the server's log. The config's "env" carries the
@@ -56,10 +56,21 @@ index 0000000..d7f047f
 +: "${SYCL_CACHE_PERSISTENT:=0}" "${ZES_ENABLE_SYSMAN:=1}" "${UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS:=1}"
 +export SYCL_CACHE_PERSISTENT ZES_ENABLE_SYSMAN UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS
 +[ -x "$bin" ] || { echo "strata-sycl-native: no engine at $bin (scripts/build.sh)" >&2; exit 127; }
++# Flags of the CUDA engine the SYCL port does not parse - a config written by an older setup_intel.py, or setup's
++# start path re-adding #578's switch, must not end the engine with "unknown argument"
++args=()
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --remote-expert-opt) echo "strata-sycl-native: dropped $1 (not in the SYCL engine)" >&2; shift ;;
++        --batch|--slots|--batch-groups) echo "strata-sycl-native: dropped $1 ${2:-} (not in the SYCL engine)" >&2; shift 2 || shift ;;
++        *) args+=("$1"); shift ;;
++    esac
++done
++set -- "${args[@]}"
 +cd "$here"
 +exec "$bin" "$@"
 diff --git a/sycl/setup_intel.py b/sycl/setup_intel.py
-index 0b1e2f0..a8e6a26 100644
+index 0b1e2f0..5c1919e 100644
 --- a/sycl/setup_intel.py
 +++ b/sycl/setup_intel.py
 @@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT))
@@ -138,7 +149,19 @@ index 0b1e2f0..a8e6a26 100644
  def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
      """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
      GGUF into VRAM (every expert must fit, so the VRAM reserve is the smallest that leaves the KV and the prompt
-@@ -139,10 +178,20 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+@@ -127,6 +166,11 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+     for f in ("--resident-experts", "--mmap-experts"):  # setup's low-RAM mode is the CUDA engine's
+         drop(args, f)
+     drop(args, "--kv-resident", True)                   # decided below on the real RAM
++    # arc-moe: engine flags of the CUDA engine the SYCL port does not parse ("unknown argument" ends the engine):
++    # #578's helper-cache switch (setup adds it to every multi-GPU config) and #465's batch slots
++    drop(args, "--remote-expert-opt")
++    for f in ("--batch", "--slots", "--batch-groups"):
++        drop(args, f, True)
+     for f in ("--pack", "--native", "--ple-gguf", "--expert-profile", "--mtp", "--control-vector-scaled"):
+         if f in args:
+             v = args[args.index(f) + 1]
+@@ -139,10 +183,24 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
          args += ["--kv-resident", "32768"]
          S.ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram:.1f} GB), every expert stays in VRAM")
      drop(args, "--vram-reserve-mib", True)
@@ -150,6 +173,10 @@ index 0b1e2f0..a8e6a26 100644
          args += ["--prefill", "4096"]
 +    gl = cfg.get("gpu")
 +    n_gpus = len(gl) if isinstance(gl, list) else 1
++    keep = {**keep, "remote_expert_opt": False}         # setup's start path would add --remote-expert-opt again
++    if isinstance(cfg.get("parallel"), int) and cfg["parallel"] > 1:
++        S.warn("parallel requests (--batch) are not in the SYCL engine: one request at a time")
++        keep["parallel"] = 1
 +    if native():                                        # arc-moe: the host runs the engine and the image encoder
 +        out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "gpus")}
 +        out.update({"backend": "sycl", "exe": str(NATIVE_WRAPPER), "args": args})
@@ -160,7 +187,7 @@ index 0b1e2f0..a8e6a26 100644
      out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "vision", "gpus")}
      out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
      env = {}
-@@ -150,6 +199,8 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
+@@ -150,6 +208,8 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict) -> dict:
          env["STRATA_SYCL_BIN"] = str(exe.relative_to(ROOT))
      if MOUNT.resolve() != ROOT.parent.resolve():
          env["STRATA_SYCL_ROOT"] = str(MOUNT)
@@ -169,7 +196,7 @@ index 0b1e2f0..a8e6a26 100644
      if env:
          out["env"] = env
      out.update(keep)
-@@ -176,9 +227,24 @@ def install(argv) -> None:
+@@ -176,9 +236,24 @@ def install(argv) -> None:
              keep[p.name] = {k: c[k] for k in ("model_switcher", "sampling") if k in c}
          except (OSError, ValueError):
              pass
@@ -197,7 +224,7 @@ index 0b1e2f0..a8e6a26 100644
  
      say = S.say
      fake_ram = max(real_ram, 1024.0)
-@@ -186,33 +252,47 @@ def install(argv) -> None:
+@@ -186,33 +261,47 @@ def install(argv) -> None:
      def say_intel(msg=""):
          """setup's words for its AMD path and its RAM rule, said for the Intel card."""
          msg = str(msg).replace("(AMD, experimental: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
@@ -251,7 +278,7 @@ index 0b1e2f0..a8e6a26 100644
          script.write_text(script.read_text().replace(str(ROOT / "serve" / "server.py"), str(SERVER)))
          return script
      S.write_run_script = write_run_script
-@@ -232,7 +312,9 @@ def install(argv) -> None:
+@@ -232,7 +321,9 @@ def install(argv) -> None:
      if "--backend" not in argv:
          sys.argv += ["--backend", "hip"]
      if "--vision" not in argv:

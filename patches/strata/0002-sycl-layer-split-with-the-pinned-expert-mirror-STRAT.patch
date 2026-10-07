@@ -1,4 +1,4 @@
-From 22e9df00c37f5d8196d15e0f3b2befefc3b6e7cd Mon Sep 17 00:00:00 2001
+From 59ecbf4b8b80fc73ffcde1a9fba699539b8e544a Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:18:15 +0000
 Subject: [PATCH 2/6] sycl: layer split with the pinned expert mirror;

@@ -3,6 +3,7 @@
 # configured: the one named, else $ARC_MODEL, else IQ2_XS, else the newest.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
+"$ROOT/scripts/apply-patches.sh" >/dev/null   # a git pull's patch updates (the runner, setup_intel.py) take effect
 cd "$STRATA"
 want=${1:-${ARC_MODEL:-}}
 want=$(echo "$want" | tr '[:upper:]' '[:lower:]')
