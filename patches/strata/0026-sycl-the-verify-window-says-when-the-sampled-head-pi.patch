@@ -1,0 +1,47 @@
+From e5a45602d41536d39dd2923c26465f13791750f2 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 15:08:35 +0000
+Subject: [PATCH] sycl: the verify window says when the sampled head picks
+ token 0 where greedy did not
+
+Token 0 is "!": what a sampler returns when it found no candidate (NaN logits, a scratch it cannot read).
+The sampled path keeps the graph's greedy picks of the window and logs (three times per process) a row
+whose sampled pick is 0 and greedy pick is not, with the request's chain and the GPU.
+---
+ sycl/src/core/verify.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index b4fb49f..60e0505 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -1638,6 +1638,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
+         SamplerParams sp = sampling_;
+         sp.counter = (uint64_t) pos0;
++        int32_t greedy_out[strata::kernels::kVerifyMaxT];   // arc-moe: the graph's greedy picks, for the check below
++        for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t) greedy_out[t] = ((volatile int32_t*) h_out_)[t];
+         try {   // arc-moe: a failed launch is this request's error, not an exception past the window
+             sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+         } catch (const std::exception& e) {
+@@ -1649,6 +1651,17 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+             err = "verify: the head sampling failed";
+             return false;
+         }
++        // arc-moe: token 0 is "!" - what a sampler returns when it found no candidate (NaN logits, unreadable
++        // scratch). Said once per process, with the greedy pick of the same row for comparison.
++        static int said = 0;
++        for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT && said < 3; ++t)
++            if (((volatile int32_t*) h_out_)[t] == 0 && greedy_out[t] != 0) {
++                ++said;
++                std::fprintf(stderr, "strata dbg: the sampled head picked token 0 at position %lld (greedy: %d; "
++                                     "temperature %.2f top_p %.2f top_k %d, penalties %s, GPU %d)\n",
++                             (long long) (pos0 + t), greedy_out[t], sampling_.temperature, sampling_.top_p,
++                             sampling_.top_k, hist_d_ ? "on" : "off", device_);
++            }
+     }
+     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
+-- 
+2.43.0
+
