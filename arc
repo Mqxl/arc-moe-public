@@ -7,6 +7,7 @@
 #   ./arc setup [opts]      download / adopt the model, image encoder, config; then start      (setup.py options)
 #   ./arc start             start the server (http://127.0.0.1:8080, OpenAI + Anthropic APIs)
 #   ./arc bench [opts]      measure prompt and decode speed through the API
+#   ./arc profile           where the time goes: three profiled runs into one file to send       (~10 min)
 #   ./arc service           install a systemd unit that starts the server at boot              (sudo)
 #   ./arc check-fp64        prove the device code has no FP64 left (no GPU needed)
 #   ./arc probe             one-minute check of kernel launches on every GPU (no model needed)
@@ -22,6 +23,7 @@ case "$cmd" in
   setup)      exec "$ROOT/scripts/setup-model.sh" "$@" ;;
   start)      exec "$ROOT/scripts/start.sh" "$@" ;;
   bench)      exec "$ROOT/scripts/bench.sh" "$@" ;;
+  profile)    exec "$ROOT/scripts/profile.sh" "$@" ;;
   service)    exec "$ROOT/scripts/install-service.sh" "$@" ;;
   check-fp64) exec "$ROOT/scripts/check-fp64.sh" "$@" ;;
   probe)      exec "$ROOT/scripts/probe.sh" "$@" ;;

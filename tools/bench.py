@@ -22,8 +22,9 @@ SHORT_CODE = "Write a Python function that returns the n-th Fibonacci number, wi
 SHORT_PROSE = "Объясни простыми словами, как работает смесь экспертов (MoE) в языковых моделях. Пять предложений."
 
 
-def long_code() -> str:
-    """~2K tokens of real code from this repository, then a task - the shape of the 2x B60 report's 2K prompt."""
+def long_code(chars: int = 7000) -> str:
+    """~2K tokens of real code from this repository (chars=7000), then a task - the shape of the 2x B60 report's 2K
+    prompt. chars=28000: the ~8K-token prompt (several prompt chunks, the shape of an agent's first request)."""
     here = Path(__file__).resolve().parent.parent
     src = ""
     for p in sorted((here / "third_party" / "strata" / "tools").glob("*.py")):
@@ -31,9 +32,9 @@ def long_code() -> str:
             src += f"# file: {p.name}\n" + p.read_text(encoding="utf-8", errors="replace") + "\n"
         except OSError:
             continue
-        if len(src) > 7000:
+        if len(src) > chars:
             break
-    src = src[:7000] or "def f(x):\n    return x\n" * 200
+    src = src[:chars] or "def f(x):\n    return x\n" * (chars // 25)
     return src + "\n\nUsing the style of the code above, write a binary search tree class with insert, find and delete."
 
 
@@ -58,6 +59,7 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--long", action="store_true", help="also the ~2K-token code prompt")
     ap.add_argument("--json", help="write the raw rows here")
+    ap.add_argument("--cases", help="comma list of short, prose, 2k, 8k (default: short,prose, and 2k with --long)")
     a = ap.parse_args()
 
     try:
@@ -67,9 +69,14 @@ def main() -> int:
         print(f"the server at {a.url} does not answer ({e}): ./arc start", file=sys.stderr)
         return 1
 
-    cases = [("short code", SHORT_CODE), ("short prose (ru)", SHORT_PROSE)]
-    if a.long:
-        cases.append(("2K code", long_code()))
+    known = {"short": ("short code", lambda: SHORT_CODE), "prose": ("short prose (ru)", lambda: SHORT_PROSE),
+             "2k": ("2K code", long_code), "8k": ("8K code", lambda: long_code(28000))}
+    want = a.cases.split(",") if a.cases else ["short", "prose"] + (["2k"] if a.long else [])
+    bad = [c for c in want if c not in known]
+    if bad:
+        print(f"unknown case(s) {bad}: pick from {sorted(known)}", file=sys.stderr)
+        return 2
+    cases = [(known[c][0], known[c][1]()) for c in want]
     rows = []
     print(f"{'prompt':18s} {'run':>3s} {'in':>6s} {'out':>5s} {'prompt tok/s':>13s} {'decode tok/s':>13s} {'wall s':>7s}")
     for name, prompt in cases:

@@ -1,0 +1,33 @@
+From dfa9110cda0cc5eb34e0a71f37a11aa2f6213a25 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 09:12:30 +0000
+Subject: [PATCH] sycl: the native runner appends STRATA_EXTRA_ARGS to the
+ engine's flags
+
+One run's flags without a new config: ./arc profile's A/B of the prompt
+chunk (--prefill-borrow --prefill auto) against the config's own.
+---
+ sycl/serve/strata-sycl-native.sh | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
+index 2c49e25..b665e9c 100755
+--- a/sycl/serve/strata-sycl-native.sh
++++ b/sycl/serve/strata-sycl-native.sh
+@@ -35,6 +35,13 @@ while [ $# -gt 0 ]; do
+         *) args+=("$1"); shift ;;
+     esac
+ done
++# arc-moe: STRATA_EXTRA_ARGS appends engine flags for one run (./arc profile's A/B), after the config's: the
++# engine's parser keeps the last value of a repeated flag
++if [ -n "${STRATA_EXTRA_ARGS:-}" ]; then
++    read -r -a extra <<< "$STRATA_EXTRA_ARGS"
++    args+=("${extra[@]}")
++    echo "strata-sycl-native: extra engine flags: ${extra[*]}" >&2
++fi
+ set -- "${args[@]}"
+ cd "$here"
+ exec "$bin" "$@"
+-- 
+2.43.0
+
