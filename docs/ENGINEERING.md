@@ -242,6 +242,18 @@ These came from the first runs on the target machine (2x A770 16 GB, i915, 48 GB
   After each `resident_plan` the device plan is printed: `skip` (planned, or refused, meaning a host fallback that
   never comes in a host-free window), its counts, and every group's expert pointer, marked `vram:` or `HOST:`.
 
+- **The step log named it: layer 0, after stage 16, before `resident_plan` finished.** Between those two points
+  only the router runs. `route<NE>` (`native_router.dp.cpp`, from llama.cpp's `topk-moe.cu`) launches an 8x32
+  block, returns rows 1-7 at once (`if (local_id(1) != 0) return;`), and then calls a work-group barrier, which is
+  dpct's translation of a `__syncthreads()`. On NVIDIA, exited warps don't hold a barrier. On Alchemist the
+  barrier waits for every thread of the work-group, the exited ones included, so the kernel never ends and i915
+  resets the GPU. The single-token decode path calls the same router, so every token would have hung too.
+
+  Patch 13 removes the barrier. The router's values are registers and it uses no local memory, so the barrier had
+  nothing to order. A scan of every SYCL kernel for an early `return` before a barrier found 30 more. All of them
+  are uniform over the work-group: they test the group index or a value the whole group reads, so the whole group
+  leaves together.
+
 ## What was verified here, and what was not
 
 | Check | Status |

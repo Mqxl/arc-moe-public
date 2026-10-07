@@ -1,0 +1,37 @@
+From 451508196e3e1917f8ff1d57dac841287c0d0394 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 08:42:24 +0000
+Subject: [PATCH] sycl: the native router has no barrier after its early return
+ (DG2 GPU hang)
+
+route<NE> launches an 8x32 block, returns rows 1-7 at once, and then
+called a work-group barrier. On Alchemist the barrier waits for every
+thread of the work-group, the exited ones included, so the kernel never
+finished: i915 reset GPU 0 in the first verify window (STRATA_VERIFY_STEPLOG
+named the stage: between stage 16 and resident_plan, i.e. the router).
+The values are registers and no local memory is used, so the barrier had
+nothing to order. Every other early return before a barrier in the SYCL
+kernels was checked: all are uniform over the work-group.
+---
+ sycl/src/kernels/cuda/native_router.dp.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/sycl/src/kernels/cuda/native_router.dp.cpp b/sycl/src/kernels/cuda/native_router.dp.cpp
+index ed61cfc..121e34d 100644
+--- a/sycl/src/kernels/cuda/native_router.dp.cpp
++++ b/sycl/src/kernels/cuda/native_router.dp.cpp
+@@ -82,7 +82,10 @@ __dpct_inline__ void route(const float *__restrict__ logits,
+     float values[NE / 32];
+ #pragma unroll
+     for (int i = 0; i < NE / 32; ++i) values[i] = logits[lane + i * 32];
+-    item_ct1.barrier(sycl::access::fence_space::local_space);
++    // arc-moe: no work-group barrier here. Rows 1-7 of the 8x32 block returned above, and on Alchemist (DG2) a
++    // barrier waits for every thread of the work-group, the exited ones included: the kernel never finished and
++    // i915 reset the GPU (the first verify window and every decode token). The values are registers, there is no
++    // local memory to order, so the barrier (dpct's __syncthreads) had nothing to do.
+     float maximum = -INFINITY;
+ #pragma unroll
+     for (int i = 0; i < NE / 32; ++i) maximum = sycl::max(maximum, values[i]);
+-- 
+2.43.0
+
