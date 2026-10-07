@@ -1,0 +1,53 @@
+From 406f823ebc8ed36cfeeefa9de370ead8fe8a2404 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:19:22 +0000
+Subject: [PATCH] sycl: the grouped prompt experts quantize the activations as
+ one flat vector
+
+native_quantize_q8_1 takes at most 8 columns (the decode window); the chunk's T rows went in as T columns
+and the engine terminated on its std::invalid_argument. The kernel is per 32-element block, so T * N as one
+column is the same rows. A failing launch on this path is now the request's error, not a terminate.
+---
+ sycl/src/prefill/prefill.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index cd48b40..bb42bfc 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -3350,7 +3350,13 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             uint8_t* gdev = base + xq_b + io_b;
+                             void* scratch = base + xq_b + io_b + al(gt_b);
+                             uint8_t* stage0 = base + fixed;
+-                            strata::kernels::native_quantize_q8_1(m.mixed, xq, (int) N, (int) T, m.cs);
++                            // one flat vector of T * N (the entry point takes at most 8 columns; the kernel is per 32-block either way)
++                            try {
++                                strata::kernels::native_quantize_q8_1(m.mixed, xq, (int) (N * T), 1, m.cs);
++                            } catch (const std::exception& ex) {
++                                err = std::string("prefill (grouped experts): ") + ex.what();
++                                return false;
++                            }
+                             pfg_iota(iota, T, m.cs);
+                             if (m.pfg_host.size() < ((size_t) m.g->n_expert + 1) * al(gt_b))
+                                 m.pfg_host.assign(((size_t) m.g->n_expert + 1) * al(gt_b), 0);
+@@ -3419,9 +3425,14 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 const int32_t* d_n = (const int32_t*) gdev;
+                                 const int32_t* d_start = d_n + 4;
+                                 const unsigned long long* d_ptr = (const unsigned long long*) (gdev + al(16 + (kGrpMax + 1) * 4));
+-                                strata::kernels::native_expert_grouped(NL, d_ptr, d_start, d_n, iota, m.src_dev + row0, ng,
+-                                                                       row1 - row0, xq, scratch, m.Dm + (size_t) row0 * N,
+-                                                                       m.cs, 0);
++                                try {
++                                    strata::kernels::native_expert_grouped(NL, d_ptr, d_start, d_n, iota, m.src_dev + row0, ng,
++                                                                           row1 - row0, xq, scratch, m.Dm + (size_t) row0 * N,
++                                                                           m.cs, 0);
++                                } catch (const std::exception& ex) {
++                                    err = std::string("prefill (grouped experts): ") + ex.what();
++                                    return false;
++                                }
+                                 if (copied_any) {
+                                     kev[hcur] = m.cs->ext_oneapi_submit_barrier();
+                                     hcur ^= 1;
+-- 
+2.43.0
+
