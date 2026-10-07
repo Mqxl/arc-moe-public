@@ -5,8 +5,9 @@
 # A server already running: checked as it is (a few minutes). None running: started once per configuration below with
 # STRATA_DBG_NAN=1, each checked, everything written to check-<time>.txt (~15 minutes, each start reloads the model):
 #   base          ./arc start's defaults
-#   old-layout    STRATA_CACHE_TAIL_LOW=0     the prompt path's borrowed buffers 7-11 GB into the expert cache, as
-#                                             before patch 27 (expected: the 10K rows broken - the cause confirmed)
+#   old-layout    STRATA_CACHE_TAIL_LOW=0     only with ARC_CHECK_OLD_LAYOUT=1: the prompt path's borrowed buffers
+#                                             7-11 GB into the expert cache, as before patch 27 - a control that MUST
+#                                             break the 10K rows (it did on 2026-10-07 and 10-08: the cause confirmed)
 #   own-buffers   --no-prefill-borrow         the prompt path in its own allocations (smaller chunks, fewer experts)
 #   one-gpu       ARC_GPUS=0                  on a machine with two Arcs: no layer split
 set -euo pipefail
@@ -81,7 +82,7 @@ run() {   # run <name> <env...>
 } >"$out"
 BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
 run base ARC_CHECK_RUN=base
-run old-layout STRATA_CACHE_TAIL_LOW=0
+if [ "${ARC_CHECK_OLD_LAYOUT:-0}" = 1 ]; then run old-layout STRATA_CACHE_TAIL_LOW=0; fi
 run own-buffers "STRATA_EXTRA_ARGS=$BASE_ARGS --no-prefill-borrow"
 if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then run one-gpu ARC_GPUS=0; fi
 trap - EXIT
