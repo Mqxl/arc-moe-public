@@ -6,6 +6,7 @@
 #   N     the defaults (./arc start's: lib.sh arc_engine_env), nothing traced: the real speeds on short prompts, on
 #         2K / 10K prompts and on a sampled request and an agent harness's (tools, streaming); every reply checked
 #   PS1   STRATA_PLAN_STAGE=1: the device plan stages mirrored experts in VRAM (patch 21; off by default since round 9)
+#   PG0   STRATA_PF_GROUPED=0: the prompt path's experts dequantized to FP16 + oneMKL (before patch 30)
 #   SR768 --short-read 768: round 9's threshold (1536 by default: up to 1536 new tokens go through the windows)
 #   SR64  --short-read 64: upstream's threshold (short prompt parts batched)
 #   G1    one card only (ARC_GPUS=0), on a machine with two: the single-GPU mode
@@ -116,6 +117,7 @@ fi
 # ./arc start's flags (STRATA_EXTRA_ARGS replaces them, so a run repeats them; the engine keeps a flag's last value)
 BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
 run PS1 short,prose 128 STRATA_PLAN_STAGE=1
+run PG0 2k,10k 128 STRATA_PF_GROUPED=0
 run SR768 1k,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --short-read 768"
 run SR64 agent 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --short-read 64"
 if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then   # the same box on one card: the single-GPU mode's speeds

@@ -1,0 +1,217 @@
+From 79385b025d1b5e1acf523040201d3c1d8c951bd9 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:39:25 +0000
+Subject: [PATCH] sycl: the prompt path's experts through the grouped native
+ kernels (no FP16 dequant, no oneMKL)
+
+On 2x A770 80% of a long prompt was the experts: per routed expert a dequantization to FP16 (10 MB written)
+and two oneMKL GEMMs of ~160 rows, ~2500 launches a layer (dequant 30%, the GEMMs 50%). A native pack's
+layer now runs them as the decode does: the activations quantized to q8_1 once per layer, then the routed
+experts in batches - the next experts in id order (contiguous rows), up to 32 copied from the host, 64
+groups or T rows - each one native_expert_grouped launch pair (gate/up + SwiGLU, down) straight from the
+quantized blobs. The host experts are copied into one half of a staging area while the other half's batch
+computes. Scratch, staging and the q8_1 rows come from the FP16 path's activation buffer (Xs), unused here.
+
+STRATA_PF_GROUPED=0: the FP16 path as before. MMQ layers, the streamed walk and peer prefill are unchanged.
+---
+ sycl/src/prefill/prefill.cpp | 135 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 132 insertions(+), 3 deletions(-)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index cc083d0..cd48b40 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -16,6 +16,7 @@
+ #include "strata/kernels/ple.hpp"
+ #include "strata/kernels/native_ple_postops.hpp"
+ #include "strata/kernels/iq_kernels.hpp"
++#include "strata/kernels/native_mmvq.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/qsa.hpp"
+ #include "strata/kernels/kv_stream.hpp"
+@@ -551,6 +552,8 @@ struct Prefill::Impl {
+     uint8_t* stage_dev[RING_MAX] = {};
+     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
+     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
++    // arc-moe (grouped experts): each batch's group table, uploaded from here (kept alive until the layer's wait)
++    std::vector<uint8_t> pfg_host;
+     dpct::event_ptr copied[RING_MAX] = {}, used[RING_MAX] = {};
+     bool stage_live[RING_MAX] = {};
+     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
+@@ -723,6 +726,17 @@ const MmqPlan& mmq_plan() {
+ bool fused_layout(size_t T, bool src) {
+     return src && fused_ring() && mmq_plan().any && ring_slots(T) > STAGE && (int64_t) T >= stream_all_min();
+ }
++// arc-moe: the prompt path's experts through the decode's grouped native kernels (STRATA_PF_GROUPED, default on):
++// a layer's routed experts in batches, each batch one gate/up + SwiGLU + down launch pair straight from the quantized
++// blobs against the q8_1 activations - instead of per expert a dequantization to FP16 (10 MB written) and two oneMKL
++// GEMMs. On the A770 those were 80% of a long prompt (dequant 30%, the GEMMs 50%, ~2500 launches a layer).
++inline bool pf_grouped_env() {
++    static const bool v = [] { const char* e = std::getenv("STRATA_PF_GROUPED"); return !(e && e[0] == '0'); }();
++    return v;
++}
++void pfg_iota(int32_t* dst, int64_t n, dpct::queue_ptr q) {
++    q->parallel_for<class arc_pfg_iota>(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { dst[i] = (int32_t) i; });
++}
+ // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
+ // default): MMQ's, for T tokens.
+ struct MoeBufs { size_t gu, h, xq, hq; };
+@@ -2756,6 +2770,13 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         n_order = order.size();
+                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
+                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
++                        // arc-moe: this layer's experts through the grouped native kernels (see pf_grouped_env); they
++                        // borrow the FP16 path's activation buffer (Xs) for their scratch, staging and q8_1 rows
++                        const bool grouped_l = pf_grouped_env() && lay.native && !use_mmq && !stream_all && m.Xs != nullptr &&
++                                               on_peer.empty() && m.src != nullptr &&
++                                               strata::kernels::native_expert_supported(lay.fmt[(size_t) l].gu_type,
++                                                                                        lay.fmt[(size_t) l].d_type, N,
++                                                                                        lay.fmt[(size_t) l].n_ff);
+                         pt.mark(kPfGather, cs);
+                         if (use_mmq) {
+                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
+@@ -2786,6 +2807,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 m.cs->memcpy(m.bounds_dev, m.bounds_host.data(),
+                                              m.bounds_host.size() * 4);
+                             }
++                        } else if (grouped_l) {
++                            // the layer's activations as q8_1 rows, one per token (the decode's input format), at
++                            // the end of Xs: below, the batches carve scratch and staging from its start
+                         } else {
+                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                         }
+@@ -3299,7 +3323,112 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                           std::exit(1);
+                         }
+                         };
+-                        if (!stream_all) {
++                        if (grouped_l) {
++                            // ---- arc-moe: the grouped walk.  Xs (T*K*N halves) is carved into: q8_1 activations
++                            // (T rows), the entry index (T ints), a group table, the kernels' scratch for T entries
++                            // (no expert has more rows than tokens) and two halves of blob staging.  A batch is the
++                            // next experts in id order (their rows are contiguous) up to `half` streamed ones, 64
++                            // groups or T rows; its host blobs are copied into one half while the other half's batch
++                            // computes, and the half is copied into again only after the kernel that read it.
++                            const auto& f = lay.fmt[(size_t) l];
++                            const strata::kernels::NativeExpertLayout NL =
++                                strata::kernels::native_expert_layout(f.gu_type, f.d_type, N, f.n_ff);
++                            auto al = [](size_t b) { return (b + 255) & ~(size_t) 255; };
++                            uint8_t* base = (uint8_t*) m.Xs;
++                            const size_t avail = (size_t) T * K * N * sizeof(uint16_t);
++                            const size_t xq_b = al((size_t) T * (size_t) (N / 32) * 36);
++                            const size_t io_b = al((size_t) T * 4);
++                            constexpr int kGrpMax = 64;
++                            const size_t gt_b = al(16 + (kGrpMax + 1) * 4) + kGrpMax * 8;
++                            const size_t sc_b = al(strata::kernels::native_expert_scratch_bytes(T, f.n_ff));
++                            const size_t blob = (size_t) lay.blob_bytes(l), slot_b = al(blob);
++                            const size_t fixed = xq_b + io_b + al(gt_b) + sc_b;
++                            const int64_t half = fixed < avail ? std::min<int64_t>(32, (int64_t) ((avail - fixed) / slot_b) / 2) : 0;
++                            if (half < 1) { err = "prefill (grouped experts): the chunk's buffers are too small"; return false; }
++                            uint8_t* xq = base;
++                            int32_t* iota = (int32_t*) (base + xq_b);
++                            uint8_t* gdev = base + xq_b + io_b;
++                            void* scratch = base + xq_b + io_b + al(gt_b);
++                            uint8_t* stage0 = base + fixed;
++                            strata::kernels::native_quantize_q8_1(m.mixed, xq, (int) N, (int) T, m.cs);
++                            pfg_iota(iota, T, m.cs);
++                            if (m.pfg_host.size() < ((size_t) m.g->n_expert + 1) * al(gt_b))
++                                m.pfg_host.assign(((size_t) m.g->n_expert + 1) * al(gt_b), 0);
++                            size_t host_off = 0;
++                            sycl::event kev[2];                // the last kernel that read each staging half
++                            int hcur = 0;
++                            size_t j = 0;
++                            while (j < order.size()) {
++                                const size_t j0 = j;
++                                int streamed = 0;
++                                const int32_t row0 = m.off[(size_t) order[j0]];
++                                int32_t row1 = row0;
++                                uint8_t* hb = m.pfg_host.data() + host_off;
++                                int32_t* h_n = (int32_t*) hb;
++                                int32_t* h_start = h_n + 4;
++                                unsigned long long* h_ptr = (unsigned long long*) (hb + al(16 + (kGrpMax + 1) * 4));
++                                uint8_t* stage = stage0 + (size_t) hcur * (size_t) half * slot_b;
++                                bool waited = false;
++                                sycl::event last_copy;
++                                bool copied_any = false;
++                                pt.mark(kPfWaitCopy, cs);
++                                while (j < order.size() && (int) (j - j0) < kGrpMax) {
++                                    const int32_t e = order[j];
++                                    const int32_t c = m.cnt[(size_t) e];
++                                    if (row1 + c - row0 > (int32_t) T) break;
++                                    const bool res = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
++                                    if (!res && streamed == half) break;
++                                    const int g = (int) (j - j0);
++                                    h_start[g] = row1 - row0;
++                                    if (res) {
++                                        h_ptr[g] = (unsigned long long) m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
++                                        ++stats_.experts_resident;
++                                    } else {
++                                        if (!waited) {   // the half's previous batch has read it
++                                            m.copy->ext_oneapi_submit_barrier({kev[hcur]});
++                                            waited = true;
++                                        }
++                                        uint8_t* dst = stage + (size_t) streamed * slot_b;
++                                        const auto th = Clock::now();
++                                        if (m.src->pinned(l, e)) {
++                                            const uint8_t* b = m.src->blob(l, e);
++                                            if (!b) { err = "prefill: expert source has no blob"; return false; }
++                                            last_copy = m.copy->memcpy(dst, b, blob);
++                                            ++stats_.experts_dma;
++                                        } else {
++                                            const uint8_t* hbuf = m.stager->wait(job_of[j]);
++                                            last_copy = m.copy->memcpy(dst, hbuf, blob);
++                                            m.stager->issued_one(job_of[j], m.copy);
++                                        }
++                                        stats_.ms_experts_host += ms_since(th);
++                                        ++stats_.experts_streamed;
++                                        copied_any = true;
++                                        h_ptr[g] = (unsigned long long) dst;
++                                        ++streamed;
++                                    }
++                                    row1 += c;
++                                    ++j;
++                                }
++                                const int ng = (int) (j - j0);
++                                if (ng == 0) { err = "prefill (grouped experts): an expert fits no batch"; return false; }
++                                h_n[0] = ng;
++                                h_start[ng] = row1 - row0;
++                                m.cs->memcpy(gdev, hb, gt_b);
++                                if (copied_any) m.cs->ext_oneapi_submit_barrier({last_copy});
++                                pt.mark(kPfGemmGU, cs);
++                                const int32_t* d_n = (const int32_t*) gdev;
++                                const int32_t* d_start = d_n + 4;
++                                const unsigned long long* d_ptr = (const unsigned long long*) (gdev + al(16 + (kGrpMax + 1) * 4));
++                                strata::kernels::native_expert_grouped(NL, d_ptr, d_start, d_n, iota, m.src_dev + row0, ng,
++                                                                       row1 - row0, xq, scratch, m.Dm + (size_t) row0 * N,
++                                                                       m.cs, 0);
++                                if (copied_any) {
++                                    kev[hcur] = m.cs->ext_oneapi_submit_barrier();
++                                    hcur ^= 1;
++                                }
++                                host_off += al(gt_b);
++                            }
++                        } else if (!stream_all) {
+                             size_t staged = 0;
+                             const size_t lookahead = STAGE - 1;
+                             for (size_t j = 0; j < order.size(); ++j) {
+@@ -3395,7 +3524,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         }
+                         };
+                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
+-                        const int64_t bgu = fused_l ? 0 : bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N),
++                        const int64_t bgu = (fused_l || (pf_grouped_env() && !use_mmq && lay.native)) ? 0 : bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N),
+                                       bbo = bad(m.bo, T * N);
+                         const int64_t bh = m.H && !fused_l ? bad(m.H, T * K * 640) : -1;
+                         // the fp16 inputs of the experts' GEMMs: the gathered activations and the last dequantized
+@@ -3414,7 +3543,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             return c;
+                         };
+                         double mxs = 0, mxq = 0;
+-                        const int64_t bxs = (!use_mmq && m.Xs) ? bad16(m.Xs, T * K * N, mxs) : -1;
++                        const int64_t bxs = (!use_mmq && m.Xs && !pf_grouped_env()) ? bad16(m.Xs, T * K * N, mxs) : -1;
+                         const int64_t bdq = (!use_mmq && m.dq_gu[0]) ? bad16(m.dq_gu[0], (int64_t) 1280 * N, mxq) : -1;
+                         static int64_t reported = -1;
+                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks)
+-- 
+2.43.0
+
