@@ -1,0 +1,101 @@
+From 5ddc23e915d75245728915a9e0f22b5d3436f085 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 08:31:02 +0000
+Subject: [PATCH] sycl: STRATA_VERIFY_STEPLOG names the verify stage a GPU
+ hangs in
+
+With STRATA_VERIFY_EAGER=1, every stage stamp waits for the GPU and logs
+the stage it finished, so a kernel that hangs the card (i915: GPU HANG,
+context reset) is named by the last 'done' line. The device-built plan of
+each group is dumped as well: skip (planned or refused), the counts, and
+for each group whether its expert pointer lies in the VRAM cache or not.
+---
+ sycl/src/core/verify.cpp | 50 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 69514b3..80986a2 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -580,7 +580,27 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+     // SYCL port, STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
+     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
+     static const bool eager = std::getenv("STRATA_VERIFY_EAGER") != nullptr;
++    // arc-moe, STRATA_VERIFY_EAGER=1 STRATA_VERIFY_STEPLOG=1: every stage stamp waits for the GPU and logs, so a
++    // kernel that hangs the card is named by the last "done" line (the stages after it are the suspects)
++    static const bool steplog = eager && std::getenv("STRATA_VERIFY_STEPLOG") != nullptr;
++    static int64_t sl_l = -1;
++    static int sl_i = -1, sl_g = 0;
++    auto step_sync = [&](int64_t l, int i, int grp, const char* what) {
++        try {
++            cs->wait_and_throw();
++        } catch (const std::exception& e) {
++            std::fprintf(stderr, "verify step: GPU %d FAILED in layer %lld before stage %d grp %d (%s); last done: layer %lld "
++                                 "stage %d grp %d: %s\n", device_, (long long) l, i, grp, what, (long long) sl_l, sl_i, sl_g,
++                         e.what());
++            std::fflush(stderr);
++            throw;
++        }
++        std::fprintf(stderr, "verify step: GPU %d layer %lld stage %d grp %d done (%s)\n", device_, (long long) l, i, grp, what);
++        std::fflush(stderr);
++        sl_l = l; sl_i = i; sl_g = grp;
++    };
+     auto stamp = [&](int64_t l, int i, int grp) {
++        if (steplog) step_sync(l, i, grp, "stamp");
+         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
+         if (!prof_on_ || grp != 0) return;
+         if (eager) { cs->wait(); prof_h_[(size_t) (l * kProfPer + i)] = (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count(); }
+@@ -890,6 +910,30 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
++        if (device_plan_ && steplog) {   // arc-moe: did the device plan the group (skip == ring) or refuse (0)?
++            step_sync(l, 17, grp, "resident_plan");
++            uint32_t sk = 0;
++            cs->memcpy(&sk, skip_ + grp, 4).wait();
++            std::fprintf(stderr, "verify step: GPU %d layer %lld grp %d resident_plan skip=%u (planned when %u)\n", device_,
++                         (long long) l, grp, sk, (uint32_t) ((l - lb_) * G + grp + 1));
++            // the plan itself: counts, and where each group's expert is read from (VRAM cache or a host mirror)
++            const int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
++            const long long capx = (long long) max_t_ * K;
++            const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
++            int32_t cnt[4] = {0, 0, 0, 0};
++            cs->memcpy(cnt, pl, sizeof cnt).wait();
++            std::vector<unsigned long long> ptrs((size_t) capx, 0ull);
++            cs->memcpy(ptrs.data(), pl + ptr_off, ptrs.size() * 8).wait();
++            const unsigned long long cb = (unsigned long long) hits_.cache_base;
++            const unsigned long long ce = cb + (unsigned long long) hits_.n_slots * (unsigned long long) hits_.blob * 2ull;
++            std::fprintf(stderr, "verify step:   plan counts %d %d %d; cache [0x%llx, ~0x%llx); groups:", cnt[0], cnt[1], cnt[2],
++                         cb, ce);
++            for (int i = 0; i < cnt[0] && i < (int) capx; ++i)
++                std::fprintf(stderr, " %s0x%llx", ptrs[(size_t) i] >= cb && ptrs[(size_t) i] < ce ? "vram:" : "HOST:",
++                             ptrs[(size_t) i]);
++            std::fprintf(stderr, "\n");
++            std::fflush(stderr);
++        }
+ #if defined(STRATA_USE_HIP)
+         if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
+             doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+@@ -1016,6 +1060,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+         return true;
+     };
+ 
++    if (steplog) {
++        std::fprintf(stderr, "verify step: GPU %d window T=%d layers [%lld, %lld) groups %d device_plan %d\n", device_, T,
++                     (long long) lb_, (long long) le_, G, (int) device_plan_);
++        step_sync(lb_, -1, 0, "window inputs + embeddings / hand-in");
++    }
+     for (int grp = 0; grp < G; ++grp)
+         if (!pre(lb_, grp)) return false;
+     for (int64_t l = lb_; l < le_; ++l)
+@@ -1033,6 +1082,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+             copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N, bo_ + (size_t) t * N, N, cs);
+             copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N + N, inj2_ + (size_t) t * HC, HC, cs);
+         }
++        if (steplog) step_sync(le_, -1, 0, "hand-off out");
+         return true;
+     }
+ 
+-- 
+2.43.0
+

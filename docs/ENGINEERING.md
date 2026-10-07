@@ -229,6 +229,19 @@ These came from the first runs on the target machine (2x A770 16 GB, i915, 48 GB
   also gets its own address table, and `resident_plan`'s mirror is now a registry per residency table. `NO_HOST=auto`
   then counts the stage as covered and stays on.
 
+- **With the window host-free, GPU 0 still hung on the first prompt**, and it hung the same way without the window
+  graph (`STRATA_VERIFY_EAGER=1`) and with the serial plan (`STRATA_PLAN_PARALLEL=0`). The kernel log shows only
+  `GPU HANG ... context reset`, with no CAT error. That rules out the graph, and it rules out the flag waits as well:
+  every device spin is bounded at `kSpinMax` = 20 000 reads, a few tens of ms. What is left is a kernel that does
+  not finish, or one that reads an address the GPU has not mapped. On DG2 under i915 the second also shows up as a
+  plain hang.
+
+  Patch 12 adds `STRATA_VERIFY_STEPLOG=1` (with `STRATA_VERIFY_EAGER=1`). Every stage stamp of the window waits for
+  the GPU and logs `verify step: GPU g layer l stage s done`. A hang ends with
+  `FAILED in layer l before stage s ... last done: ...`, which names the kernels between the two stamps.
+  After each `resident_plan` the device plan is printed: `skip` (planned, or refused, meaning a host fallback that
+  never comes in a host-free window), its counts, and every group's expert pointer, marked `vram:` or `HOST:`.
+
 ## What was verified here, and what was not
 
 | Check | Status |

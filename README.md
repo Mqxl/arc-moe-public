@@ -174,6 +174,7 @@ print(r.choices[0].message.content)
 | `ExpertCache: cudaMalloc(… GiB) failed` | В окружении нет `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` (его ставит `./arc setup`) |
 | `STRATA_VERIFY_NO_HOST=auto -> off` | Не все эксперты поместились в VRAM + зеркало: закройте программы, съедающие RAM, или уменьшите `--context` |
 | Медленно, часто моргает SSD | Зеркало маленькое (мало свободной RAM), промахи идут на SSD. Проверьте строку `mirrored in pinned host memory` в логе |
+| `GPU HANG` в `dmesg` на первом запросе | Запустите с `STRATA_VERIFY_EAGER=1 STRATA_VERIFY_STEPLOG=1`: последняя строка `verify step:` в логе показывает, на каком ядре зависла карта |
 | Первый ответ медленный | Первый запуск заполняет VRAM из GGUF (~1 мин) и читает PLE-таблицу с SSD. Дальше быстро |
 
 Лог движка: `third_party/strata/strata-iq2_xs.log`. Проверка без GPU: `./arc check-fp64`.
