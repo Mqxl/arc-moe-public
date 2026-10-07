@@ -7,7 +7,7 @@
 #   base          ./arc start's defaults
 #   one-block     STRATA_SAMPLER_ONE_BLOCK=1  the sampled path's one-kernel variant (no split scratch)
 #   old-sampler   STRATA_OLD_SAMPLER=1        the original sampled kernel
-#   no-spec       --spec 0                    no drafter (no coupled draft sampling)
+#   spec2         --spec 2                    the shortest drafts (a native IQ pack needs --spec >= 2)
 #   eager         STRATA_VERIFY_EAGER=1       the verify window without SYCL graphs
 #   one-gpu       ARC_GPUS=0                  on a machine with two Arcs: no layer split
 set -euo pipefail
@@ -82,7 +82,7 @@ BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
 run base ARC_CHECK_RUN=base
 run one-block STRATA_SAMPLER_ONE_BLOCK=1
 run old-sampler STRATA_OLD_SAMPLER=1
-run no-spec "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 0"
+run spec2 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 2"
 run eager STRATA_VERIFY_EAGER=1
 if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then run one-gpu ARC_GPUS=0; fi
 trap - EXIT
