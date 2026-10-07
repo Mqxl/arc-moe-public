@@ -1,0 +1,302 @@
+From a7702f50edf71e2816066817863fa73ac3ddbca1 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 16:03:37 +0000
+Subject: [PATCH] sycl: a native pack's cache slots lie in reverse, so the
+ prompt path's loan is in the arena's first 4 GiB
+
+The prompt path borrows the last expert-cache slots for its buffers (--prefill-borrow). On one 10-15 GB arena
+they sat 7-11 GB in, and the oneMKL GEMMs of the batched prompt (kernels this build does not compile, so
+-ze-opt-greater-than-4GB-buffer-required does not reach them) computed garbage there from layer 0's first
+projection on: every prompt of ~1K tokens or more came out NaN ("!!!!", token 0), with the router sending
+every token to the same 10 experts. The engine's own kernels read the same memory fine.
+
+ExpertCache lays sized slots out last-first (STRATA_CACHE_TAIL_LOW=0: as before): device_slot and
+slot_offsets give the addresses, slot_ends the sizes the loan is priced with, device_base the device plan's
+base and lend_base(first) the loan's lowest address. Slot order, sizes and every rule over slot indices are
+unchanged. Uniform-slot caches (the S2 kernels address base + slot * blob) and --vram-elastic keep the old
+layout.
+
+The batched prompt also checks its last residual row (40 KB, once per prompt): a non-finite one refuses the
+request with a reason instead of answering "!!!!" (STRATA_PREFILL_NAN_CHECK=0: off).
+---
+ include/strata/core/expert_cache.hpp | 18 ++++++++++++--
+ sycl/src/core/expert_cache.cpp       | 35 +++++++++++++++++++++++++++-
+ sycl/src/prefill/prefill.cpp         | 25 ++++++++++++++++++++
+ sycl/src/program/generate.cpp        | 30 ++++++++++++------------
+ 4 files changed, 90 insertions(+), 18 deletions(-)
+
+diff --git a/include/strata/core/expert_cache.hpp b/include/strata/core/expert_cache.hpp
+index 8c031ff..84af434 100644
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -84,8 +84,19 @@ public:
+     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
+     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
+     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
+-    /// Byte offset of each slot in the arena (null for uniform slots).
+-    const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
++    /// Byte offset of each slot in the arena (null for uniform slots) - where it IS: the device plan's pointers.
++    const uint64_t* slot_offsets() const { return !pos_.empty() ? pos_.data() : off_.empty() ? nullptr : off_.data(); }
++    /// Each slot's END in slot order (slots + 1 entries, null for uniform slots): sizes, not addresses - what the
++    /// prompt path's loan is priced with.  The same table as `slot_offsets()` unless the tail is laid out low.
++    const uint64_t* slot_ends() const { return off_.empty() ? nullptr : off_.data(); }
++    /// arc-moe: the arena's first byte (the device plan's base; `device_slot(0)` is not it when the tail is low).
++    uint8_t* device_base() const { return base_; }
++    /// arc-moe: the lowest address of the slots [first, slots()) - the prompt path's loan, contiguous either way.
++    uint8_t* lend_base(int32_t first);
++    /// arc-moe: true when the last slots sit at the START of the arena (STRATA_CACHE_TAIL_LOW, default on in this
++    /// port): the prompt path borrows the last slots, and its buffers then lie below 4 GiB of the allocation - where
++    /// the oneMKL GEMMs (which this build cannot compile with -ze-opt-greater-than-4GB-buffer-required) read them.
++    bool tail_low() const { return !pos_.empty(); }
+     void close();
+ 
+     bool valid() const { return base_ != nullptr; }
+@@ -221,6 +232,9 @@ private:
+     bool per_layer_ = false;
+     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
+     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
++    std::vector<uint64_t> pos_;         ///< arc-moe: each slot's address offset when the tail is laid out low
++    bool in_open_sized_ = false;        ///< arc-moe: open() runs for open_sized (byte "slots": no layout yet)
++    void lay_out_tail_low();
+     int64_t admitted_ = 0;
+ };
+ 
+diff --git a/sycl/src/core/expert_cache.cpp b/sycl/src/core/expert_cache.cpp
+index 56cd011..40bb7d0 100644
+--- a/sycl/src/core/expert_cache.cpp
++++ b/sycl/src/core/expert_cache.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <algorithm>
+ #include <cstdio>
++#include <cstdlib>
+ #include <filesystem>
+ #include <utility>
+ #include <cstring>
+@@ -580,11 +581,15 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
+         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
+     }
+     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
+-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
++    in_open_sized_ = true;
++    const bool opened = open((int64_t) off.back(), n_layers, n_expert, 1, err);
++    in_open_sized_ = false;
++    if (!opened) return false;
+     slots_ = (int64_t) slot_bytes.size();
+     live_slots_ = slots_;
+     blob_ = mx;
+     off_ = std::move(off);
++    lay_out_tail_low();
+ #if defined(STRATA_USE_HIP)
+     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
+         close();
+@@ -609,6 +614,7 @@ void ExpertCache::close() {
+     blocking_staging_bytes_ = 0;
+ #endif
+     off_.clear();
++    pos_.clear();
+     if (!segs_.empty()) {
+         release_segmented();
+     } else if (base_ != nullptr) {
+@@ -665,16 +671,43 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
+ 
+ uint8_t* ExpertCache::device_slot(int32_t slot) {
+     if (slot < 0 || slot >= slots_) return nullptr;
++    if (!pos_.empty()) return base_ + pos_[(size_t) slot];
+     if (!off_.empty()) return base_ + off_[(size_t) slot];
+     return base_ + (size_t) slot * (size_t) blob_;
+ }
+ 
+ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
+     if (slot < 0 || slot >= slots_) return nullptr;
++    if (!pos_.empty()) return base_ + pos_[(size_t) slot];
+     if (!off_.empty()) return base_ + off_[(size_t) slot];
+     return base_ + (size_t) slot * (size_t) blob_;
+ }
+ 
++// arc-moe: the slots in REVERSE address order - slot i ends where slot i - 1 starts, the last slot at the arena's start.
++// The prompt path borrows the last slots (the least-routed experts of the profile) for its buffers; on one 10-15 GB
++// arena they sat 7-11 GB in, and the oneMKL GEMMs of the prompt path (kernels this build does not compile, so
++// -ze-opt-greater-than-4GB-buffer-required does not reach them) returned garbage for operands past 4 GiB: every
++// batched prompt came out as NaN ("!!!!" - token 0) while the engine's own kernels read the same memory fine.
++// Laid out low, a loan of up to 4 GiB lies in the arena's first 4 GiB.  The order of the slots, the sizes and every
++// rule over slot indices are unchanged; only addresses move (device_slot, slot_offsets, device_base, lend_base).
++// STRATA_CACHE_TAIL_LOW=0: the old layout.  Not with --vram-elastic (shrink gives back the arena's END), and only for
++// sized slots (open_sized: the native packs) - the uniform-slot S2 kernels address `base + slot * blob` themselves.
++void ExpertCache::lay_out_tail_low() {
++    pos_.clear();
++    static const bool on = [] { const char* e = std::getenv("STRATA_CACHE_TAIL_LOW"); return !(e && e[0] == '0'); }();
++    if (!on || seg_req_ > 0 || !segs_.empty() || slots_ <= 1) return;
++    const uint64_t full = (uint64_t) full_bytes();
++    pos_.assign((size_t) slots_ + 1, 0);
++    for (int64_t i = 0; i < slots_; ++i) pos_[(size_t) i] = full - (uint64_t) slot_end(i + 1);
++    pos_[(size_t) slots_] = full;   // (one past the table, as off_: never a slot)
++}
++
++uint8_t* ExpertCache::lend_base(int32_t first) {
++    if (first < 0 || first >= live_slots_) return nullptr;
++    if (pos_.empty()) return device_slot(first);
++    return base_ + pos_[(size_t) (live_slots_ - 1)];   // the lowest of [first, live): the last live slot's start
++}
++
+ bool ExpertCache::fill_slot(int32_t slot, const uint8_t *host_blob,
+                             void *stream, std::string &err, int64_t bytes) try {
+     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 5303693..cc083d0 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -3570,6 +3570,31 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+         bad(ss.gdn_state, 64 * 1024);
+         std::fprintf(stderr, "\n");
+     }
++    // arc-moe: the batched prompt's last residual row (40 KB, once per prompt) - a non-finite one is a request that
++    // would answer "!!!!" (token 0) to the end: refuse it with a reason instead (STRATA_PREFILL_NAN_CHECK=0: off)
++    static const bool nan_check = [] { const char* e = std::getenv("STRATA_PREFILL_NAN_CHECK"); return !(e && e[0] == '0'); }();
++    if (nan_check && n > 0) {
++        std::vector<float> row((size_t) D);
++        const int64_t last = (n - 1) % m.T;
++        try {
++            m.cs->memcpy(row.data(), m.R + last * D, (size_t) D * 4).wait();
++        } catch (const std::exception& e) {
++            err = std::string("prefill: reading the prompt's last row: ") + e.what();
++            return false;
++        }
++        int64_t badn = 0;
++        for (float v : row) badn += !std::isfinite(v);
++        if (badn > 0) {
++            static int said = 0;
++            if (said++ < 3)
++                std::fprintf(stderr, "strata prefill: ERROR: the batched prompt (%lld tokens, chunk %lld) left %lld of %lld "
++                                     "values of its last row non-finite - the reply would be garbage; refused. Restart "
++                                     "with --no-prefill-borrow, or STRATA_DBG_NAN=1 to see where it starts\n",
++                             (long long) n, (long long) m.T, (long long) badn, (long long) D);
++            err = "prefill: the prompt's hidden state is NaN (a GPU computation failed); see the engine log";
++            return false;
++        }
++    }
+     if (DPCT_CHECK_ERROR(m.cs->wait()) != 0) {
+         /*
+         DPCT1009: SYCL reports errors using exceptions and does not use
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index e63c13f..9fa3f05 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -3633,7 +3633,7 @@ int main(int argc, char **argv) try {
+             }
+             if (!auto_cache || attempt - failed >= 6) break;
+             dpct::get_in_order_queue()
+-                .memset(xcache.device_slot(0), 0, (size_t)xcache.bytes())
++                .memset(xcache.device_base(), 0, (size_t)xcache.full_bytes())
+                 .wait();
+             dpct::get_current_device().queues_wait_and_throw();
+             size_t free_b = 0, total_b = 0;
+@@ -4203,7 +4203,7 @@ int main(int argc, char **argv) try {
+         }
+         drive.d.cache = &xcache;
+         drive.d.cache_stream = main_cs;
+-        drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
++        drive.d.cache_base = (const uint8_t*) xcache.device_base();
+         drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+         drive.d.cache_slot_off = xcache.slot_offsets();
+         drive.d.hit_scratch = hit_scratch;
+@@ -4963,10 +4963,10 @@ int main(int argc, char **argv) try {
+         const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
++        if (xcache.slot_ends() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+             k = 0;
+             while (k < xcache.slots() &&
+-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
++                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_ends()[xcache.slots() - k]) < need) ++k;
+         }
+         return k;
+     };
+@@ -5123,10 +5123,10 @@ int main(int argc, char **argv) try {
+         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
+             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
+             strata::core::ExpertCache& xc = *p.cache;
+-            if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
++            if (xc.slot_ends() != nullptr) {   // sized slots: from the end until they hold `need`
+                 int64_t k = 0;
+                 while (k < xc.slots() &&
+-                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
++                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_ends()[xc.slots() - k]) < need) ++k;
+                 return k;
+             }
+             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+@@ -5134,7 +5134,7 @@ int main(int argc, char **argv) try {
+         };
+         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
+             strata::core::ExpertCache& xc = *p.cache;
+-            return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
++            return xc.slot_ends() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_ends()[first])
+                                      : (uint64_t) (xc.slots() - first) *
+                                            (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+         };
+@@ -5290,7 +5290,7 @@ int main(int argc, char **argv) try {
+                     }
+                 }
+                 lend_first = pf_parts[0].first;
+-                borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
++                borrow = lend_first >= 0 ? xcache.lend_base(lend_first) : nullptr;
+                 borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+             } else if (o.prefill_auto) {
+                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
+@@ -5339,7 +5339,7 @@ int main(int argc, char **argv) try {
+                 uint64_t sbb = 0;
+                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
+                 if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
+-                    sb = st.cache.device_slot(pf_parts[i + 1].first);
++                    sb = st.cache.lend_base(pf_parts[i + 1].first);
+                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
+                 }
+                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
+@@ -5441,7 +5441,7 @@ int main(int argc, char **argv) try {
+                             p.first_now = p.first;
+                         }
+                     lend_first = pf_parts[0].first;
+-                    borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
++                    borrow = lend_first >= 0 ? xcache.lend_base(lend_first) : nullptr;
+                     borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                 }
+                 err.clear();
+@@ -5593,12 +5593,12 @@ int main(int argc, char **argv) try {
+                     const strata::core::OnDevice on(gs.dev);
+                     strata::core::VerifyHits vs;
+                     vs.d_res = gs.d_res;
+-                    vs.cache_base = gs.cache.device_slot(0);
++                    vs.cache_base = gs.cache.device_base();
+                     vs.blob = thits.blob;
+                     vs.slot_off = gs.cache.slot_offsets();
+                     vs.n_slots = gs.cache.slots();
+                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err);
+-                    split_drive.cache_base[st] = gs.cache.device_slot(0);
++                    split_drive.cache_base[st] = gs.cache.device_base();
+                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
+                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
+                 }
+@@ -6929,7 +6929,7 @@ int main(int argc, char **argv) try {
+                     const strata::core::OnDevice on(p.dev);
+                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                     if (want != p.sp->chunk() || first != p.first_now) {
+-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
++                        if (!p.sp->relayout(want, p.cache->lend_base(first), part_bytes(p, first), e)) return false;
+                         p.first_now = first;
+                     }
+                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+@@ -7544,8 +7544,8 @@ int main(int argc, char **argv) try {
+                     .memcpy(d_res, host_res.data(),
+                             host_res.size() * sizeof(int32_t))
+                     .wait();
+-                borrow = xcache.device_slot(first);
+-                borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
++                borrow = xcache.lend_base(first);
++                borrow_bytes = xcache.slot_ends() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_ends()[first])
+                                                      : (uint64_t) k * (uint64_t) blob;
+                 std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
+                              (double) borrow_bytes / 1073741824.0);
+-- 
+2.43.0
+

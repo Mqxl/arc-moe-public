@@ -2,13 +2,12 @@
 # ./arc check [model] - does the server answer with text the way every kind of client asks? tools/check.py sends
 # one short question greedy and sampled, thinking off and on, streamed, with penalties and with tools.
 #
-# A server already running: checked as it is (a minute). None running: started once per configuration below with
-# STRATA_DBG_NAN=1, each checked, everything written to check-<time>.txt (~10 minutes, each start reloads the model):
+# A server already running: checked as it is (a few minutes). None running: started once per configuration below with
+# STRATA_DBG_NAN=1, each checked, everything written to check-<time>.txt (~15 minutes, each start reloads the model):
 #   base          ./arc start's defaults
-#   one-block     STRATA_SAMPLER_ONE_BLOCK=1  the sampled path's one-kernel variant (no split scratch)
-#   old-sampler   STRATA_OLD_SAMPLER=1        the original sampled kernel
-#   spec2         --spec 2                    the shortest drafts (a native IQ pack needs --spec >= 2)
-#   eager         STRATA_VERIFY_EAGER=1       the verify window without SYCL graphs
+#   old-layout    STRATA_CACHE_TAIL_LOW=0     the prompt path's borrowed buffers 7-11 GB into the expert cache, as
+#                                             before patch 27 (expected: the 10K rows broken - the cause confirmed)
+#   own-buffers   --no-prefill-borrow         the prompt path in its own allocations (smaller chunks, fewer experts)
 #   one-gpu       ARC_GPUS=0                  on a machine with two Arcs: no layer split
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -48,7 +47,7 @@ stop_server() {
 }
 trap stop_server EXIT
 
-keep='strata dbg|head sampling|sampl|NaN|non-finite|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|split|extra engine'
+keep='strata prefill|prompt chunk|borrows|own buffers|strata dbg|head sampling|sampl|NaN|non-finite|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|split|extra engine'
 
 run() {   # run <name> <env...>
     local name=$1; shift
@@ -80,10 +79,8 @@ run() {   # run <name> <env...>
 } >"$out"
 BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
 run base ARC_CHECK_RUN=base
-run one-block STRATA_SAMPLER_ONE_BLOCK=1
-run old-sampler STRATA_OLD_SAMPLER=1
-run spec2 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 2"
-run eager STRATA_VERIFY_EAGER=1
+run old-layout STRATA_CACHE_TAIL_LOW=0
+run own-buffers "STRATA_EXTRA_ARGS=$BASE_ARGS --no-prefill-borrow"
 if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then run one-gpu ARC_GPUS=0; fi
 trap - EXIT
 rm -f "$out".*.start
