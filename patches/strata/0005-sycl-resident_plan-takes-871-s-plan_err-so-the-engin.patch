@@ -1,4 +1,4 @@
-From 574bcb637ec2938fb20e63f554f48e5d46feccd9 Mon Sep 17 00:00:00 2001
+From 14ff50b5af6eba151235a2c387db1cf15e79ed7b Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:24:38 +0000
 Subject: [PATCH 5/6] sycl: resident_plan takes #871's plan_err, so the engine

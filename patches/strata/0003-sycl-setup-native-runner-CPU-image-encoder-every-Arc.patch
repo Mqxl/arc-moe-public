@@ -1,4 +1,4 @@
-From 55dc6f3218a73d81a5702c0d230704a55d5c202b Mon Sep 17 00:00:00 2001
+From 0dce1190fcb0262ed4059581867a92dafec3f234 Mon Sep 17 00:00:00 2001
 From: arc-moe <arc-moe@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 23:19:52 +0000
 Subject: [PATCH 3/6] sycl setup: native runner, CPU image encoder, every Arc
@@ -19,8 +19,8 @@ Level Zero numbers them, so an Intel CPU's integrated GPU never takes a
 card's place in the split.
 ---
  sycl/serve/strata-sycl-native.sh |  29 +++++++++
- sycl/setup_intel.py              | 102 ++++++++++++++++++++++++++++---
- 2 files changed, 121 insertions(+), 10 deletions(-)
+ sycl/setup_intel.py              | 106 +++++++++++++++++++++++++++----
+ 2 files changed, 123 insertions(+), 12 deletions(-)
  create mode 100755 sycl/serve/strata-sycl-native.sh
 
 diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
@@ -59,7 +59,7 @@ index 0000000..d7f047f
 +cd "$here"
 +exec "$bin" "$@"
 diff --git a/sycl/setup_intel.py b/sycl/setup_intel.py
-index 0b1e2f0..98c1c0a 100644
+index 0b1e2f0..a8e6a26 100644
 --- a/sycl/setup_intel.py
 +++ b/sycl/setup_intel.py
 @@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT))
@@ -197,7 +197,7 @@ index 0b1e2f0..98c1c0a 100644
  
      say = S.say
      fake_ram = max(real_ram, 1024.0)
-@@ -186,23 +252,37 @@ def install(argv) -> None:
+@@ -186,33 +252,47 @@ def install(argv) -> None:
      def say_intel(msg=""):
          """setup's words for its AMD path and its RAM rule, said for the Intel card."""
          msg = str(msg).replace("(AMD, experimental: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
@@ -239,6 +239,18 @@ index 0b1e2f0..98c1c0a 100644
      S.hipblaslt_table = lambda *a, **k: None
      S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
  
+     write = S.write_run_script
+ 
+-    def write_run_script(model, cfg_path, port):
++    def write_run_script(model, cfg_path, port, *rest, **kw):   # setup.py's signature (#870: + open_browser)
+         cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+         cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}))
+         Path(cfg_path).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+-        script = write(model, cfg_path, port)
++        script = write(model, cfg_path, port, *rest, **kw)
+         script.write_text(script.read_text().replace(str(ROOT / "serve" / "server.py"), str(SERVER)))
+         return script
+     S.write_run_script = write_run_script
 @@ -232,7 +312,9 @@ def install(argv) -> None:
      if "--backend" not in argv:
          sys.argv += ["--backend", "hip"]
