@@ -1,0 +1,444 @@
+From d1ba7f1e8c1dfa5e4b3b92c16c07e93261f905d1 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 12:07:33 +0000
+Subject: [PATCH] sycl: the hc-read kernels read their arguments from device
+ memory; gr_down_sliced at SIMD16 on Alchemist
+
+unitrace on the A770 put gr_up_multi at 269 us per call (12,904 calls, the
+largest decode kernel) for 6.5 MB of weights. Its 936-byte GrMulti was one
+by-value kernel argument that every work-item copied into private memory
+(OpCopyMemorySized; zeinfo private_size 29,952 per SIMD32 thread) and indexed
+there by lane, group and token: ~38 MB of scratch traffic per call. The
+same for gr_norm_split and gr_down_reduce. Each distinct GrMulti (a call
+site's buffers, the same every window, so graphs replay the same pointer)
+is now uploaded once through a side queue and the kernels take a reference
+to it: private_size 0 on acm-g10.
+
+gr_down_sliced spilled 1,952 bytes per thread at SIMD32 on acm-g10's 128
+GRFs; its shuffles stay in 4-lane groups, so SIMD16 runs the same sums with
+no spill.
+---
+ sycl/src/kernels/cuda/fused_gr.dp.cpp | 142 ++++++++++++++++++--------
+ 1 file changed, 99 insertions(+), 43 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/fused_gr.dp.cpp b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+index a68a062..bd7efa8 100644
+--- a/sycl/src/kernels/cuda/fused_gr.dp.cpp
++++ b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+@@ -7,6 +7,7 @@
+ #include "strata/sycl_queue.hpp"
+ #include "strata/core/emulate.hpp"
+ #include "strata/kernels/fused_gr.hpp"
++#include <functional>
+ #include "strata/kernels/bf16_bits.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ 
+@@ -250,6 +251,57 @@ struct GrMulti {
+     float* part2 = nullptr;    ///< SYCL port: [GRS_SLICES][kFusedGrMaxT][LR + HC] slice partials of the sliced kernel
+ };
+ 
++// arc-moe: the kernels read GrMulti from device memory. Passed by value it became one 936-byte kernel argument the
++// kernel copied into private memory and indexed there with runtime values (a lane, a group, a token loop): on
++// acm-g10 that is 29,952 bytes of scratch per SIMD32 thread, and the decode window's hc-read kernels spent most of
++// their time on it (unitrace, A770: gr_up_multi 269 us per call for 6.5 MB of weights). Each distinct GrMulti (a
++// call site's buffers: the same on every window, so a graph replays the same pointer) is uploaded once, through a
++// side queue so that a queue being recorded into a graph is not touched; the kernels index it in global memory.
++const GrMulti* gr_dev(const GrMulti& m, dpct::queue_ptr q) {
++    // the key: every field's value (not the struct's bytes: its padding is not initialized)
++    std::string key;
++    key.reserve(1024);
++    auto put = [&key](const void* p, size_t n) { key.append(static_cast<const char*>(p), n); };
++    for (int k = 0; k < kFusedGrMaxT; ++k) {
++        const FusedGrArgs& a = m.a[k];
++        const void* ptrs[12] = {a.R, a.R_out, a.bo_prev, a.inj_prev, a.w_norm, a.w_down, a.w_up, a.w_inject,
++                                a.lo, a.rs, a.inject_out, a.mixed};
++        put(ptrs, sizeof ptrs);
++        put(&a.eps, sizeof a.eps);
++        const char ap = a.apply ? 1 : 0;
++        put(&ap, 1);
++    }
++    const void* tail[3] = {m.xn, m.part, m.part2};
++    put(tail, sizeof tail);
++    put(&m.T, sizeof m.T);
++    put(&m.nsplit, sizeof m.nsplit);
++    const sycl::context ctx = q->get_context();
++    const sycl::device dev = q->get_device();
++    struct Side { sycl::context ctx; sycl::device dev; sycl::queue q; };
++    static std::mutex mu;
++    static std::unordered_map<std::string, GrMulti*> cache;
++    static std::vector<Side> sides;
++    std::lock_guard<std::mutex> lk(mu);
++    key += std::to_string(std::hash<sycl::device>{}(dev));
++    if (auto it = cache.find(key); it != cache.end()) return it->second;
++    sycl::queue* side = nullptr;
++    for (Side& sd : sides)
++        if (sd.ctx == ctx && sd.dev == dev) side = &sd.q;
++    if (side == nullptr) {
++        sides.push_back({ctx, dev, sycl::queue(ctx, dev, sycl::property::queue::in_order())});
++        side = &sides.back().q;
++        for (Side& sd : sides)   // (push_back may have moved the earlier entries: look the new one up again)
++            if (sd.ctx == ctx && sd.dev == dev) side = &sd.q;
++    }
++    GrMulti* d = sycl::malloc_device<GrMulti>(1, *side);
++    side->memcpy(d, &m, sizeof m).wait();
++    if (cache.size() == 65536)
++        std::fprintf(stderr, "strata: fused_gr: 65536 distinct hc-read argument sets uploaded (kept: graphs may hold "
++                             "them) - is a caller passing fresh buffers every call?\n");
++    cache.emplace(std::move(key), d);
++    return d;
++}
++
+ // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
+ /*
+ DPCT1110: The total declared local variable size in device function
+@@ -257,7 +309,7 @@ gr_norm_multi_kernel exceeds 128 bytes and may cause high register pressure.
+ Consult with your hardware vendor to find the total register size available and
+ adjust the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_norm_multi_kernel(GrMulti m) {
++__dpct_inline__ void gr_norm_multi_kernel(const GrMulti& m) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+ auto &part =
+     *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS][HC]>(
+@@ -326,7 +378,7 @@ auto &part =
+ // elements of stream c in the same order as in the per-token kernel (i = 4t + 1024k), and the warp and cross-warp
+ // sums run in the same order, so rs and xn are bitwise the old kernel's. The scaled values stay in registers
+ // (at most 3 float4 per thread) instead of a second pass over global memory.
+-__dpct_inline__ void gr_norm_split_port_kernel(GrMulti m) {
++__dpct_inline__ void gr_norm_split_port_kernel(const GrMulti& m) {
+     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     auto& part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(item.get_group());
+     auto& s_rs = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(item.get_group());
+@@ -396,7 +448,7 @@ gr_down_multi_kernel exceeds 128 bytes and may cause high register pressure.
+ Consult with your hardware vendor to find the total register size available and
+ adjust the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
++__dpct_inline__ void gr_down_multi_kernel(const GrMulti& m, uint8_t *dpct_local) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     constexpr int TQ = TILEV / 8 / 32; // uint4 weight chunks per lane per tile
+     auto tile = (float *)dpct_local;   // [T][TILEV]
+@@ -481,7 +533,7 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
+ // B70 at ~2 groups per Xe core (unitrace: 64 us per call, ~100 GB/s). Here each lane reads its 8 xn floats per
+ // token straight from global memory (T x 40 KB in all, L1/L2-resident, shared by every group). Same per-lane
+ // order of the sums, so the outputs are bitwise the tiled kernel's.
+-__dpct_inline__ void gr_down_multi_direct_kernel(GrMulti m) {
++__dpct_inline__ void gr_down_multi_direct_kernel(const GrMulti& m) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+     const int T = m.T;
+@@ -529,7 +581,15 @@ __dpct_inline__ void gr_down_multi_direct_kernel(GrMulti m) {
+ // once (<= 4 KB of SLM) and streams the rows through it, 4 lanes per row (one 64-byte line per step), reducing over
+ // those 4 lanes once per row. gr_down_reduce then sums the 80 slice partials in a fixed order.
+ constexpr int GRS_COLS = 128, GRS_SLICES = D / GRS_COLS, GRS_ROWS = LR + HC;   // 80 slices, 324 rows
+-__dpct_inline__ void gr_down_sliced_kernel(GrMulti m, float* tile) {
++// arc-moe: Alchemist (acm-g10: 128 GRFs, no large-GRF mode) spilled this kernel at SIMD32 (16 weight dwords and 6
++// sums per lane: 1,952 bytes of spill per thread); its shuffles stay inside 4-lane groups and its rows are indexed by
++// the thread, so SIMD16 runs the same arithmetic in half the registers per lane
++#if defined(STRATA_SYCL_NO_XMX)
++constexpr int kSlicedSG = 16;
++#else
++constexpr int kSlicedSG = 32;
++#endif
++__dpct_inline__ void gr_down_sliced_kernel(const GrMulti& m, float* tile) {
+     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     const int t = (int) item.get_local_id(2), lane = t & 31, warp = t >> 5;
+     const int T = m.T, sl = (int) item.get_group(2), c0 = sl * GRS_COLS;
+@@ -568,7 +628,7 @@ __dpct_inline__ void gr_down_sliced_kernel(GrMulti m, float* tile) {
+         }
+     }
+ }
+-__dpct_inline__ void gr_down_reduce_kernel(GrMulti m) {
++__dpct_inline__ void gr_down_reduce_kernel(const GrMulti& m) {
+     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     const int i = (int) item.get_global_id(2);
+     if (i >= m.T * GRS_ROWS) return;
+@@ -609,7 +669,7 @@ gr_up_multi_kernel exceeds 128 bytes and may cause high register pressure.
+ Consult with your hardware vendor to find the total register size available and
+ adjust the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_up_multi_kernel(GrMulti m) {
++__dpct_inline__ void gr_up_multi_kernel(const GrMulti& m) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+     float[kFusedGrMaxT][LR]>(
+@@ -718,7 +778,7 @@ gr_down_v3_kernel exceeds 128 bytes and may cause high register pressure.
+ Consult with your hardware vendor to find the total register size available and
+ adjust the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_down_v3_kernel(GrMulti m, float *__restrict__ part,
++__dpct_inline__ void gr_down_v3_kernel(const GrMulti& m, float *__restrict__ part,
+                                        float *__restrict__ ssg,
+                                        uint8_t *dpct_local) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+@@ -834,7 +894,7 @@ gr_up_v3_kernel exceeds 128 bytes and may cause high register pressure. Consult
+ with your hardware vendor to find the total register size available and adjust
+ the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_up_v3_kernel(GrMulti m, const float *__restrict__ part,
++__dpct_inline__ void gr_up_v3_kernel(const GrMulti& m, const float *__restrict__ part,
+                                      const float *__restrict__ ssg) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+@@ -988,7 +1048,7 @@ gr_norm_split_kernel exceeds 128 bytes and may cause high register pressure.
+ Consult with your hardware vendor to find the total register size available and
+ adjust the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_norm_split_kernel(GrMulti m) {
++__dpct_inline__ void gr_norm_split_kernel(const GrMulti& m) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(
+     sycl::ext::oneapi::this_work_item::get_work_group<3>());
+@@ -1150,7 +1210,7 @@ gr_down_staged_kernel exceeds 128 bytes and may cause high register pressure.
+ Consult with your hardware vendor to find the total register size available and
+ adjust the code, or use smaller sub-group size to avoid high register pressure.
+ */
+-__dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
++__dpct_inline__ void gr_down_staged_kernel(const GrMulti& m, uint8_t *dpct_local) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     auto hbuf = (sycl::float4 *)dpct_local; // 2 buffers x [T][2][160] float4
+     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+@@ -1346,6 +1406,7 @@ int down_chunk(bool staged, int* tile_out) {
+ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                   unsigned long long *stamp_buf, int stamp_i0) {
+     const int n_tok = m.T;
++    const GrMulti* mp_ = gr_dev(m, st);   // arc-moe: the kernels read it in device memory (see gr_dev)
+     if (variant >= kHcSplit) {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+             STRATA_ROOT_SYNC_PROP};
+@@ -1356,7 +1417,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                               sycl::range(1, 1, THREADS)),
+             exp_props,
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+-                gr_norm_split_kernel(m);
++                gr_norm_split_kernel(*mp_);
+             });
+     } else {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+@@ -1368,7 +1429,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                               sycl::range(1, 1, THREADS)),
+             exp_props,
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+-                gr_norm_multi_kernel(m);
++                gr_norm_multi_kernel(*mp_);
+             });
+     }
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+@@ -1392,6 +1453,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+             c.T = ct;
+             for (int k = 0; k < ct; ++k) c.a[k] = m.a[c0 + k];
+         }
++        const GrMulti* cp_ = gr_dev(c, st);
+         const size_t smem = (size_t) ct * per_tok;
+         // #443, opt-in STRATA_GR_DOWN_MAX4=1: launches of up to 4 tokens hold 4 tokens' sums per thread instead of
+         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
+@@ -1416,8 +1478,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                         exp_props,
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[sycl::reqd_sub_group_size(32)]] {
+-                                gr_down_staged_kernel<4>(
+-                                    c, dpct_local_acc_ct1
++                                gr_down_staged_kernel<4>(*cp_, dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+@@ -1443,8 +1504,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                         exp_props,
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[sycl::reqd_sub_group_size(32)]] {
+-                                gr_down_staged_kernel(
+-                                    c, dpct_local_acc_ct1
++                                gr_down_staged_kernel(*cp_, dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+@@ -1469,8 +1529,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                         exp_props,
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[sycl::reqd_sub_group_size(32)]] {
+-                                gr_down_multi_kernel<1280, 4>(
+-                                    c, dpct_local_acc_ct1
++                                gr_down_multi_kernel<1280, 4>(*cp_, dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+@@ -1497,8 +1556,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                         exp_props,
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[sycl::reqd_sub_group_size(32)]] {
+-                                gr_down_multi_kernel<1280>(
+-                                    c, dpct_local_acc_ct1
++                                gr_down_multi_kernel<1280>(*cp_, dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+@@ -1523,8 +1581,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                         exp_props,
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[sycl::reqd_sub_group_size(32)]] {
+-                                gr_down_multi_kernel<2560, 4>(
+-                                    c, dpct_local_acc_ct1
++                                gr_down_multi_kernel<2560, 4>(*cp_, dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+@@ -1551,8 +1608,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                         exp_props,
+                         [=](sycl::nd_item<3> item_ct1)
+                             [[sycl::reqd_sub_group_size(32)]] {
+-                                gr_down_multi_kernel<2560>(
+-                                    c, dpct_local_acc_ct1
++                                gr_down_multi_kernel<2560>(*cp_, dpct_local_acc_ct1
+                                            .get_multi_ptr<
+                                                sycl::access::decorated::no>()
+                                            .get());
+@@ -1572,7 +1628,7 @@ void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
+                               sycl::range(1, 1, THREADS)),
+             exp_props,
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+-                gr_up_multi_kernel(m);
++                gr_up_multi_kernel(*mp_);
+             });
+     }
+ }
+@@ -1658,6 +1714,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+         }
+     }
+     const int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
++    const GrMulti* mp_ = gr_dev(m, st);   // arc-moe: the kernels read it in device memory (see gr_dev)
+     if (split > 0) {   // 2 kernels; scratch = partials + sums of squares
+         float* part = xn_scratch;
+         float* ssg = xn_scratch + (size_t) n_tok * HC * 2 * PR;   // room for S = 2
+@@ -1684,8 +1741,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                     exp_props,
+                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                         32)]] {
+-                        gr_down_v3_kernel<2>(
+-                            m, part, ssg,
++                        gr_down_v3_kernel<2>(*mp_, part, ssg,
+                             dpct_local_acc_ct1
+                                 .get_multi_ptr<sycl::access::decorated::no>()
+                                 .get());
+@@ -1707,8 +1763,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                     exp_props,
+                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
+                         32)]] {
+-                        gr_down_v3_kernel<1>(
+-                            m, part, ssg,
++                        gr_down_v3_kernel<1>(*mp_, part, ssg,
+                             dpct_local_acc_ct1
+                                 .get_multi_ptr<sycl::access::decorated::no>()
+                                 .get());
+@@ -1728,7 +1783,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                 exp_props,
+                 [=](sycl::nd_item<3> item_ct1)
+                     [[sycl::reqd_sub_group_size(32)]] {
+-                        gr_up_v3_kernel<2>(m, part, ssg);
++                        gr_up_v3_kernel<2>(*mp_, part, ssg);
+                     });
+         } else {
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+@@ -1742,7 +1797,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                 exp_props,
+                 [=](sycl::nd_item<3> item_ct1)
+                     [[sycl::reqd_sub_group_size(32)]] {
+-                        gr_up_v3_kernel<1>(m, part, ssg);
++                        gr_up_v3_kernel<1>(*mp_, part, ssg);
+                     });
+         }
+         /*
+@@ -1755,6 +1810,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+         return;
+     }
+     m.part = down_partials(st);
++    mp_ = gr_dev(m, st);
+     {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+             STRATA_ROOT_SYNC_PROP};
+@@ -1762,7 +1818,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+         if (gr_norm_split())
+             st->parallel_for<dpct_kernel_name<class gr_norm_split_k>>(
+                 sycl::nd_range<3>(sycl::range(1, 1, n_tok * HC) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_norm_split_port_kernel(m); });
++                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_norm_split_port_kernel(*mp_); });
+         else
+         st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d92>>(
+             sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
+@@ -1770,7 +1826,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                               sycl::range(1, 1, THREADS)),
+             exp_props,
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+-                gr_norm_multi_kernel(m);
++                gr_norm_multi_kernel(*mp_);
+             });
+     }
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
+@@ -1793,23 +1849,24 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+     if (gr_down_sliced()) {
+         m.part2 = slice_partials(st);
+         m.nsplit = 1;
++        mp_ = gr_dev(m, st);
+         st->submit([&](sycl::handler& cgh) {
+             sycl::local_accessor<float, 1> tl(sycl::range<1>((size_t) kFusedGrMaxT * GRS_COLS), cgh);
+             cgh.parallel_for<dpct_kernel_name<class gr_down_sliced_k>>(
+                 sycl::nd_range<3>(sycl::range(1, 1, GRS_SLICES) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+-                    gr_down_sliced_kernel(m, tl.get_multi_ptr<sycl::access::decorated::no>().get());
++                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(kSlicedSG)]] {
++                    gr_down_sliced_kernel(*mp_, tl.get_multi_ptr<sycl::access::decorated::no>().get());
+                 });
+         });
+         const unsigned nred = unsigned((n_tok * GRS_ROWS + 127) / 128);
+         st->parallel_for<dpct_kernel_name<class gr_down_reduce_k>>(
+             sycl::nd_range<3>(sycl::range(1, 1, nred) * sycl::range(1, 1, 128), sycl::range(1, 1, 128)),
+-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_reduce_kernel(m); });
++            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_reduce_kernel(*mp_); });
+     } else if (gr_down_direct()) {
+         st->parallel_for<dpct_kernel_name<class gr_down_multi_direct>>(
+             sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) * sycl::range(1, 1, THREADS),
+                               sycl::range(1, 1, THREADS)),
+-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_multi_direct_kernel(m); });
++            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_multi_direct_kernel(*mp_); });
+     } else if (chunk_tok >= n_tok) {
+         auto exp_props = sycl::ext::oneapi::experimental::properties{
+             STRATA_ROOT_SYNC_PROP};
+@@ -1824,8 +1881,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                 exp_props,
+                 [=](sycl::nd_item<3> item_ct1)
+                     [[sycl::reqd_sub_group_size(32)]] {
+-                        gr_down_multi_kernel<TILE>(
+-                            m, dpct_local_acc_ct1
++                        gr_down_multi_kernel<TILE>(*mp_, dpct_local_acc_ct1
+                                    .get_multi_ptr<sycl::access::decorated::no>()
+                                    .get());
+                     });
+@@ -1838,6 +1894,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+             c.T = ct;
+             for (int k = 0; k < ct; ++k) c.a[k] = a[c0 + k];
+             c.part = m.part;
++            const GrMulti* cp_ = gr_dev(c, st);
+             auto exp_props = sycl::ext::oneapi::experimental::properties{
+                 STRATA_ROOT_SYNC_PROP};
+             st->submit([&](sycl::handler &cgh) {
+@@ -1851,8 +1908,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                     exp_props,
+                     [=](sycl::nd_item<3> item_ct1)
+                         [[sycl::reqd_sub_group_size(32)]] {
+-                            gr_down_multi_kernel<TILE>(
+-                                c, dpct_local_acc_ct1
++                            gr_down_multi_kernel<TILE>(*cp_, dpct_local_acc_ct1
+                                        .get_multi_ptr<sycl::access::decorated::no>()
+                                        .get());
+                         });
+@@ -1870,7 +1926,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+                               sycl::range(1, 1, THREADS)),
+             exp_props,
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+-                gr_up_multi_kernel(m);
++                gr_up_multi_kernel(*mp_);
+             });
+     }
+     /*
+-- 
+2.43.0
+

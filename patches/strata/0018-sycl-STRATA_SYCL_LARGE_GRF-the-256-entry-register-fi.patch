@@ -1,0 +1,39 @@
+From 2b93de806b779632756d062d3eab3e28a9baf546 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 12:07:33 +0000
+Subject: [PATCH] sycl: STRATA_SYCL_LARGE_GRF - the 256-entry register file for
+ Alchemist (default ON there)
+
+The decode kernels were tuned on Xe2, where IGC picks the large register
+file per kernel itself; for acm-g10 it does not (the auto option changes
+nothing), and at 128 GRFs nearly every decode GEMV spilled: native_mmvq
+10-17 KB of scratch per thread, the expert kernels 2.5-10 KB, the hc read
+2-3 KB. -ze-opt-large-register-file builds them at SIMD32 with no spill
+(every kernel stays SIMD32/16, so 1024-item work-groups still fit).
+---
+ sycl/CMakeLists.txt | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index 3c00736..5454128 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -51,6 +51,15 @@ endif()
+ # The expert cache is ONE device allocation of 10-15 GB. IGC may otherwise assume every buffer is below 4 GB and
+ # address it with 32-bit offsets; this option makes it keep 64-bit (stateless) addressing for every kernel.
+ set(_strata_igc_opts "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
++# arc-moe: the large register file (256 GRFs per thread, half the threads per EU). The decode kernels were tuned on Xe2,
++# whose IGC picks the large file per kernel by itself; for acm-g10 it does not (-ze-intel-enable-auto-large-GRF-mode
++# changes nothing there), and at 128 GRFs nearly every decode GEMV spilled: native_mmvq 10-17 KB of scratch per thread,
++# the expert kernels (launch_gu_port / launch_mmvq) 2.5-10 KB, the hc read 2-3 KB. With it IGC builds them at SIMD32
++# with no spills. On by default for Alchemist; -DSTRATA_SYCL_LARGE_GRF=OFF (./arc build: ARC_LARGE_GRF=OFF) for the A/B.
++option(STRATA_SYCL_LARGE_GRF "Compile the device code for the 256-entry register file" ${_strata_alchemist})
++if(STRATA_SYCL_LARGE_GRF)
++  string(APPEND _strata_igc_opts " -ze-opt-large-register-file")
++endif()
+ set(STRATA_SYCL_IGC_EXTRA "" CACHE STRING "Extra IGC options for the device code (e.g. -ze-opt-large-register-file)")
+ if(STRATA_SYCL_IGC_EXTRA)
+   string(APPEND _strata_igc_opts " ${STRATA_SYCL_IGC_EXTRA}")
+-- 
+2.43.0
+

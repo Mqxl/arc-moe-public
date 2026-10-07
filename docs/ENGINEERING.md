@@ -311,6 +311,39 @@ and two Level Zero runtime switches as A/B runs: the v2 adapter, and the driver'
 - **Round 4** sweeps the kernel variants upstream tuned on the B70: SIMD16 GEMVs, the hyper-connection read's
   variants and the GDN recurrence's variants, one run each. It also adds `STRATA_DRAFT_TIMING` and unitrace.
 
+### Round 4 (a40fc8d): the kernel times, and why Alchemist ran the Xe2-tuned kernels so slowly
+
+- **The variant sweep found nothing:** SIMD16 GEMVs, rows per warp and four hyper-connection read variants all
+  measured 21.5-21.6 tok/s on code. Of the GDN recurrence's variants, the key-head kernel was 35% slower, and
+  the others matched the default.
+- **unitrace, decode:** kernel time is about 135 ms of a ~220 ms window. The largest items per call:
+  - the hyper-connection up kernel `gr_up_multi`: 269 us, 2 per layer, for 6.5 MB of BF16 weights (~13 us of
+    bandwidth)
+  - the experts' gate/up GEMV `launch_gu_port<IQ2_S>`: 422 us
+  - the experts' down GEMV: 145 us
+  - the router's top-10: 91 us
+- **The cause, found offline:** IGC's dumps for `acm-g10` (`ocloc -device acm-g10` with
+  `IGC_ShaderDumpEnable=1`, then the zeinfo `spill_size` / `private_size` of every kernel) show two separate
+  problems. Neither needs the cards to see.
+  1. **A 936-byte argument copied per work-item.** `GrMulti`, the per-token arguments of the hyper-connection read,
+     was one by-value kernel argument that every work-item copied into private memory and indexed by lane, group
+     and token: 29,952 bytes of scratch per SIMD32 thread, ~38 MB of scratch traffic per `gr_up_multi` call. Patch
+     17 uploads each distinct `GrMulti` once to device memory (a call site's buffers are the same on every window,
+     so graphs replay the same pointer) and the kernels take a reference: `private_size` 0.
+  2. **Register spills everywhere.** On Xe2, IGC picks the 256-entry register file per kernel by itself; for
+     `acm-g10` it does not, and the auto option changes nothing. At 128 GRFs nearly every decode GEMV spilled:
+     `native_mmvq` 10-17 KB per thread, the expert kernels 2.5-10 KB, the hyper-connection read 2-3 KB. Patch 18
+     builds the device code with `-ze-opt-large-register-file` on Alchemist (`ARC_LARGE_GRF=OFF ./arc build`
+     for the A/B). The decode GEMVs then compile at SIMD32 with no spill: `iq_kernels` goes from spills in nearly
+     every kernel to 1 of 150 (224 B), and every `native_mmvq` kernel decode uses to 0. Every kernel stays SIMD32
+     or 16, so 1024-item work-groups still fit. `gr_down_sliced` also runs at SIMD16 (its shuffles stay in 4-lane
+     groups), which removes its spill at either register size.
+- **The draft layer's 2.9 s per chunk:** the serve path batched the drafter's prompt K/V only on one GPU (`!multi_gpu
+  && sp.draft_kv(...)`). With a layer split, the drafter read every chunk through its own pass, 6 tokens at a time.
+  Patch 19 batches it on the last stage's prompt path, which is on the drafter's device.
+- **Prompt trace, next targets:** `gdn_recurrence` takes 36.8 ms per call (8K sequential steps; a chunk-parallel
+  form is the fix). Prompt attention runs through the FP32 `qsa_decode_attn_batch` at 724 us x 4,032 calls.
+
 ## What was verified here, and what was not
 
 | Check | Status |

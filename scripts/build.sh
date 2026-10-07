@@ -29,7 +29,8 @@ mem_gb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1048576 ))
 cmake -S "$STRATA/sycl" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=Release \
     -DSTRATA_SYCL_AOT="$AOT_TARGET" -DSTRATA_SYCL_NO_FP64=ON \
-    -DSTRATA_SYCL_PARITY="${ARC_PARITY:-OFF}" -DSTRATA_SYCL_IGC_EXTRA="${ARC_IGC_EXTRA:-}" >/dev/null
+    -DSTRATA_SYCL_PARITY="${ARC_PARITY:-OFF}" -DSTRATA_SYCL_IGC_EXTRA="${ARC_IGC_EXTRA:-}" \
+    -DSTRATA_SYCL_LARGE_GRF="${ARC_LARGE_GRF:-ON}" >/dev/null
 t0=$(date +%s)
 set +eo pipefail
 cmake --build "$BUILD_DIR" --target strata -j "$jobs" 2>&1 | tee "$BUILD_DIR/build.log" \

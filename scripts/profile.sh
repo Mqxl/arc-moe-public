@@ -4,15 +4,13 @@
 # (profile-<time>.txt).
 #
 #   N   the defaults (./arc start's), nothing traced: the real speeds on short prompts and on 2K / 10K prompts
-#   K*  decode knobs, one run each (short code + prose): kernel variants upstream tuned on the B70 (Xe2) that may suit
-#       the A770 (Xe-HPG) better - SIMD16 GEMVs, the hyper-connection read's variants
-#   G*  prompt knobs, one run each (10K prompt): the GDN recurrence's kernel variants (same bits)
 #   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
 #   D   decode, eager, under unitrace: the GPU time of every kernel by name
 #   E   the 10K prompt under unitrace
+#   ARC_PROFILE_SWEEP=1 adds round 4's kernel-variant runs (K*: decode, G*: the GDN recurrence)
 #
 # D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: cmake + network, ~5 min).
-# The server must be stopped first (the run starts its own). About 45 minutes (each run reloads the model).
+# The server must be stopped first (the run starts its own). About 15 minutes (each run reloads the model).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 use_unitrace=1
@@ -97,17 +95,19 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
 } >"$out"
 
 run N short,prose,2k,10k 128 ARC_PROFILE_RUN=N
-run K-sg16 short,prose 128 STRATA_MMVQ_SG=16
-run K-sg3 short,prose 128 STRATA_MMVQ_SG=3
-run K-rpw2 short,prose 128 STRATA_MMVQ_RPW=2
-run K-grv3 short,prose 128 STRATA_GR_V3=1
-run K-sliced0 short,prose 128 STRATA_GR_DOWN_SLICED=0
-run K-normsplit0 short,prose 128 STRATA_GR_NORM_SPLIT=0
-run K-hcsplit1 short,prose 128 STRATA_HC_SPLIT=1
-run K-hcsplit0 short,prose 128 STRATA_HC_SPLIT=0
-run G-keyhead 10k 16 STRATA_GDN_KEYHEAD=1
-run G-heads 10k 16 STRATA_GDN_REC_HEADS=1
-run G-nopipe 10k 16 STRATA_GDN_PIPELINE=0
+if [ "${ARC_PROFILE_SWEEP:-0}" = 1 ]; then
+    run K-sg16 short,prose 128 STRATA_MMVQ_SG=16
+    run K-sg3 short,prose 128 STRATA_MMVQ_SG=3
+    run K-rpw2 short,prose 128 STRATA_MMVQ_RPW=2
+    run K-grv3 short,prose 128 STRATA_GR_V3=1
+    run K-sliced0 short,prose 128 STRATA_GR_DOWN_SLICED=0
+    run K-normsplit0 short,prose 128 STRATA_GR_NORM_SPLIT=0
+    run K-hcsplit1 short,prose 128 STRATA_HC_SPLIT=1
+    run K-hcsplit0 short,prose 128 STRATA_HC_SPLIT=0
+    run G-keyhead 10k 16 STRATA_GDN_KEYHEAD=1
+    run G-heads 10k 16 STRATA_GDN_REC_HEADS=1
+    run G-nopipe 10k 16 STRATA_GDN_PIPELINE=0
+fi
 run A 10k 128 STRATA_PREFILL_TIMING=1 STRATA_DRAFT_TIMING=1
 if [ -n "$unitrace" ]; then
     run D short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.D.unitrace"

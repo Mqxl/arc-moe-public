@@ -1,0 +1,38 @@
+From be2f78c769ee3edf523b5d78353ecb49e9a22fab Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 12:17:51 +0000
+Subject: [PATCH] sycl: with a layer split the drafter's prompt K/V is batched
+ on the last stage
+
+The serve path batched the draft layer's K/V over a prompt chunk only on
+one GPU (`!multi_gpu && sp.draft_kv(...)`): with a layer split the drafter
+read every chunk through its own pass, 6 tokens at a time - 2.9 s per
+8K-token chunk on the A770s, more than the last stage's 13 layers took.
+The drafter lives on the last stage, whose prompt path is on the same
+device with its own borrowed region, so that stage's draft_kv takes it.
+---
+ sycl/src/program/generate.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 6896c4d..e63c13f 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -5803,8 +5803,12 @@ int main(int argc, char **argv) try {
+         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+             std::vector<int32_t> nxt((size_t) T);
+             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
+-            // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
+-            const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
++            // E-9: batched through the prompt path when it can. arc-moe: with a layer split the drafter is on the last
++            // stage, so that stage's prompt path (same device, its borrowed region) takes the batch; upstream left a
++            // split to the drafter's own pass, 6 tokens at a time - 2.9 s per 8K-token chunk on the A770s, longer
++            // than the last stage's 13 layers
++            strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;
++            const bool batched = dsp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
+             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+             if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
+                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
+-- 
+2.43.0
+
