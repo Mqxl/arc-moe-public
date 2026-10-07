@@ -1,0 +1,38 @@
+From a2b95a2c084ccf75e05bec69b90bdb6b2e4771ec Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:20:22 +0000
+Subject: [PATCH] sycl: the 8-superblock dequant work-groups are opt-in
+ (STRATA_DQ_WG=256)
+
+Measured on 2x A770: the prompt path's dequant time did not move and the 10K prompt read 2% slower than
+with the one-superblock work-groups.
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 2efe64b..e04a11c 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -1986,7 +1986,8 @@ __dpct_inline__ void dequant_gu_kernel(
+ // arc-moe: the same two kernels with 8 superblocks per 256-thread work-group (32 threads each, as above): the prompt
+ // path dequantizes every routed expert of a chunk (~17K per 8K-token chunk on one A770), and one 32-thread work-group
+ // per superblock left Alchemist's dispatcher the bottleneck (~40 GB/s written). Per thread the work is unchanged, so
+-// the output is bit-identical. STRATA_DQ_WG=32: the one-superblock work-groups.
++// the output is bit-identical. Measured on 2x A770 (round 9): the prompt path's dequant time did not move (the
++// dispatcher was not the limit) and the 10K prompt read 2% slower - so opt-in: STRATA_DQ_WG=256.
+ __dpct_inline__ void dequant_flat_kernel_wide(int ty, const void *__restrict__ vx, sycl::half *__restrict__ y,
+                                               int64_t n_blocks) {
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+@@ -2006,7 +2007,7 @@ __dpct_inline__ void dequant_gu_kernel_wide(int ty, const void *__restrict__ gat
+     dq_dispatch<sycl::half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, (int) (g & 31));
+ }
+ bool dq_wide() {
+-    static const bool v = [] { const char* e = std::getenv("STRATA_DQ_WG"); return !(e && std::atoi(e) == 32); }();
++    static const bool v = [] { const char* e = std::getenv("STRATA_DQ_WG"); return e && std::atoi(e) == 256; }();
+     return v;
+ }
+ 
+-- 
+2.43.0
+

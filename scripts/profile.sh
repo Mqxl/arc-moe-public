@@ -6,8 +6,8 @@
 #   N     the defaults (./arc start's: lib.sh arc_engine_env), nothing traced: the real speeds on short prompts, on
 #         2K / 10K prompts and on a sampled request and an agent harness's (tools, streaming); every reply checked
 #   PS1   STRATA_PLAN_STAGE=1: the device plan stages mirrored experts in VRAM (patch 21; off by default since round 9)
-#   DQ32  STRATA_DQ_WG=32: the prompt path's dequantization in one-superblock work-groups (8 per group by default)
-#   SR64  --short-read 64: short prompt parts batched (768 by default: up to 768 new tokens go through the windows)
+#   SR768 --short-read 768: round 9's threshold (1536 by default: up to 1536 new tokens go through the windows)
+#   SR64  --short-read 64: upstream's threshold (short prompt parts batched)
 #   G1    one card only (ARC_GPUS=0), on a machine with two: the single-GPU mode
 #   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
 #   D   decode, eager, under unitrace: the GPU time of every kernel by name   (ARC_PROFILE_TRACE=1)
@@ -116,8 +116,8 @@ fi
 # ./arc start's flags (STRATA_EXTRA_ARGS replaces them, so a run repeats them; the engine keeps a flag's last value)
 BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
 run PS1 short,prose 128 STRATA_PLAN_STAGE=1
-run DQ32 2k,10k 128 STRATA_DQ_WG=32
-run SR64 1k,agent 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --short-read 64"
+run SR768 1k,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --short-read 768"
+run SR64 agent 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --short-read 64"
 if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then   # the same box on one card: the single-GPU mode's speeds
     run G1 short,prose,2k,10k 128 ARC_GPUS=0
 fi

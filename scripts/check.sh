@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ./arc check [model] - does the server answer with text the way every kind of client asks? tools/check.py sends
+# ./arc check [model] [--no-long] - does the server answer with text the way every kind of client asks? tools/check.py sends
 # one short question greedy and sampled, thinking off and on, streamed, with penalties and with tools.
 #
 # A server already running: checked as it is (a few minutes). None running: started once per configuration below with
@@ -12,7 +12,9 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 cd "$STRATA"
-want=${1:-${ARC_MODEL:-iq2_xs}}
+pos=(); pass=()   # --no-long and the other tools/check.py options go through to it
+for a in "$@"; do case "$a" in --*) pass+=("$a") ;; *) pos+=("$a") ;; esac; done
+want=${pos[0]:-${ARC_MODEL:-iq2_xs}}
 want=$(echo "$want" | tr '[:upper:]' '[:lower:]')
 cfg="strata-$want.json"
 [ -f "$cfg" ] || die "no $cfg: ./arc setup first (or ./arc check <model>)"
@@ -25,7 +27,7 @@ keyarg=(); [ "$key" != "-" ] && keyarg=(--api-key "$key")
 
 if curl -fsS -m 3 "$url/health" >/dev/null 2>&1; then
     say "${B}checking the running server${N} at $url (stop it for the full run over several configurations)"
-    exec python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}"
+    exec python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" "${pass[@]}"
 fi
 
 [ "$log" != "-" ] || die "$cfg has no \"log\": the engine's lines are needed"
@@ -63,7 +65,7 @@ run() {   # run <name> <env...>
         [ $t -lt 900 ] || { warn "not loaded after 15 minutes"; break; }
     done
     echo "================ $name: $*" >>"$out"
-    python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" 2>&1 | tee -a "$out" || true
+    python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" "${pass[@]}" 2>&1 | tee -a "$out" || true
     stop_server
     {
         echo "---- engine log"

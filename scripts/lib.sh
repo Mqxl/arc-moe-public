@@ -19,11 +19,12 @@ ONEAPI=${ONEAPI_ROOT:-/opt/intel/oneapi}
 #   --spec 6                          8-token windows (code accepts ~90% of the drafts): +4% on code
 #   STRATA_GU_LANES=32                32 lanes per row in the experts' gate/up GEMV (8, tuned on Xe2): code +18%
 #   STRATA_PREFILL_FIRST=0            no 256-token first chunk (a whole extra walk over the experts, ~4.7 s)
-#   --short-read 768                  a prompt part of up to 768 new tokens (an agent's next turn: a tool result, a
-#                                     message) goes through the decode windows (~25 ms a token) instead of a batched
-#                                     chunk (~17 s however short, + ~4 ms a token: every expert dequantized); upstream's
-#                                     64 assumes CUDA's ~0.3 s chunk. A 311-token turn: 18.7 s batched.
-ARC_ENGINE_ARGS_DEFAULT="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 768"
+#   --short-read 1536                 a prompt part of up to 1536 new tokens (an agent's next turn: a tool result, a
+#                                     message) goes through the decode windows instead of a batched chunk. Measured on
+#                                     2x A770: windows ~4 s + 10.4 ms a token, a batched chunk ~12.5 s + 6.1 ms a token
+#                                     (every expert dequantized however short): even at ~2000. Upstream's 64 assumes
+#                                     CUDA's ~0.3 s chunk; a 311-token turn took 18.7 s batched, 7.9 s in windows.
+ARC_ENGINE_ARGS_DEFAULT="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 1536"
 arc_engine_env() {   # export the defaults above; a variable already set (even empty) wins
     export STRATA_EXTRA_ARGS="${STRATA_EXTRA_ARGS-$ARC_ENGINE_ARGS_DEFAULT}"
     export STRATA_PREFILL_FIRST="${STRATA_PREFILL_FIRST-0}"
