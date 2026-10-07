@@ -59,7 +59,7 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--long", action="store_true", help="also the ~2K-token code prompt")
     ap.add_argument("--json", help="write the raw rows here")
-    ap.add_argument("--cases", help="comma list of short, prose, 2k, 8k (default: short,prose, and 2k with --long)")
+    ap.add_argument("--cases", help="comma list of short, prose, 2k, 8k, 10k (default: short,prose, and 2k with --long)")
     a = ap.parse_args()
 
     try:
@@ -70,7 +70,8 @@ def main() -> int:
         return 1
 
     known = {"short": ("short code", lambda: SHORT_CODE), "prose": ("short prose (ru)", lambda: SHORT_PROSE),
-             "2k": ("2K code", long_code), "8k": ("8K code", lambda: long_code(28000))}
+             "2k": ("2K code", long_code), "8k": ("8K code", lambda: long_code(28000)),
+             "10k": ("10K code", lambda: long_code(36000))}
     want = a.cases.split(",") if a.cases else ["short", "prose"] + (["2k"] if a.long else [])
     bad = [c for c in want if c not in known]
     if bad:

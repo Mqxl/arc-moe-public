@@ -280,6 +280,22 @@ profiling info from queues created without `enable_profiling`. Patch 15 times th
 The next profile adds per-kernel GPU time (`unitrace -d`, built by `scripts/get-unitrace.sh`), a real decode baseline,
 and two Level Zero runtime switches as A/B runs: the v2 adapter, and the driver's in-order lists.
 
+### Round 2 (04bc8e4)
+
+- **Level Zero runtime switches:** the v2 adapter gave 19.2 tok/s and the driver's in-order lists 19.2, against a
+  19.0 baseline. Decode is not limited by kernel submission.
+- **Where prompt reading goes:** 90% of it is `dequant`, `gemm gate/up` and `gemm down`, which run per expert. A
+  native pack's prompt experts are dequantized to FP16 and multiplied by oneMKL one expert at a time, because the
+  grouped MMQ path needs ggml-cuda and is not built in the SYCL port. Each chunk walks all of a GPU's routed
+  experts, and on GPU 0 most of them stream from the RAM mirror, so the cost grows with the number of chunks more
+  than with the number of tokens. The 256-token first chunk (`STRATA_PREFILL_FIRST`, a B70 latency trick) is a
+  whole extra walk here, ~4.7 s.
+- **Bigger chunks:** borrowing cache slots for the prompt (`--prefill-borrow --prefill auto`, 8K chunks) took the
+  2K prompt from 49 to 116 tok/s and the 8K prompt from 63 to 284 tok/s, with decode unchanged.
+- **Defaults now in `./arc start`:** 8K borrowed chunks and no first chunk. Round 3 measures 16K chunks, the
+  stream-all walk and per-kernel times (`unitrace` builds without `libze-dev`, since its CMake fetches the Level
+  Zero headers itself).
+
 ## What was verified here, and what was not
 
 | Check | Status |

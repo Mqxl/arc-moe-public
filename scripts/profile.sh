@@ -3,17 +3,15 @@
 # engine's profilers on, sends prompts, stops it, and writes everything worth reading into one file
 # (profile-<time>.txt).
 #
-#   N  the config as it is, nothing traced: the real decode speed (the baseline of V2 and IO)
-#   V2 the same with the Level Zero v2 adapter (SYCL_UR_USE_LEVEL_ZERO_V2=1)
-#   IO the same with the driver's in-order command lists (UR_L0_USE_DRIVER_INORDER_LISTS=1)
-#   A  the config as it is: the prompt path's phases (STRATA_PREFILL_TIMING) on the 2K and 8K prompts
-#   B  decode windows run eagerly with a host clock at every stage (STRATA_VERIFY_EAGER + _PROFILE): ms per stage
-#      of a verify window (slower than real decode: each stage waits for the GPU)
-#   C  bigger prompt chunks: the prompt path borrows expert-cache slots (--prefill-borrow --prefill auto)
-#   D  decode, eager, under unitrace: the GPU time of every kernel by name
-#   E  the 8K prompt under unitrace
+#   N   the defaults (./arc start's: 8K prompt chunks borrowing cache slots, no short first chunk), nothing traced:
+#       the real speeds on short prompts and on 2K / 10K-token prompts
+#   P16 16K prompt chunks (--prefill auto:16384): a 10K prompt in one walk over the experts instead of two
+#   SA  the stream-all walk (STRATA_PREFILL_STREAM_ALL=1): every non-resident expert through a 384-slot ring
+#   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) on the 10K prompt
+#   D   decode, eager, under unitrace: the GPU time of every kernel by name
+#   E   the 10K prompt under unitrace
 #
-# D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: libze-dev from apt, ~3 min).
+# D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: cmake + network, ~5 min).
 # The server must be stopped first (the run starts its own). About 25 minutes.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -98,15 +96,13 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     echo
 } >"$out"
 
-run N short,prose,2k 128 ARC_PROFILE_RUN=N
-run V2 short,prose,2k 128 SYCL_UR_USE_LEVEL_ZERO_V2=1
-run IO short,prose,2k 128 UR_L0_USE_DRIVER_INORDER_LISTS=1
-run A 2k,8k 128 STRATA_PREFILL_TIMING=1
-run B short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_VERIFY_PROFILE=1
-run C 2k,8k 128 STRATA_PREFILL_TIMING=1 "STRATA_EXTRA_ARGS=--prefill-borrow --prefill auto"
+run N short,prose,2k,10k 128 ARC_PROFILE_RUN=N
+run P16 10k 128 "STRATA_EXTRA_ARGS=--prefill-borrow --prefill auto:16384"
+run SA 10k 128 STRATA_PREFILL_STREAM_ALL=1
+run A 10k 128 STRATA_PREFILL_TIMING=1
 if [ -n "$unitrace" ]; then
     run D short,prose 128 STRATA_VERIFY_EAGER=1 "STRATA_WRAP=$unitrace -d -o $out.D.unitrace"
-    run E 8k 1 "STRATA_WRAP=$unitrace -d -o $out.E.unitrace"
+    run E 10k 1 "STRATA_WRAP=$unitrace -d -o $out.E.unitrace"
     for f in "$out".D.unitrace* "$out".E.unitrace*; do
         [ -f "$f" ] || continue
         { echo "================ $(basename "$f")"; head -c 60000 "$f"; echo; } >>"$out"
