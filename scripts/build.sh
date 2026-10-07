@@ -16,7 +16,7 @@ step "Strata source"
 [ -e "$STRATA/.git" ] || die "third_party/strata is missing (git clone --recursive)"
 "$ROOT/scripts/apply-patches.sh"
 
-step "Compiling the engine for $AOT_TARGET (Arc A770) - 20-60 minutes the first time"
+step "Compiling the engine for $AOT_TARGET (detected from this machine's Arcs; ARC_AOT= to override) - 20-60 minutes the first time"
 oneapi_env
 command -v icpx >/dev/null || die "icpx not found after setvars.sh (./arc deps)"
 if [ -n "$AOT_TARGET" ] && ! command -v ocloc >/dev/null; then

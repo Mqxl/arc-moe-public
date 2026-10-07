@@ -9,6 +9,7 @@
 #   S4    the defaults with --spec 4 (6 by default: 8-token windows)
 #   DN32 / DN4  the experts' down GEMV with 32 / 4 lanes per row (8 by default; gate/up runs 32)
 #   GU16  gate/up with 16 lanes per row
+#   G1    one card only (ARC_GPUS=0), on a machine with two: the single-GPU mode
 #   A   the defaults with the prompt path's phases (STRATA_PREFILL_TIMING) and the draft layer's (STRATA_DRAFT_TIMING)
 #   D   decode, eager, under unitrace: the GPU time of every kernel by name   (ARC_PROFILE_TRACE=1)
 #   E   the 10K prompt under unitrace                                          (ARC_PROFILE_TRACE=1)
@@ -120,6 +121,9 @@ run S4 short,prose,2k 128 "STRATA_EXTRA_ARGS=$BASE_ARGS --spec 4"
 run DN32 short,prose 128 STRATA_DOWN_LANES=32
 run DN4 short,prose 128 STRATA_DOWN_LANES=4
 run GU16 short,prose 128 STRATA_GU_LANES=16
+if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then   # the same box on one card: the single-GPU mode's speeds
+    run G1 short,prose,2k,10k 128 ARC_GPUS=0
+fi
 run A 10k 128 STRATA_PREFILL_TIMING=1 STRATA_DRAFT_TIMING=1
 if [ -n "$unitrace" ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
     run D short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.D.unitrace"

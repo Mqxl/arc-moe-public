@@ -1,0 +1,58 @@
+From 2e303d175bcc5ad3ff674250b312d1279c675a7c Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:59:39 +0000
+Subject: [PATCH] sycl: the native runner picks Arcs with ARC_GPUS; one visible
+ card runs without a layer split
+
+ARC_GPUS=0 (or 1, or 0,1) selects among the discrete Arcs by their order,
+after the integrated GPU is left out, so a two-card config can run on one
+card (./arc start, ./arc profile) without a new setup. With one card
+visible the server's --layer-split is dropped.
+---
+ sycl/serve/strata-sycl-native.sh | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
+index ab21c83..2f4edd5 100755
+--- a/sycl/serve/strata-sycl-native.sh
++++ b/sycl/serve/strata-sycl-native.sh
+@@ -19,12 +19,26 @@ if [ "${ONEAPI_DEVICE_SELECTOR:-}" = arc ]; then
+     # "Arc(TM) Graphics") would otherwise be level_zero:0 and take a card's place in the layer split
+     unset ONEAPI_DEVICE_SELECTOR
+     ids=$(sycl-ls 2>/dev/null | sed -nE 's/^\[level_zero:gpu\]\[level_zero:([0-9]+)\].*Arc\(TM\) (Pro )?[AB][0-9]{2,3}.*/\1/p' | paste -sd, -)
++    # arc-moe: ARC_GPUS picks among those discrete Arcs by their order (0 = the first): "0" one card, "0,1" two
++    if [ -n "$ids" ] && [ -n "${ARC_GPUS:-}" ]; then
++        IFS=, read -r -a all <<< "$ids"
++        IFS=, read -r -a want <<< "$ARC_GPUS"
++        picked=()
++        for w in "${want[@]}"; do
++            if [ "$w" -ge 0 ] 2>/dev/null && [ "$w" -lt "${#all[@]}" ]; then picked+=("${all[$w]}")
++            else echo "strata-sycl-native: ARC_GPUS=$ARC_GPUS: there is no Arc number $w (${#all[@]} found)" >&2; exit 2; fi
++        done
++        ids=$(IFS=,; echo "${picked[*]}")
++    fi
+     if [ -n "$ids" ]; then export ONEAPI_DEVICE_SELECTOR="level_zero:$ids"; fi
+     echo "strata-sycl-native: discrete Arc GPUs: ${ONEAPI_DEVICE_SELECTOR:-none found, all devices visible}" >&2
+ fi
+ : "${SYCL_CACHE_PERSISTENT:=0}" "${ZES_ENABLE_SYSMAN:=1}" "${UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS:=1}"
+ export SYCL_CACHE_PERSISTENT ZES_ENABLE_SYSMAN UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS
+ [ -x "$bin" ] || { echo "strata-sycl-native: no engine at $bin (scripts/build.sh)" >&2; exit 127; }
++# arc-moe: one visible card (ARC_GPUS=0 on a two-card config) runs without a layer split
++n_visible=2
++case "${ONEAPI_DEVICE_SELECTOR:-}" in level_zero:*,* | *'*'*) ;; level_zero:[0-9] | level_zero:[0-9][0-9]) n_visible=1 ;; esac
+ # Flags of the CUDA engine the SYCL port does not parse - a config written by an older setup_intel.py, or setup's
+ # start path re-adding #578's switch, must not end the engine with "unknown argument"
+ args=()
+@@ -32,6 +46,9 @@ while [ $# -gt 0 ]; do
+     case "$1" in
+         --remote-expert-opt) echo "strata-sycl-native: dropped $1 (not in the SYCL engine)" >&2; shift ;;
+         --batch|--slots|--batch-groups) echo "strata-sycl-native: dropped $1 ${2:-} (not in the SYCL engine)" >&2; shift 2 || shift ;;
++        --layer-split|--split-device)
++            if [ "$n_visible" -lt 2 ]; then echo "strata-sycl-native: dropped $1 ${2:-} (one GPU visible)" >&2; shift 2 || shift
++            else args+=("$1" "$2"); shift 2; fi ;;
+         *) args+=("$1"); shift ;;
+     esac
+ done
+-- 
+2.43.0
+

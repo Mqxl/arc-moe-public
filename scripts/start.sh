@@ -19,5 +19,11 @@ port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("port
 say "${B}Strata on Intel Arc:${N} ${pick#run-} -> http://127.0.0.1:${port}  (OpenAI: /v1, Anthropic: /v1/messages)"
 say "${D}The first start fills the experts into VRAM and pins the overflow in RAM: ~1 minute.${N}"
 export STRATA_SYCL_NATIVE=1
+n_arc=$(arc_bdfs | wc -l)
+if [ -n "${ARC_GPUS:-}" ]; then mode="Arc #${ARC_GPUS//,/ + #} (ARC_GPUS)"
+elif [ "$n_arc" -ge 2 ]; then mode="$n_arc Arcs, layers split across them (ARC_GPUS=0 for one card)"
+else mode="one Arc"; fi
+say "${D}GPUs: $mode${N}"
+export ARC_GPUS="${ARC_GPUS-}"
 arc_engine_env   # the measured defaults (lib.sh: ARC_ENGINE_ARGS_DEFAULT); a variable set by the caller wins
 exec "./$pick"

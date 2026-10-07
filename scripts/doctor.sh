@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ./arc doctor - everything that decides whether 2x A770 reach 30-40 tok/s, checked without changing anything.
+# ./arc doctor - everything that decides how fast this machine runs Qwen3.8-Flash-Next on its Arc A-series card(s),
+# checked without changing anything, and which mode (one card or a layer split across two) fits it.
 # Exit status: 0 all good, 1 something blocks a run, 2 only warnings.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -21,9 +22,6 @@ step "Memory and disk"
 mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo); av_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 mem=$((mem_kb / 1048576)); av=$((av_kb / 1048576))
 say "  RAM: ${mem} GiB total, ${av} GiB available"
-if [ "$mem" -ge 44 ]; then ok "RAM holds the IQ2_XS overflow mirror (~10 GiB pinned) beside the system"
-elif [ "$mem" -ge 30 ]; then wrn "RAM ${mem} GiB: IQ2_XS will mirror fewer experts; the Coder (IQ1_M) fits VRAM instead"
-else blk "RAM ${mem} GiB is too little for the pinned mirror"; fi
 ml=$(ulimit -l)
 [ "$ml" = unlimited ] && ok "locked-memory limit: unlimited" || say "  ${D}locked-memory limit: ${ml} KiB (Level Zero pins through the driver; only matters if pinning fails)${N}"
 df -BG --output=avail,target "$ROOT" 2>/dev/null | tail -1 | while read -r a t; do
@@ -32,13 +30,15 @@ df -BG --output=avail,target "$ROOT" 2>/dev/null | tail -1 | while read -r a t; 
 step "GPUs"
 mapfile -t bdfs < <(arc_bdfs)
 [ ${#bdfs[@]} -eq 0 ] && blk "no Intel discrete GPU on the PCI bus"
-n_a770=0
+n_cards=0; vram_sum=0; vram_min=0
 for b in "${bdfs[@]}"; do
     d=/sys/bus/pci/devices/$b
     id=$(cat "$d/device"); id=${id#0x}
     drv=$(basename "$(readlink -f "$d/driver" 2>/dev/null)" 2>/dev/null || echo none)
     name="Intel GPU $id"
-    case "$id" in 56a0) name="Arc A770"; n_a770=$((n_a770 + 1)) ;; 56a1) name="Arc A750" ;; 56a2) name="Arc A580" ;; 56a5|56a6) name="Arc A380/A310" ;; esac
+    case "$id" in 56a0) name="Arc A770" ;; 56a1) name="Arc A750" ;; 56a2) name="Arc A580" ;; 56a5|56a6) name="Arc A380/A310" ;;
+        5690|5691|5692) name="Arc A-series mobile" ;; 56b2|56b3) name="Arc Pro A60" ;; esac
+    name="$name ($(arc_die "0x$id"))"
     say "  ${B}$b${N}  $name [8086:$id]  driver: $drv"
     case "$drv" in i915|xe) ok "kernel driver $drv" ;; *) blk "no i915/xe driver bound (kernel too old, or i915.force_probe=$id needed)" ;; esac
     if [ "$drv" = i915 ]; then
@@ -53,6 +53,11 @@ for b in "${bdfs[@]}"; do
     if [ -r "$d/resource" ]; then
         read -r s e _ < <(sed -n 3p "$d/resource")
         [ -n "${s:-}" ] && bar=$(( (e - s + 1) / 1048576 ))
+    fi
+    # with ReBAR the aperture is the whole VRAM: the card's size for the mode plan below
+    if [ "$bar" -ge 4096 ]; then
+        g=$((bar / 1024)); n_cards=$((n_cards + 1)); vram_sum=$((vram_sum + g))
+        { [ "$vram_min" -eq 0 ] || [ "$g" -lt "$vram_min" ]; } && vram_min=$g
     fi
     if [ "$bar" -ge 8192 ]; then ok "Resizable BAR on (VRAM aperture $((bar / 1024)) GiB)"
     elif [ "$bar" -gt 0 ]; then blk "Resizable BAR OFF (aperture ${bar} MiB): enable 'Above 4G decoding' + 'Re-Size BAR' in the BIOS - A-series cards lose much of their speed without it"
@@ -71,8 +76,34 @@ for b in "${bdfs[@]}"; do
             *) wrn "PCIe link: $best - the experts mirrored in RAM are read over this link; x8 Gen4 or better keeps decode near the top of the range" ;; esac
     else say "  ${D}PCIe link: not readable here${N}"; fi
 done
-if [ "$n_a770" -ge 2 ]; then ok "${n_a770}x Arc A770: the layers are split across them (32 GB of VRAM together)"
-elif [ "$n_a770" -eq 1 ]; then wrn "one A770: IQ2_XS mirrors more than half of its experts in RAM (slower); the Coder fits better"; fi
+
+step "Mode plan (IQ2_XS: 35.5 GB of experts)"
+# Measured on 2x A770 16 GB: 21 of the 32 GB of VRAM held experts (the rest: dense weights, KV at 32K, the draft head,
+# the reserve). Per card that is ~4.5 GB of overhead plus ~2 GB once; the experts the VRAM cannot hold are pinned in
+# RAM (the mirror) and read over PCIe, beside ~12 GB the system, the drafter's files and the server keep.
+plan() {   # plan <cards> <VRAM GB of those cards>: prints "experts_in_vram mirror ram_needed"
+    awk -v n="$1" -v v="$2" 'BEGIN { e = v - 4.5 * n - 2; if (e < 0) e = 0; if (e > 35.5) e = 35.5;
+                                      m = 35.5 - e; printf "%.0f %.0f %.0f", e, m, m + 12 }'
+}
+mode_line() {   # mode_line <label> <cards> <VRAM sum>
+    read -r e m need < <(plan "$2" "$3")
+    if [ "$mem" -ge "$need" ]; then
+        ok "$1: ~${e} GB of experts in VRAM, ~${m} GB pinned in RAM - fits (${mem} GiB RAM, needs ~${need})"
+    else
+        wrn "$1: ~${e} GB of experts in VRAM, ~${m} GB to pin in RAM - needs ~${need} GiB RAM, this machine has ${mem}: part of the experts stays on the SSD and decode takes the slower per-layer host path (a smaller model, a second card, or more RAM)"
+    fi
+}
+if [ "$n_cards" -ge 2 ]; then
+    mode_line "two cards (layer split, the default)" 2 $((vram_sum > 2 * vram_min ? 2 * vram_min : vram_sum))
+    mode_line "one card (ARC_GPUS=0)" 1 "$vram_min"
+    say "  ${D}measured: two A770 16 GB with 46 GB RAM - decode 34 tok/s on code, a 10K prompt at 800-1000 tok/s${N}"
+elif [ "$n_cards" -eq 1 ]; then
+    mode_line "one card" 1 "$vram_sum"
+    say "  ${D}a second A770 roughly doubles the experts in VRAM: the layers are split across the cards automatically${N}"
+else
+    wrn "no card size known (Resizable BAR off or unreadable): no mode plan"
+fi
+[ "$vram_min" -gt 0 ] && [ "$vram_min" -lt 12 ] && wrn "an ${vram_min} GB card holds few experts: A770 16 GB is what this is tuned for"
 if [ "$(id -u)" -eq 0 ]; then ok "running as root (/dev/dri is open to it)"
 elif id -nG | tr ' ' '\n' | grep -qx render; then ok "user $(id -un) is in the render group"
 else blk "user $(id -un) is not in the 'render' group: sudo usermod -aG render,video $(id -un), then log in again"; fi
@@ -81,7 +112,7 @@ step "Compute runtime and oneAPI"
 if [ -f "$ONEAPI/setvars.sh" ]; then
     oneapi_env
     ok "oneAPI: $(icpx --version 2>/dev/null | head -1 || echo 'runtime only')"
-    command -v ocloc >/dev/null && ok "ocloc (ahead-of-time compiler for acm-g10)" || wrn "no ocloc: the engine builds as SPIR-V and compiles every kernel at its first start (~1 min)"
+    command -v ocloc >/dev/null && ok "ocloc (ahead-of-time compiler; this machine builds for $AOT_TARGET)" || wrn "no ocloc: the engine builds as SPIR-V and compiles every kernel at its first start (~1 min)"
     if command -v sycl-ls >/dev/null; then
         lz=$(sycl-ls 2>/dev/null | grep -c 'level_zero:gpu' || true)
         sycl-ls 2>/dev/null | grep -E 'level_zero:gpu' | sed 's/^/    /'

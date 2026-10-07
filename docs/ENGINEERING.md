@@ -392,6 +392,28 @@ None of the single changes against it beats noise: reserve 512 34.5 / 19.5 (firs
 33.2 / 19.8, 32 or 4 down lanes 33.2 / 18.8 and 33.8 / 19.1, 16 gate/up lanes 31.4 / 18.5. Prose stays below code
 because its MTP drafts are accepted far less often (~35 of 100 against ~85).
 
+### Round 8: the misses staged in VRAM, two kernels fixed, any A770 machine in one or two-card mode
+
+- **Patch 21: mirrored experts are copied, not read in place.** The device-built plan put the experts it found
+  in the pinned mirror into the VRAM groups with their host address, so the expert GEMVs read them over PCIe a few
+  bytes per lane at a time: unitrace's gate/up GEMV ranged from 3.7 us to 4.4 ms per call. The window already has
+  the host pool's PCIe share in copy-kernel mode: `fetch_blobs` copies the blobs into VRAM staging with ~100K
+  threads of 16-byte loads, then a second grouped launch computes them. `resident_plan` now puts the first
+  `pcie_cap` mirrored experts of a group there (`ptr2` / `start2` / `counts[2]`, entries after the VRAM ones: the host
+  pool's layout). The cap is the group's share of the staging, 16 (8 per half of a split window). Any experts past
+  the cap stay in place, as before.
+- **Patch 22, two smaller kernel fixes:**
+  - `gr_up_multi` read its staged `lo` rows 32 bytes apart across a sub-group, which causes SLM bank conflicts. They
+    are now staged chunk-interleaved and read with a stride: the same products in the same order, so the same bits.
+  - The router's 8x32 work-groups, of which rows 1-7 returned at once, are now 1x32.
+- **One or two cards (patch 23), any machine:**
+  - The runner takes `ARC_GPUS` (indices among the discrete Arcs, the integrated GPU left out) and drops
+    `--layer-split` when one card is visible, so a two-card config also runs on one card.
+  - `./arc build` derives the AOT target from the PCI ids (`acm-g10/g11/g12`, comma-joined for mixed cards).
+  - `./arc doctor` prints a plan per mode for the machine's VRAM and RAM. It is calibrated on the two-card run:
+    21 of 32 GB held experts.
+  - `./arc profile` adds a one-card run (G1) on two-card machines.
+
 ## What was verified here, and what was not
 
 | Check | Status |

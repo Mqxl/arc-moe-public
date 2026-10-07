@@ -7,7 +7,9 @@ STRATA=$ROOT/third_party/strata
 # load_experts_gguf drifted from the migrated copies in sycl/).
 STRATA_PIN=a5682fea1667c87b9a6b9ad0b2cd69dd9898fbaf
 STRATA_BRANCH=arc-moe
-AOT_TARGET=${ARC_AOT:-acm-g10}          # Arc A770 / A750 (DG2-512). A580: acm-g12, A380/A310: acm-g11
+# The AOT device(s) for the GPU code: ARC_AOT if set, else what the PCI ids of the Arcs in this machine need
+# (detect_aot below; acm-g10 when none is found, e.g. building on another machine)
+AOT_TARGET=${ARC_AOT-}
 BUILD_DIR=$STRATA/build-sycl-aot
 ONEAPI=${ONEAPI_ROOT:-/opt/intel/oneapi}
 # The engine settings ./arc start adds, each measured on 2x A770 with ./arc profile (docs/ENGINEERING.md section 9):
@@ -54,3 +56,26 @@ arc_bdfs() {
         basename "$d"
     done
 }
+
+# The Alchemist die of an Arc by PCI device id (ocloc's names): ACM-G10 = A770, A750, A580 and the A770M / A730M /
+# A550M; ACM-G11 = A380, A310 and the small mobile parts; ACM-G12 = Arc Pro A60 / A60M. Battlemage (B580, B570, Pro
+# B50/B60) is Strata's own SYCL target (bmg-g21) - arc-moe's patches are for Alchemist.
+arc_die() {
+    case "$1" in
+        0x56a0|0x56a1|0x56a2|0x5690|0x5691|0x5692) echo acm-g10 ;;
+        0x56a3|0x56a4|0x56a5|0x56a6|0x5693|0x5694|0x5695|0x5696|0x5697|0x56b0|0x56b1|0x56ba|0x56bb|0x56bc|0x56bd) echo acm-g11 ;;
+        0x56b2|0x56b3) echo acm-g12 ;;
+        0xe20*|0xe21*) echo bmg-g21 ;;
+        *) echo unknown ;;
+    esac
+}
+detect_aot() {   # every die among the Arcs in this machine, comma separated (acm-g10 when there is none)
+    local b dies="" d
+    for b in $(arc_bdfs); do
+        d=$(arc_die "$(cat "/sys/bus/pci/devices/$b/device" 2>/dev/null)")
+        [ "$d" = unknown ] && continue
+        case ",$dies," in *",$d,"*) ;; *) dies=${dies:+$dies,}$d ;; esac
+    done
+    echo "${dies:-acm-g10}"
+}
+[ -n "$AOT_TARGET" ] || AOT_TARGET=$(detect_aot)

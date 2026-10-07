@@ -1,0 +1,166 @@
+From 13581805b6d771a6ce0333e5686d167a258bca87 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:58:11 +0000
+Subject: [PATCH] sycl: the device plan stages mirrored experts in VRAM (copy
+ kernel) instead of reading them in the GEMVs
+
+With every routed expert in VRAM or in the pinned host mirror, the device-
+built plan put the mirrored ones into the VRAM groups with their host
+address: the expert GEMVs then read them over PCIe themselves, a few bytes
+per lane at a time (unitrace on the A770: the gate/up GEMV 368 us on
+average, 3.7 us - 4.4 ms per call). The window already has the host pool's
+copy-kernel path for its PCIe share (fetch_blobs into VRAM staging, then
+the second grouped launch). resident_plan now puts the first pcie_cap
+mirrored experts of a group into those PCIe groups (ptr2 / start2 /
+counts[2], entries after the VRAM ones: the host pool's layout); the
+window passes its group's share of the staging (16, or 8 per half) in the
+copy-kernel mode (--pcie-mode auto/kernel), 0 otherwise. Mirrored experts
+past the cap stay in the VRAM groups as before.
+---
+ include/strata/kernels/verify_kernels.hpp   |  7 ++-
+ sycl/src/core/verify.cpp                    |  5 +-
+ sycl/src/kernels/cuda/verify_kernels.dp.cpp | 60 +++++++++++++++------
+ 3 files changed, 53 insertions(+), 19 deletions(-)
+
+diff --git a/include/strata/kernels/verify_kernels.hpp b/include/strata/kernels/verify_kernels.hpp
+index 2efb7cf..92c7b23 100644
+--- a/include/strata/kernels/verify_kernels.hpp
++++ b/include/strata/kernels/verify_kernels.hpp
+@@ -49,7 +49,12 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream);
+ /// left empty and *plan_err (mapped host memory) is set to 1, so the host sees it instead of running a stale plan.
+ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
++                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr,
++                   int pcie_cap = 0);
++/// (arc-moe: `pcie_cap` > 0 - the SYCL port's copy-kernel PCIe mode - puts up to that many experts the pinned host mirror
++/// holds into the PCIe groups (ptr2 / start2 / counts[2], entries after the VRAM ones, as the host pool lays them out),
++/// so the window copies them into VRAM staging with fetch_blobs before computing them; 0 = in the VRAM groups, read
++/// over PCIe by the expert kernels themselves.)
+ /// wait_flag_ge that also returns when *skip == value (device memory).
+ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
+ /// copy_i32_from_mapped unless *skip == value.
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 80986a2..68eb6f4 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -909,7 +909,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+-                          (uint32_t) ((l - lb_) * G + grp + 1), cs);
++                          (uint32_t) ((l - lb_) * G + grp + 1), cs, nullptr,
++                          // arc-moe: the mirrored experts go to the PCIe groups, which post() copies into this
++                          // group's share of the VRAM staging (fetch_blobs) - in the copy-kernel mode only
++                          sink_.pcie_mode == 2 ? (int) (G == 2 ? kStagingBlobs / 2 : kStagingBlobs) : 0);
+         if (device_plan_ && steplog) {   // arc-moe: did the device plan the group (skip == ring) or refuse (0)?
+             step_sync(l, 17, grp, "resident_plan");
+             uint32_t sk = 0;
+diff --git a/sycl/src/kernels/cuda/verify_kernels.dp.cpp b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+index 6301392..51fdc14 100644
+--- a/sycl/src/kernels/cuda/verify_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+@@ -935,7 +935,7 @@ __dpct_inline__ void resident_plan_kernel(
+     const int32_t *__restrict__ res, int n_expert, const uint8_t *cache_base,
+     const unsigned long long *slot_off, long long blob,
+     int32_t *__restrict__ pl, long long capx, uint32_t *skip, uint32_t ring,
+-    const unsigned long long *__restrict__ mir, bool par, uint32_t *plan_err) {
++    const unsigned long long *__restrict__ mir, bool par, uint32_t *plan_err, int pcie_cap) {
+     // #871 (ported by arc-moe): without `skip` (the all-resident graph) there is no host plan to fall back on - an
+     // empty plan, so no expert runs on a stale pointer, and the mapped error flag for the host
+     auto refuse = [&]() {
+@@ -990,33 +990,59 @@ __dpct_inline__ void resident_plan_kernel(
+         const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+         unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+         int32_t* start2 = pl + ptr_off + 4 * capx;
++        // arc-moe: a class per group - 0: the VRAM groups (an expert in the cache, or a mirrored one past pcie_cap,
++        // read over PCIe by the expert kernels), 1: the PCIe groups (the first pcie_cap mirrored experts in routing
++        // order, copied into VRAM staging by fetch_blobs before they are computed: one wide copy instead of the
++        // GEMVs' scattered reads of host memory). Entries: the VRAM groups' first, then the PCIe groups', each in
++        // the order above - the host pool's layout. pcie_cap 0: every group class 0, the plan as before.
++        auto &s_cls = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[kPlanCap]>(item.get_group());
++        if (tid < n && s_lead[tid] == tid) {
++            int rank = 0;   // mirrored experts first-seen before this one
++            for (int j = 0; j < tid; ++j) rank += (s_lead[j] == j && s_res[j] < 0) ? 1 : 0;
++            s_cls[tid] = (s_res[tid] < 0 && rank < pcie_cap) ? 1 : 0;
++        }
++        item.barrier(sycl::access::fence_space::local_space);
++        unsigned long long* ptr2 = ptr + capx;
+         if (tid < n) {
+             const int L = s_lead[tid];
+-            int g = 0, gstart = 0, pos = 0;
++            const int cl = s_cls[L];
++            int g = 0, gstart = 0, pos = 0, nv = 0;
+             for (int j = 0; j < n; ++j) {
+                 const int Lj = s_lead[j];
+-                if (j < L && Lj == j) ++g;           // first occurrences before L
+-                if (Lj < L) ++gstart;                // entries of earlier groups
+-                if (j < tid && Lj == L) ++pos;       // earlier entries of this group
++                const int cj = s_cls[Lj];
++                nv += cj == 0 ? 1 : 0;                         // entries of the VRAM groups
++                if (j < L && Lj == j && cj == cl) ++g;         // first occurrences of this class before L
++                if (Lj < L && cj == cl) ++gstart;              // entries of this class's earlier groups
++                if (j < tid && Lj == L) ++pos;                 // earlier entries of this group
+             }
+-            dst[gstart + pos] = tid;
+-            tok[gstart + pos] = tid / k;
++            const int at = (cl == 0 ? 0 : nv) + gstart + pos;
++            dst[at] = tid;
++            tok[at] = tid / k;
+             if (L == tid) {
+                 const int32_t slot = s_res[tid];
+-                ptr[g] = slot >= 0 ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
+-                                   : s_mir[tid];
+-                start[g] = gstart;
++                if (cl == 0) {
++                    ptr[g] = slot >= 0 ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
++                                       : s_mir[tid];
++                    start[g] = gstart;
++                } else {
++                    ptr2[g] = s_mir[tid];
++                    start2[g] = nv + gstart;
++                }
+             }
+         }
+         item.barrier(sycl::access::fence_space::global_and_local);
+         if (tid != 0) return;
+-        int groups = 0;
+-        for (int i = 0; i < n; ++i) groups += s_lead[i] == i;
+-        start[groups] = n;
+-        start2[0] = n;
++        int groups = 0, groups2 = 0, nv = 0;
++        for (int i = 0; i < n; ++i) {
++            const int c = s_cls[s_lead[i]];
++            nv += c == 0 ? 1 : 0;
++            if (s_lead[i] == i) { if (c == 0) ++groups; else ++groups2; }
++        }
++        start[groups] = nv;
++        start2[groups2] = n;
+         counts[0] = groups;
+         counts[1] = n;
+-        counts[2] = 0;
++        counts[2] = groups2;
+         sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device);
+         strata::sys_store(skip, ring);
+         return;
+@@ -1138,7 +1164,7 @@ void resident_plan_set_mirror(const int32_t* d_res, int64_t n_entries, const uns
+ }
+ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
++                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err, int pcie_cap) {
+     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
+     for (int i = 0; i < g_n_mirrors; ++i) {
+         const MirrorReg& m = g_mirrors[i];
+@@ -1155,7 +1181,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
+                 exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                     resident_plan_kernel(ids, n_entries, k, res_layer, n_expert,
+                                          cache_base, slot_off, blob, plan, capx,
+-                                         skip, ring, mir, par, plan_err);
++                                         skip, ring, mir, par, plan_err, mir != nullptr ? pcie_cap : 0);
+                 });
+     }
+     check("resident_plan");
+-- 
+2.43.0
+

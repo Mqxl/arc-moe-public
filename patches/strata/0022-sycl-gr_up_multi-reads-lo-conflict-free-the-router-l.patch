@@ -1,0 +1,118 @@
+From 2b47e0d2a2d6ee284350c086ba2ae71db35ed7fb Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:58:11 +0000
+Subject: [PATCH] sycl: gr_up_multi reads lo conflict-free; the router launches
+ one sub-group per token
+
+gr_up_multi (110 us per call on the A770 for ~6.5 MB of weights) read its
+staged lo rows with each lane taking 8 consecutive floats: 32 bytes apart
+across the sub-group, bank conflicts in the SLM. lo is now staged chunk-
+interleaved and read with a stride (dot8s: the same products in the same
+order, so the same bits).
+
+The native router's work-groups were 8x32 with rows 1-7 returning at once;
+they are 1x32 now (the same work for row zero).
+---
+ sycl/src/kernels/cuda/fused_gr.dp.cpp      | 21 ++++++++++++++++++---
+ sycl/src/kernels/cuda/native_router.dp.cpp | 11 ++++++-----
+ 2 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/fused_gr.dp.cpp b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+index bd7efa8..554c66b 100644
+--- a/sycl/src/kernels/cuda/fused_gr.dp.cpp
++++ b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+@@ -63,6 +63,17 @@ __dpct_inline__ float sigmoidf_(float x) {
+ }
+ 
+ // 8 bf16 packed in a uint4 against 8 floats.
++// arc-moe: dot8 over x[0], x[stride], ... x[7 * stride] - the same products in the same order (same bits)
++__dpct_inline__ float dot8s(const sycl::uint4 w, const float *x, int stride) {
++    float acc = 0.0f;
++    const uint32_t v[4] = {w.x(), w.y(), w.z(), w.w()};
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        acc = sycl::fma(sycl::bit_cast<float>(v[j] << 16), x[(2 * j) * stride], acc);
++        acc = sycl::fma(sycl::bit_cast<float>(v[j] & 0xffff0000u), x[(2 * j + 1) * stride], acc);
++    }
++    return acc;
++}
+ __dpct_inline__ float dot8(const sycl::uint4 w, const float *x) {
+     float acc = 0.0f;
+     const uint32_t v[4] = {w.x(), w.y(), w.z(), w.w()};
+@@ -658,6 +669,7 @@ bool gr_down_direct() {   // default; STRATA_GR_DOWN_DIRECT=0: the tiled kernel
+     return v;
+ }
+ 
++constexpr int LRC = LR / 8;                       // arc-moe: 8-wide chunks of lo (40)
+ constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
+ constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
+ 
+@@ -688,7 +700,10 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+         for (int sp = 0; sp < DOWN_SPLIT; ++sp) if (sp < m.nsplit) x += m.part[((size_t) sp * kFusedGrMaxT + k) * LR + r];
+         x /= (float) HC;
+         const float v = x / (1.0f + sycl::native::exp(-x));
+-        lo[k][r] = v;
++        // arc-moe: staged chunk-interleaved, lo[k][j * LRC + c] = element 8c + j: a lane reads its chunk c with stride
++        // LRC, so the 32 lanes of a step read 32 consecutive floats (the [k][8c + j] layout had them 32 bytes apart:
++        // bank conflicts in Alchemist's SLM); dot8s takes the same products in the same order
++        lo[k][(r % 8) * LRC + r / 8] = v;
+         m.a[k].lo[r] = v;
+     }
+     /*
+@@ -729,8 +744,8 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+ #pragma unroll
+         for (int k = 0; k < kFusedGrMaxT; ++k) {
+             if (k >= T) break;
+-            float acc = dot8(wa, lo[k] + lane * 8);
+-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
++            float acc = dot8s(wa, lo[k] + lane, LRC);
++            if (lane < LR / 8 - 32) acc += dot8s(wb, lo[k] + 32 + lane, LRC);
+             acc = warp_sum(acc);
+             if (lane == k) mine = acc;
+         }
+diff --git a/sycl/src/kernels/cuda/native_router.dp.cpp b/sycl/src/kernels/cuda/native_router.dp.cpp
+index 121e34d..edcf59f 100644
+--- a/sycl/src/kernels/cuda/native_router.dp.cpp
++++ b/sycl/src/kernels/cuda/native_router.dp.cpp
+@@ -71,7 +71,8 @@ template <int NE>   // SYCL port: 512 (canonical) or 256 (the Coder) experts, 32
+ __dpct_inline__ void route(const float *__restrict__ logits,
+                            int32_t *__restrict__ ids,
+                            float *__restrict__ weights) {
+-    // Preserve the pinned 32x8 block geometry; only row zero is active here.
++    // Preserve the pinned 32x8 block geometry; only row zero is active here. (arc-moe: launched as 32x1 - the 7 idle
++    // rows were 7 more sub-groups per token for the GPU to start and retire; row zero's work is unchanged)
+     // blockIdx.x = the token (a multi-token launch; 0 for the single one)
+     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+     logits += (size_t)item_ct1.get_group(2) * NE;
+@@ -165,7 +166,7 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
+ 
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class route_60b296>>(
+-                sycl::nd_range<3>(sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
++                sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
+                 exp_props,
+                 [=](sycl::nd_item<3> item_ct1)
+                     [[sycl::reqd_sub_group_size(32)]] {
+@@ -204,8 +205,8 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
+         ((sycl::queue *)(strata::q_of(stream)))
+             ->parallel_for<dpct_kernel_name<class route_64c24f>>(
+                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tok) *
+-                                      sycl::range(1, 8, 32),
+-                                  sycl::range(1, 8, 32)),
++                                      sycl::range(1, 1, 32),
++                                  sycl::range(1, 1, 32)),
+                 exp_props,
+                 [=](sycl::nd_item<3> item_ct1)
+                     [[sycl::reqd_sub_group_size(32)]] {
+@@ -241,7 +242,7 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
+         throw std::invalid_argument("native router (multi, 256): a stream, 256 experts and aligned [n,256]/[n,10] buffers");
+     ((sycl::queue *)(strata::q_of(stream)))
+         ->parallel_for<dpct_kernel_name<class route_256_multi>>(
+-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
++            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
+             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); });
+ }
+ }
+-- 
+2.43.0
+

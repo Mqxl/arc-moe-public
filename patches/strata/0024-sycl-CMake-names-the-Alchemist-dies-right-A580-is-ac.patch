@@ -1,0 +1,26 @@
+From 194cbf55889a3db3e1a413f979faf54f7577a479 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:02:36 +0000
+Subject: [PATCH] sycl: CMake names the Alchemist dies right (A580 is acm-g10,
+ the Arc Pro A60 acm-g12)
+
+---
+ sycl/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index 5454128..f879778 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -21,7 +21,7 @@ endif()
+ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}-sycl")
+ 
+ set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
+-# arc-moe: Alchemist (Xe-HPG: acm-g10 = A770/A750, acm-g11 = A380, acm-g12 = A580, "dg2") has no FP64 unit.
++# arc-moe: Alchemist (Xe-HPG: acm-g10 = A770/A750/A580, acm-g11 = A380/A310, acm-g12 = Arc Pro A60, "dg2") has no FP64 unit.
+ # STRATA_SYCL_NO_FP64 turns the device reductions upstream writes in double into float (strata/sycl_fp.hpp);
+ # it is on by default whenever the AOT target is an Alchemist part.
+ set(_strata_alchemist OFF)
+-- 
+2.43.0
+
