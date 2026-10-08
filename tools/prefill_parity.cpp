@@ -97,6 +97,18 @@ int main(int argc, char** argv) {
             k::native_prefill_expert_grouped(L, ptr, start, ng, ddst, dtok, 3, nt, xq, scratch, out, q);
             q->wait_and_throw();
             q->memcpy(got.data(), out, got.size() * 4).wait();
+            // Compare against the decode entry point too: it always keeps the original DP4A arithmetic.
+            std::vector<float> baseline(got.size());
+            q->fill(out, NAN, got.size()).wait();
+            k::native_expert_grouped(L, ptr, start, ng, ddst, dtok, 3, nt, xq, scratch, out, q);
+            q->wait_and_throw();
+            q->memcpy(baseline.data(), out, baseline.size() * 4).wait();
+            double delta = 0, base_norm = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                delta += std::fabs((double)got[i] - baseline[i]);
+                base_norm += std::fabs((double)baseline[i]);
+            }
+            const double relative_delta = delta / (base_norm + 1e-30);
             double err = 0, norm = 0;
             bool finite = true;
             for (size_t i = 0; i < got.size(); ++i) {
@@ -105,9 +117,9 @@ int main(int argc, char** argv) {
                 norm += std::fabs((double)ref[i]);
             }
             const double relative = err / (norm + 1e-30);
-            const bool ok = finite && relative < 0.03; // same tolerance as upstream native_expert_parity
-            std::printf("layer %d type %d/%d rows %d: float-reference L1 relative %.6g %s\n",
-                        l, L.gu_type, L.d_type, nt, relative, ok ? "ok" : "FAIL");
+            const bool ok = finite && relative < 0.03 && relative_delta < 0.01; // same tolerance as upstream native_expert_parity
+            std::printf("layer %d type %d/%d rows %d: float-reference L1 relative %.6g, DP4A delta %.6g %s\n",
+                        l, L.gu_type, L.d_type, nt, relative, relative_delta, ok ? "ok" : "FAIL");
             failures += !ok;
             sycl::free(dx, *q); sycl::free(xq, *q); sycl::free(scratch, *q); sycl::free(out, *q);
             sycl::free(ptr, *q); sycl::free(start, *q); sycl::free(ng, *q); sycl::free(dtok, *q); sycl::free(ddst, *q);

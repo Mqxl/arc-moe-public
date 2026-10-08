@@ -1,0 +1,112 @@
+From 326d1be53038a13d5aa4a8324b5b8c7c2fb791b8 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 19:43:57 +0500
+Subject: [PATCH] sycl: opt-in complete prompt expert fusion with local hidden
+ activations
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 81 +++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 6d142a3..d96b2c4 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2694,6 +2694,70 @@ void launch_pf_xmx(unsigned groups, dpct::queue_ptr q, const unsigned long long*
+     });
+ }
+ 
++// Prompt-only full expert fusion: gate/up, SwiGLU/q8_1 and down in one work-group.
++// Hidden activations stay in local memory. The original three kernels remain the default.
++template <int TG, int NC>
++void launch_pf_fused(int groups, int entries, dpct::queue_ptr q,
++                     const unsigned long long* ptr, const int32_t* starts, const int32_t* ng,
++                     const int32_t* dst, const int32_t* tok, const block_q8_1* x,
++                     NativeExpertLayout L, float* out) {
++    const int tiles = std::clamp((entries + groups * NC - 1) / (groups * NC), 1, 64);
++    q->submit([&](sycl::handler& cgh) {
++        sycl::local_accessor<float, 1> H(sycl::range<1>((size_t)NC * L.n_ff), cgh);
++        sycl::local_accessor<block_q8_1, 1> HQ(sycl::range<1>((size_t)NC * (L.n_ff / 32)), cgh);
++        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t)tiles * 256), sycl::range<3>(1, 1, 256)),
++          [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
++#pragma clang fp contract(off)
++            const int g = it.get_group(1);
++            if (g >= *ng) return;
++            const int lane = it.get_local_id(2) & 31, warp = it.get_local_id(2) >> 5;
++            const int e1 = starts[g + 1], nf = (int)L.n_ff, nx = (int)L.n_embd;
++            auto* h = H.template get_multi_ptr<sycl::access::decorated::no>().get();
++            auto* hq = HQ.template get_multi_ptr<sycl::access::decorated::no>().get();
++            const uint8_t* blob = (const uint8_t*)ptr[g];
++            for (int e = starts[g] + (int)it.get_group(2) * NC; e < e1; e += tiles * NC) {
++                const int n = sycl::min(NC, e1 - e);
++                int xo[NC], ho[NC];
++#pragma unroll
++                for (int c = 0; c < NC; ++c) { xo[c] = tok[e + sycl::min(c, n - 1)] * (nx / 32); ho[c] = c * (nf / 32); }
++                for (int r = warp; r < nf; r += 8) {
++                    float gate[NC], up[NC];
++                    row_dot_multi<TG, NC>(blob + (size_t)r * L.gu_row, x, xo, n, nx / Fmt<TG>::qk, lane, gate);
++                    row_dot_multi<TG, NC>(blob + L.up_off + (size_t)r * L.gu_row, x, xo, n, nx / Fmt<TG>::qk, lane, up);
++#pragma unroll
++                    for (int c = 0; c < NC; ++c)
++                        if (c < n && lane == c) h[(size_t)c * nf + r] = (gate[c] / (1.f + sycl::exp(-gate[c]))) * up[c];
++                }
++                it.barrier(sycl::access::fence_space::local_space);
++                for (int b = warp; b < n * (nf / 32); b += 8) {
++                    const int i = b * 32 + lane;
++                    q8_1_store(h[i], hq, i);
++                }
++                it.barrier(sycl::access::fence_space::local_space);
++                for (int r = warp; r < nx; r += 8) {
++                    float val[NC];
++                    const block_q8_1* hx[NC];
++                    for (int c = 0; c < NC; ++c) hx[c] = hq + ho[sycl::min(c, n - 1)];
++                    row_dot_multi<42, 32, NC>(blob + L.down_off + (size_t)r * L.d_row, hx, nf / Fmt<42>::qk, lane, val);
++#pragma unroll
++                    for (int c = 0; c < NC; ++c)
++                        if (c < n && lane == c) out[(size_t)dst[e + c] * nx + r] = val[c];
++                }
++                it.barrier(sycl::access::fence_space::local_space);
++            }
++          });
++    });
++}
++
++template <int TG>
++void dispatch_pf_fused(int nc, int groups, int entries, dpct::queue_ptr q,
++                       const unsigned long long* ptr, const int32_t* starts, const int32_t* ng,
++                       const int32_t* dst, const int32_t* tok, const block_q8_1* x, NativeExpertLayout L, float* out) {
++    if (nc == 16) launch_pf_fused<TG, 16>(groups, entries, q, ptr, starts, ng, dst, tok, x, L, out);
++    else if (nc == 8) launch_pf_fused<TG, 8>(groups, entries, q, ptr, starts, ng, dst, tok, x, L, out);
++    else launch_pf_fused<TG, 4>(groups, entries, q, ptr, starts, ng, dst, tok, x, L, out);
++}
++
+ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+@@ -2707,6 +2771,23 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
+     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+     const auto* X = (const block_q8_1*) x_q8_1;
++    static const int fused_nc = [] {
++        const char* v = std::getenv("STRATA_PF_FUSE_EXPERT");
++        const int n = v ? std::atoi(v) : 0;
++        return n == 4 || n == 8 || n == 16 ? n : 0;
++    }();
++    if (prefill && fused_nc && L.d_type == 42 && (L.gu_type == 16 || L.gu_type == 22 || L.gu_type == 29) &&
++        L.n_ff % 32 == 0 && cap_groups > 0) {
++        const size_t local = (size_t)fused_nc * (L.n_ff * sizeof(float) + (L.n_ff / 32) * sizeof(block_q8_1));
++        if (local <= s->get_device().get_info<sycl::info::device::local_mem_size>()) {
++            if (L.gu_type == 16) dispatch_pf_fused<16>(fused_nc, cap_groups, cap_entries, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, L, out);
++            else if (L.gu_type == 22) dispatch_pf_fused<22>(fused_nc, cap_groups, cap_entries, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, L, out);
++            else dispatch_pf_fused<29>(fused_nc, cap_groups, cap_entries, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, L, out);
++            check("native_prefill_expert/fused");
++            return;
++        }
++    }
++
+     const bool v1 = g_grouped_v1;
+     // Only the dedicated prompt entry point selects wider tiles.
+     // Decode caps count token-expert pairs (up to 80), not tokens.
+-- 
+2.43.0
+

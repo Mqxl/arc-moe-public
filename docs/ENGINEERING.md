@@ -446,6 +446,196 @@ Its 3% L1 tolerance is the upstream native-expert test's (activation quantizatio
 DP4A, tile8 and tile16 pass with about 1.1-1.2% relative error. This test is correctness-only; timings come from
 `./arc profile`.
 
+### Q2_0 down tiles (patch 33)
+
+The diagnostic pack uses Q2_0 down (type 42), not IQ4_NL (type 20). Patch 33 widens this actual down
+path as well. `profile-20261008-022225.txt`, two replies per case with phase timing off:
+
+| prompt | DP4A (4 rows) | tile8 | tile16 |
+|---|---|---|---|
+| 2K prefill, tok/s | 249.9 / 271.8 | 277.6 / 304.3 | 286.6 / 312.9 |
+| 10K prefill, tok/s | 363.3 / 370.6 | 409.1 / 419.3 | 426.0 / 433.3 |
+| decode after 10K, median tok/s | about 30 | 30.0 | 29.9 |
+
+The tile16 10K median is 17% above four-row DP4A. `check-20261008-021323.txt` passes all 14 cases
+in base, own-buffers and one-gpu with tile16. The numerical parity test now also compares each output against
+the original DP4A kernel: all three tested gate/up formats and all four tail sizes have zero L1 delta for tile8
+and tile16. Decode still uses its original entry point.
+
+### Staging banks and phase timing (patch 34)
+
+Patch 34 adds opt-in STRATA_PF_STAGE_BANKS (2-4), STRATA_PF_STAGE_SLOTS (1-128),
+STRATA_PF_GROUPS (8-128) and STRATA_PF_BATCH_ROWS (up to the current chunk).
+It also enqueues a batch's copies before the phase timer waits for the previous compute.
+This changes phase instrumentation, not the ordinary untraced schedule.
+
+With tile16, profile-20261008-134607.txt measures:
+
+| banks / slots / group cap / row cap | 10K prefill tok/s, two requests |
+|---|---|
+| 2 / 32 / 64 / chunk | 426.5 / 433.5 |
+| 3 / 32 / 64 / chunk | 424.7 / 431.3 |
+| 3 / 16 / 64 / chunk | 418.3 / 424.1 |
+| 3 / 64 / 64 / chunk | 424.6 / 432.0 |
+| 3 / 32 / 32 / chunk | 420.9 / 427.4 |
+| 3 / 32 / 64 / 2048 | 382.5 / 390.0 |
+
+None wins: defaults remain two banks, 32 staging slots, 64 groups and the whole chunk.
+A-CP2 and A-CP3 both report wait copy at 13.7% for the complete 10K prompt.
+The synchronous phase timer still changes overlap, so this is a diagnostic result, not a speed gain.
+check-20261008-133701.txt passes all 14 cases in base, own-buffers and one-gpu with three banks.
+
+### Alchemist SG8 expert matrices (patch 35)
+
+The SG8 FP16 8x8x16 shape compiles and runs on ACM-G10. Numerical parity passes for all three
+real gate/up formats, shuffled entries and 7/17/65/160-row tails. It is slower than DP4A here:
+profile-20261008-142124.txt measures dual-card 10K at 426.9/432.6 tok/s with tile16,
+88.4/88.8 with 256 GRFs and 134.4/134.9 with 128 GRFs. Lowering the row threshold to one
+still gives 134.3/135.0. On one card profile-20261008-160840.txt measures 108.7/109.1 versus
+tile16 369.1/374.4. Keep XMX opt-in; legal matrix shapes alone do not imply a speed gain.
+
+### PCIe probe allocation (patch 36)
+
+The previous probe measured pageable malloc memory. STRATA_PCIE_PINNED_PROBE=1 uses USM host
+memory and host elapsed time through memcpy.wait_and_throw. The engine log reports 13.7-13.8 GB/s
+on the x16 card and 5.2 GB/s on the x4 card, versus about 9.3 and 4.5 with pageable memory.
+These are probe measurements, not effective expert-copy throughput.
+
+profile-20261008-160840.txt, two replies per case:
+
+| probe allocation | dual 10K tok/s | single 10K tok/s |
+|---|---|---|
+| pageable | 431.2 / 439.5 | 369.1 / 374.4 |
+| pinned | 430.6 / 438.5 | 369.1 / 374.5 |
+
+Probe pinning does not speed up prefill. The phase-timed pinned run still has 12.8% wait copy
+on the main stage. check-20261008-155935.txt passes all 14 cases in all three configurations.
+All seven profile runs finished; a shell tail parse error caused by editing a running script prevented
+its final summary. The script passes bash -n, and the summary was recovered from the original saved
+bench rows without rerunning or replacing measurements.
+
+The same profile finally compares tile16 against DP4A on one card: 369.1/374.4 versus 312.3/316.2
+on 10K, an 18.3% median improvement. Dual improvement is about 17%. Earlier single-card figures
+around 310 are not used as a matched baseline for this newer run.
+
+### Pinned copies of lent experts (patch 37)
+
+STRATA_PF_PIN_LOAN=1 copies immutable experts to USM host memory before their cache slots become
+prompt scratch. Pools use at most half of MemAvailable, one-GiB allocations, and retain the existing
+Stager fallback. These extra pinned copies are opt-in and consume additional RAM.
+
+check-20261008-163459.txt passes all 14 requests in each configuration. In
+profile-20261008-164542.txt (two replies, including initial pool preparation):
+
+| mode | dual 10K tok/s | single 10K tok/s |
+|---|---|---|
+| ordinary sources | 429.9 / 438.6 | 367.8 / 375.0 |
+| pinned loans | 411.6 / 451.0 | 369.2 / 382.3 |
+
+The warm dual request is 2.8% faster, but the two-request median is 0.7% slower; the single median
+is 1.2% faster. Do not enable this alone by default. Phase timing on the main stage reports
+wait copy 12.7% -> 10.7%, gather 313 -> 59 ms, and host staging 950 -> 535 ms for the second
+10K request. The requested <5% wait-copy target is not reached. These phase runs include observer
+synchronization and are not the final speed measurement.
+
+Inspection found that the later cache refill still uses the original source and drains its temporary
+blob ring every 256 entries. A separate experiment will reuse immutable pinned copies there and
+keep the ring drains only for fallback blobs. Startup preparation is tested separately from lazy pinning.
+
+### Early pinned expert copies (patch 38)
+
+STRATA_PF_PREFETCH_SLOTS=64/128/256 allocates a separate pool, limited to half the currently
+free VRAM, and issues pinned misses while attention runs. It must not use the tail of Xs: Xs
+aliases attention scratch. The first implementation considered that alias and was not executed;
+the shipped experiment uses disjoint memory. Default is zero.
+
+check-20261008-170142.txt passes all 14 cases in base, own-buffers and one-gpu.
+profile-20261008-171042.txt measures:
+
+| slots | dual 2K tok/s | dual 10K tok/s | single 2K tok/s | single 10K tok/s |
+|---|---|---|---|---|
+| 0 | 286.8 / 316.5 | 431.5 / 439.1 | 290.2 / 310.3 | 369.3 / 374.7 |
+| 64 | 286.9 / 316.6 | 432.4 / 441.6 | not measured | not measured |
+| 128 | 284.3 / 312.7 | 433.4 / 439.3 | 290.5 / 307.4 | 372.2 / 377.4 |
+| 256 | 280.4 / 306.3 | 433.6 / 439.8 | not measured | not measured |
+
+The dual 10K difference is below 0.5%; 128 reduces dual 2K by about 1.0%, and 256 by 2.8%.
+Single 128 gains 0.8% on 10K but loses 0.4% on 2K. This does not justify a default change.
+The current prefix-of-misses selection is not a routing-frequency predictor. It was tested with
+ordinary sources; combined tests with fully pinned loans may change its usefulness.
+The timed EP128 run has 9.6% wait copy on the main stage, still above the requested 5% target.
+
+### Host kernel failure during pipeline validation
+
+The first patch-39 check passed base and own-buffers (14 replies each), but the host
+became unreachable while loading one-gpu. EFI pstore survives the manual reboot:
+Linux 7.0.0-38 had already reported `BUG: Bad page state` / `compound_head not consistent`
+at 16:20 in i915 shmem allocation and cgroup reclaim, before patch 39 was applied.
+It later faulted in `lru_gen_del_folio` from the same allocation/reclaim path. The
+final console stack is process exit/TLB flushing. This is not a BROKEN-reply result
+and does not establish whether the original cause is kernel/driver or hardware.
+
+For the resumed experiments only, MGLRU was disabled through its runtime sysfs
+switch, and the test unit's explicit 44-GiB MemoryMax was removed. These changes
+are not portable engine defaults or a confirmed kernel fix. All subsequent A/B
+arms run under the same host settings; a final matched control is required rather
+than comparing across the reboot. No kernel/driver/firmware upgrade was performed.
+The complete previous-boot journal and EFI pstore were preserved separately.
+
+### Existing stage pipeline control (patch 39)
+
+The upstream prompt path already double-buffers hand-off rows and overlaps its two
+stages using std::async. Patch 39 adds STRATA_PF_PIPELINE=0 to wait immediately;
+mode 1 preserves existing behavior. MTP, PLE and checkpoint callbacks are retained.
+check-20261008-174420.txt passes all 42 requests after the host reboot.
+
+profile-20261008-181213.txt measures dual 10K 362.0/362.6 tok/s serial versus
+437.7/437.8 pipelined (+20.8% median); 4096-token chunks give 432.2/448.9.
+Single gives 373.7/374.0 versus 373.9/374.3; the switch has no single-stage effect.
+This exposes an existing benefit; it is not a newly obtained +21% above tile16.
+
+The normal profile's 32-token greedy comparison failed both across dual modes and
+across single modes. Independent fresh-request controls in
+profile-20261008-182245.txt compare serial repeat, pipeline repeat and serial versus
+pipeline: all 32 tokens and top-20 normalized log probabilities are identical
+(max delta 0). The preceding one-token repeat test also has delta 0. However,
+32-token single-card repeats still differ with identical mode settings. This
+baseline reproducibility limitation is unresolved; passing BROKEN-reply checks
+does not establish bitwise deterministic generation across process lifetimes.
+Keep the failed comparison files rather than calling those profiles entirely clean.
+Default pipeline remains 1; no new stage scheduling is enabled by this patch.
+
+### SG8 prompt attention (patch 40)
+
+STRATA_PROMPT_ATTN_XMX=16/32 enables legal Alchemist SG8 FP16 8x8x16 matrices
+with FP32 accumulators, Q high/low halves and register-held output accumulators.
+Default remains zero. tools/attention_parity.cpp tests int8 and FP16 KV against
+FP64, the FP32 kernel, shuffled page tables, 32768/1500/2100 contexts and the
+identity-to-sparse selection edge. Both chunk sizes pass their numerical bounds.
+
+The first mixed int8-K/Q4-V prototype failed the strict bound: max error from
+FP64 0.00184 versus FP32 4.15e-6 (about 2.6e-4 of output scale relative to FP32).
+Q4 products rounded to one FP16 V tile do not retain enough precision. The patch
+therefore refuses both Q4 keys and Q4 values; the caller retains its FP32 path.
+The parity tool separately verifies both Q4 fallbacks rather than pretending
+that those formats are accelerated. The failed prototype log is preserved.
+
+On 256-query synthetic int8/FP16 inputs, 16-cell SG8 takes roughly 16 ms versus
+8-10 ms for FP32; 32-cell SG8 is also slower on the short-context arms. These are
+kernel microbenchmarks, not final model throughput. check-20261008-184712.txt passes all 42 replies with SG8 enabled. The completed
+profile-20261008-185610.txt gives:
+
+| attention mode | dual 2K tok/s | dual 10K tok/s | single 2K tok/s | single 10K tok/s |
+|---|---|---|---|---|
+| FP32 | 283.9 / 316.5 | 429.8 / 439.8 | 275.2 / 308.5 | 366.5 / 374.5 |
+| SG8 CH16 | 266.5 / 298.7 | 384.2 / 392.9 | 272.8 / 292.9 | 326.1 / 331.3 |
+| SG8 CH32 | 278.5 / 309.5 | 412.5 / 421.9 | 287.5 / 303.9 | 351.6 / 356.7 |
+
+CH16 loses about 10.6% dual and 11.3% single on 10K; CH32 loses 4.0% and 4.4%.
+The small single 2K gain for CH32 does not offset long-prompt regression or the
+dual 2K loss. Keep the FP32 default. Legal XMX shapes and precise arithmetic
+are not sufficient for faster attention on Alchemist.
+
 ## What was verified here, and what was not
 
 | Check | Status |
@@ -456,5 +646,67 @@ DP4A, tile8 and tile16 pass with about 1.1-1.2% relative error. This test is cor
 | Host link of the engine | fails at `a5682fe` (#871 drift); links with patch 5 |
 | AOT build of `strata` for `acm-g10` with all 6 patches | **links**: 994 device modules built by IGC for acm-g10, 0 compiler errors (the 7 XMX modules are stubs now), 16 min on 4 cores; the 102 MB binary runs (`--help`) |
 | A tiny double kernel: `acm-g10` fails, `bmg-g21` builds | reproduced |
-| Run on an A770 | **not yet**: no Arc in the build machine. `./arc bench` reports the real numbers |
-| Kernel parity tests (`ARC_PARITY=ON`, `ctest`) on an A770 | not yet. Expect the tight-tolerance ones that compare against float64 references to report ulp differences |
+| Run on A770 | measured on one and two A770s with full reply checks and profiles; see rounds above |
+| Native prefill numeric parity on A770 | real GGUF experts tested against FP64/ggml and the original DP4A kernel; this does not claim that the entire upstream ctest suite passed |
+
+### Round 41: split-format gate/up row tiles
+
+`STRATA_PF_SPLIT_ROWS=4/8/16/auto` extends row reuse to native IQ2_XXS and IQ1_M (IQ2_S already had tile16). Real GGUF parity with shuffled mappings and row tails passes every mode; full check-20261008-191643.txt passes all 42 requests. Profile-20261008-192536.txt (128 output tokens, two runs) gives mean 10K prefill: dual 434.3 / 434.9 / 433.1 / 434.3 tok/s; single 370.9 / 371.2 / 370.4 / 371.8. This is noise, not a reason to change the default of 4. Dual 2K 308.4 / 311.4 / 308.9 also has no robust gain.
+
+### Screening policy for remaining candidates
+
+At the user's request, test potential speed gains before running the full stability matrix again. `ARC_PROFILE_SCREEN=1 ./arc profile` preserves two cold/warm measurements, uses 2K/10K with 32 output tokens for prefill candidates, and keeps normal lengths for decode/spec/short-read and parity diagnostics. Profiles record screening, cases, output length and run count explicitly; their short-output decode rates are not final throughput figures. Fusion retains real-weight numerical parity. A candidate losing over 5% in every measured dual-GPU prefill case skips redundant single-GPU screening (unmeasured single performance is not claimed). Only measured winners go through the full final check and normal-length profile. Host-copy rounds 43/44/45 remain separate patches but share one build; all experimental defaults stay off until justified.
+
+Screening also prunes SR256 in the card sweep: every measured agent/0.7K/2K prompt is at least 311 tokens, so thresholds 64 and 256 select exactly the same batched path. SR768 remains a distinct comparison. Lazy-loan refill sweep is omitted in favor of the matched eager-loan P2R0/P2R1 comparison, which isolates the same refill switch without extra server reloads. Unitrace graph/eager samples use short code and 64 generated tokens; normal decode throughput still uses code/prose with 128 tokens.
+
+### Round 42: fused native expert, rejected
+
+`STRATA_PF_FUSE_EXPERT=4/8/16` computes gate/up, SwiGLU, q8_1 hidden quantization and Q2_0 down in one work-group, using local hidden buffers and guarded row tails. Build succeeds; every mode passes real-GGUF FP64-reference/DP4A parity on IQ2_XXS/IQ2_S/IQ1_M, shuffled mappings and 7/17/65/160 rows, DP4A L1 difference about 3e-8. This does not make it faster. Screening profile-20261008-194950.txt (two runs, 32 output tokens): baseline means 2K302.1 / 10K434.0 tok/s; fuse4 134.3 / 272.1; fuse8 100.5 / 185.3. Fuse16 measured 2K23.0/23.4 versus baseline302.1 (over92% slower); its long tests were explicitly aborted under the user's fast-screening instruction. 10K fuse16 and all fused single-GPU speed figures are unmeasured, not inferred. The profile is interrupted and is not labelled a successful complete profile. All fused paths remain opt-in; default0 retains separate kernels. Larger local buffers and per-group work trade off occupancy/reuse; these measurements reject this design without claiming a verified low-level bottleneck.
+
+### Rounds 43/44: queued immutable refill and eager pinned loans
+
+Round43 `STRATA_PF_PIN_REFILL=1` restores borrowed cache slots directly from immutable pinned loan copies; the 256-buffer reuse drain is retained only for fallback pageable staging. Round44 `STRATA_PF_PIN_LOAN=2` prepares those bounded copies before READY, instead of doing it lazily in the first prompt (mode1). Both default off pending final validation. Budget and fallback are runtime-based; no PCI address, GPU count or model path hardcode is introduced.
+
+Screening profile-20261008-201005.txt, two runs with 32 output tokens: dual P0 2K301.1/10K433.9; P2R0 273.4/417.6; P2R1 329.4/473.5 tok/s. Single P0 298.1/370.9; P2R0 298.2/373.4; P2R1 320.55/391.6. Combined P2R1 is a real candidate (+9.1% dual10K, +5.6% single10K; +9.4%/+7.5%2K), not yet a validated default. Eager preparation alone is insufficient. The phase observer still reports 10.7% wait-copy on the primary stage, so the <5% target remains unmet; cache-restoration waits also occur outside this phase interval. Final normal-length matched controls and full stability matrix are required before adoption. Chunk/short-read/GDN/decode sweeps now use this candidate, since it changes the cost of the batched path. The single-card third staging bank regresses slightly (profile-20261008-202122.txt:2K319.6→312.7,10K391.6→389.9); keep2.
+
+One interaction probe is warranted: eager pinned copies make borrowed experts eligible for early prefetch, whereas the earlier round38 test with PIN0 could only prefetch the existing pinned mirror. `ARC_PROFILE_EARLY_COMBO=1` compares0/128 slots on P2R1; single-GPU arms run only if dual10K improves at least3% without a clear2K loss. No new kernel or rebuild is required.
+
+### E/F/H screening after the copy candidate
+
+Profile-20261008-202730.txt (P2R1, two10K runs,32 output tokens): dual GDN base467.5,keyhead357.8,heads462.8,serial465.6 tok/s. The keyhead variant loses23.5% and its single-GPU repetition is skipped. None justifies a new default. HC read is ~3.2% of the primary-stage timeline; retain its current path rather than add an unmeasured precision change. Profile-20261008-202122.txt tests two/three staging banks on one GPU; no third-bank benefit as recorded above.
+
+CARD screening uses normal128 output tokens for agent/short-read/spec; all knobs are measured on P2R1. Initial dual SR64 wall: agent3.94/3.03s,0.7K6.84/6.48s,2K10.49/10.19s. SR768:agent8.01/7.70s,0.7K15.33/15.06s,2K10.74/10.33s. Keep64; reducing batched overhead strengthens this choice.
+
+### Reboot at 21:28 and completed late screening
+
+The second host loss has a preserved previous-boot journal: at21:12, Linux7.0.0-38 reports list_del corruption in kswapd/isolate_lru_folios. The incorrect prev->next differs in one bit from the expected pointer. This is evidence of memory corruption, not proof of a DRAM fault or an engine cause. Disabling MGLRU did not prevent it (the second stack is classic LRU). No MCE or OOM diagnosis is established; BIOS remains1.08. The watcher now also stops on list corruption, which the old BUG/Oops pattern missed.
+
+Profile210736 rejects early128 on P2R1: dual10K mean473.85->468.3 and2K328.35->319.9; single repetition skipped. Profile210039 normal128 decode with graph: dualcode33.9/34.8,prose19.1/19.7;singlecode25.1/25.7,prose14.0/14.7. Traced64-token eager runs regress to10.5-11.8tok/s. Keep graph; these traced figures are not normal throughput. Single32-token eager repeats in profile210532 still differ, so disabling graph does not resolve the generation reproducibility limitation.
+
+DMA profile211052 was interrupted after dual arms and before the single arms. Real event clocks on P2R1 show primary pinned-loan15.25-15.29GB/s and mirror15.11-15.12GB/s;later-card pinned-loan4.93-5.16GB/s. Primary wait remains10.6-10.9%, not below5%. Do not claim25GB/s or completed single-copy clocks.
+
+CARD203752 contains failed2K own-buffer2048 requests (HTTP400/503), with user-space SIGSEGV in libur_loader on both card configurations. Both are rejected; ordinary measured10K also regresses. The old bench masked API errors if other cases succeeded. tools/bench.py now records failed rows and returns3 for any API/transport error; a synthetic failure+success regression confirms this. Error-body handling excludes authentication bodies and redacts keys. The old CARD file is marked incomplete, not a clean stability result. Single spec6 code25.2/25.7 versus spec8 24.2/23.7 confirms keeping6 for code; prose remains13.9-14.6, so35-40tok/s cannot be claimed for every output type.
+
+### Follow-up goals: throughput and 128K
+
+The current model shard metadata reports qwen4exp.context_length262144 and RoPE base10000000;128K is within that declared limit. This does not establish memory fit or actual long-context quality in this port. Added a counted120K-126K request with audit-label retrieval and a >131072-token overflow control, plus normal API/agent benchmarks. Context expansion is kept separate from32K measured defaults until verified. Layer-placement screening compares auto with explicit34/28/24 and foreign dense-weight trimming, preserving precision, copy flags and normal128 output length. No1000tok/s result has been measured.
+
+### Validated copy default at32K
+
+check-20261008-213531.txt passes all42 requests (base,own-buffers,one-gpu), including both10K rows per configuration. Normal128-output profile-20261008-214426.txt completes all arms with the corrected bench. P0/R0 control versus P2/R1 means: dual10K435.95->474.15 (+8.8%),2K312.65->337.2 (+7.9%);single10K371.7->390.85 (+5.2%),2K309.1->323.1 (+4.5%). Dual0.7K242.75->245.3 is noise;single210.75->210.65 unchanged. Defaults now choose PIN_LOAN2/PIN_REFILL1 with bounded allocation/fallback. Extra pinned RAM is roughly6.9GiB dual /3.4GiB single for the current loans; this is not free memory savings.
+
+Actual normal decode after10K is dual29.6 versus31.1 control andsingle22.35 versus22.45; the two-run dual difference is preserved, not called an improvement. Short code is33.9/34.8 dual and25.2/25.7 single;Russianprose18.7/19.2 and14.0/14.7. Agent tool stream38.3/38.8 dual,26.2/26.6 single has only26 generated tokens. These figures must not be generalized to stable35-40tok/s after every prompt.
+
+The residency knob UR_L0_USM_RESIDENT is supported by the installed legacy adapter but absent from the installed v2 library strings;process maps confirmv2. Intel's adapter-specific documentation also lists the equivalent legacy knob asLegacy-only (https://github.com/intel/llvm/blob/sycl/sycl/doc/EnvironmentVariables.md). No inert residency variable was made a default, and no reliability fix is claimed.
+
+### Stage placement tradeoffs
+
+Normal128-output profile215453, two runs per case, P2R1: auto34/14 means10K473.5,short-code33.45,after10K31.35,Russianprose19.25tok/s. Explicit34+trim gives474.6/35.9/29.4/19.75;28+trim446.9/37.6/33.15/18.1;24+trim420.9/34.6/27.5/16.0. These are tradeoffs, not a general faster prefill. None meets the no-clear-regression selector: keep auto for the128K capacity probe. A coding-focused user may prefer28+trim, but its~5.6%long-prefill and~6%prose losses must be visible. The1:1 placement does not help on the x16/x4 pair. Temperatures reached84C upper/72C lower in the sampled sweep without recorded thermal-throttle flags; this does not prove cooling can be ignored indefinitely.
+
+### Host RAM integrity failure blocks further stability claims
+
+Before the128K capacity probe, CPU-only memtester4.6.0 tested4GiB of successfully mlocked memory with no Strata engine running. It completed with exit4 and8 FAILURE comparisons across SolidBits,BlockSequential,Checkerboard and later patterns. Seven show XOR0x0004000000000000 (bit50), the same bit as the21:12 corrupted kernel pointer;one shows bit4. Logs are retained under test-logs and copied separately. This is direct evidence of host memory integrity failure independent of active model inference, but userspace offsets do not identify a DIMM or distinguish DRAM/controller/board. The machine has two8GB Kingston and two16GB A-DATA modules, all reported at2400MT/s, no ECC. A shorter fresh CPU confirmation was launched with SolidBits/Checkerboard only.
+
+The shell chain stopped on memtester's failure, before creating a128K config or issuing128K inference. No128K capacity, quality, throughput or editor compatibility result is claimed. GPU/server tests are left stopped pending repair of host memory integrity;8790 was not started. All earlier speed tables describe observed measurements, not long-term host stability or a proven performance ceiling. New1024+prefill designs should be screened only after the host passes memory tests.
+
+The fresh4GiB confirmation using only SolidBits/Checkerboard (MEMTESTER_TEST_MASK0x500) completed exit0. This narrower pass does not clear the earlier8 failures or test all48GiB. Full offline per-module testing is needed; no module is declared faulty solely from these offsets.

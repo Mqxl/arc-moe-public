@@ -1,0 +1,106 @@
+From e873ad524dd8ae1706e65c113ff314210eda6c30 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 19:11:08 +0500
+Subject: [PATCH] sycl: opt-in 8/16-row prefill reuse for split IQ2_XXS and
+ IQ1_M gate/up
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 39 ++++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 11 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index d6d5fa1..6d142a3 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -1428,7 +1428,7 @@ __dpct_inline__ void native_gu_kernel(
+ // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
+ constexpr int GRP_NC = 4;
+ 
+-template <int TG>
++template <int TG, int NC = GRP_NC>
+ __dpct_inline__ void native_gu_multi_kernel(
+     const unsigned long long *__restrict__ grp_ptr,
+     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+@@ -1450,16 +1450,16 @@ __dpct_inline__ void native_gu_multi_kernel(
+          item_ct1.get_group_range(1)) { // the group stride, as native_gu_kernel
+         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+-        for (int e = e0; e < e1; e += GRP_NC) {
+-            const int n = sycl::min(GRP_NC, e1 - e);
+-            int off[GRP_NC];
++        for (int e = e0; e < e1; e += NC) {
++            const int n = sycl::min(NC, e1 - e);
++            int off[NC];
+ #pragma unroll
+-            for (int c = 0; c < GRP_NC; ++c)
++            for (int c = 0; c < NC; ++c)
+                 off[c] = ent_tok[e + sycl::min(c, n - 1)] * xb;
+-            float s[GRP_NC];
+-            row_dot_multi<TG, GRP_NC>(wr, xq, off, n, nb, lane, s);
++            float s[NC];
++            row_dot_multi<TG, NC>(wr, xq, off, n, nb, lane, s);
+ #pragma unroll
+-            for (int c = 0; c < GRP_NC; ++c)
++            for (int c = 0; c < NC; ++c)
+                 if (c < n && lane == c) dst[(size_t) (e + c) * L.n_ff + r] = s[c];
+         }
+     }
+@@ -2273,7 +2273,7 @@ void launch_down_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long l
+     }
+ }
+ 
+-template <int TG>
++template <int TG, int NC = GRP_NC>
+ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+                const unsigned long long *grp_ptr, const int32_t *grp_start,
+                const int32_t *n_groups, const int32_t *ent_tok,
+@@ -2293,13 +2293,13 @@ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+         s->submit([&](sycl::handler &cgh) {
+ 
+             cgh.parallel_for<dpct_kernel_name<
+-                class native_gu_multi_kernel_37f479, dpct_kernel_scalar<TG>>>(
++                class native_gu_multi_kernel_37f479, dpct_kernel_scalar<TG>, dpct_kernel_scalar<NC>>>(
+                 sycl::nd_range<3>(dpct::dim3((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), grid.y) * sycl::range(1, 1, 256),
+                                   sycl::range(1, 1, 256)),
+                 exp_props,
+                 [=](sycl::nd_item<3> item_ct1)
+                     [[sycl::reqd_sub_group_size(32)]] {
+-                        native_gu_multi_kernel<TG>(grp_ptr, grp_start, n_groups,
++                        native_gu_multi_kernel<TG, NC>(grp_ptr, grp_start, n_groups,
+                                                    ent_tok, X, L, gate, up);
+                     });
+         });
+@@ -2717,6 +2717,15 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+         return 4; // dp4a: measured baseline, wider kernels opt-in
+     }();
+     const int rows = prefill && !v1 ? pf_rows : 4;
++    static const int split_rows = [] {
++        const char* v = std::getenv("STRATA_PF_SPLIT_ROWS");
++        if (v && !std::strcmp(v, "auto")) return -1;
++        const int n = v ? std::atoi(v) : 4;
++        return n == 8 || n == 16 ? n : 4;
++    }();
++    const int average_rows = cap_groups > 0 ? (int)(cap_entries / cap_groups) : 0;
++    const int nc = !prefill || v1 ? 4 : split_rows < 0 ? (average_rows >= 32 ? 16 : average_rows >= 8 ? 8 : 4) : split_rows;
++
+     static const bool pf_xmx = [] {
+         const char* v = std::getenv("STRATA_PF_EXPERT_KERNEL");
+         return v && std::strcmp(v, "xmx") == 0;
+@@ -2744,6 +2753,14 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     else if (rows > 4 && L.gu_type == 22) {
+         if (rows == 8) launch_gu_port<22, 32, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         else launch_gu_port<22, 32, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++    } else if (nc > 4 && (L.gu_type == 16 || L.gu_type == 29)) {
++        if (L.gu_type == 16) {
++            if (nc == 8) launch_gu<16, 8>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++            else launch_gu<16, 16>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        } else {
++            if (nc == 8) launch_gu<29, 8>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++            else launch_gu<29, 16>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        }
+     } else switch (L.gu_type) {
+ #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+         STRATA_GU_FMTS(STRATA_GU)
+-- 
+2.43.0
+

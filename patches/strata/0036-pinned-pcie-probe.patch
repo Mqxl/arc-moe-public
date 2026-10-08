@@ -1,0 +1,88 @@
+From 0e061a8c70415f5d206636dee0a70c6a7ffa9d28 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 15:54:41 +0500
+Subject: [PATCH] sycl: opt-in pinned PCIe probe with host wall timing
+
+---
+ sycl/src/program/generate.cpp | 47 ++++++++++-------------------------
+ 1 file changed, 13 insertions(+), 34 deletions(-)
+
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 9fa3f05..c1ce38e 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -1211,12 +1211,15 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
+ double probe_pcie_h2d_gbps(std::string *samples = nullptr) try {
+     constexpr size_t kBytes = 256ull << 20;
+     constexpr int kBursts = 4;
++    const char* pinned_env = std::getenv("STRATA_PCIE_PINNED_PROBE");
++    const bool pinned = pinned_env && pinned_env[0] == '1';
+     void* h = nullptr;
+     void* d = nullptr;
+-    if (DPCT_CHECK_ERROR(h = (void *)malloc(kBytes)) != 0) return -1.0;
++    h = pinned ? sycl::malloc_host(kBytes, dpct::get_in_order_queue()) : malloc(kBytes);
++    if (!h) return -1.0;
+     if (DPCT_CHECK_ERROR(d = (void *)sycl::malloc_device(
+                              kBytes, dpct::get_in_order_queue())) != 0) {
+-        free(h);
++        if (pinned) sycl::free(h, dpct::get_in_order_queue()); else free(h);
+         return -1.0;
+     }
+     std::memset(h, 0, kBytes);   // fault the pages in before timing
+@@ -1241,37 +1244,13 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr) try {
+         ms[b] = (float) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+     }
+ #else
+-    // the bursts run back to back on the stream, an event between each two
+-    dpct::event_ptr ev[kBursts + 1];
+-    int n_ev = 0;
+-    while (n_ev <= kBursts &&
+-           DPCT_CHECK_ERROR(ev[n_ev] = new sycl::event()) == 0)++ n_ev;
+-    bool ok = n_ev == kBursts + 1;
+-    if (ok) {
+-        dpct::sync_barrier(ev[0]);
+-        for (int b = 0; b < kBursts; ++b) {
+-            /*
+-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
+-            API. While the origin API might be synchronous, it depends on the
+-            type of operand memory, so you may need to call wait() on event
+-            return by memcpy API to ensure synchronization behavior.
+-            */
+-            dpct::get_in_order_queue().memcpy(d, h, kBytes).wait();
+-            dpct::sync_barrier(ev[b + 1]);
+-        }
+-        ok = DPCT_CHECK_ERROR(ev[kBursts]->wait_and_throw()) == 0;
+-        for (int b = 0; b < kBursts && ok; ++b) ok =
+-            DPCT_CHECK_ERROR(
+-                ms[b] =
+-                    (ev[b + 1]
+-                         ->get_profiling_info<
+-                             sycl::info::event_profiling::command_end>() -
+-                     ev[b]
+-                         ->get_profiling_info<
+-                             sycl::info::event_profiling::command_start>()) /
+-                    1000000.0f) == 0;
+-    }
+-    for (int i = 0; i < n_ev; ++i) dpct::destroy_event(ev[i]);
++    // Host wall timing includes enqueue and wait overhead; pinned USM avoids pageable staging.
++    bool ok = true;
++    for (int b = 0; b < kBursts && ok; ++b) {
++        const Clock::time_point t0 = Clock::now();
++        dpct::get_in_order_queue().memcpy(d, h, kBytes).wait_and_throw();
++        ms[b] = (float) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
++    }
+ #endif
+     double bw = -1.0;
+     if (samples != nullptr) samples->clear();
+@@ -1291,7 +1270,7 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr) try {
+     */
+     if (!ok)(void) 0;
+     sycl::free(d, dpct::get_in_order_queue());
+-    free(h);
++    if (pinned) sycl::free(h, dpct::get_in_order_queue()); else free(h);
+     return bw;
+ }
+ catch (sycl::exception const &exc) {
+-- 
+2.43.0
+

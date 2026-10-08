@@ -1,0 +1,95 @@
+From cc5df75415839b01e5619e7d502105d808ad95ca Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 13:32:12 +0500
+Subject: [PATCH] sycl: tune prefill staging banks and preserve copy overlap in
+ timing
+
+---
+ sycl/src/prefill/prefill.cpp | 29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index e11cd6a..b2dc1ad 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -3327,7 +3327,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         if (grouped_l) {
+                             // ---- arc-moe: the grouped walk.  Xs (T*K*N halves) is carved into: q8_1 activations
+                             // (T rows), the entry index (T ints), a group table, the kernels' scratch for T entries
+-                            // (no expert has more rows than tokens) and two halves of blob staging.  A batch is the
++                            // (no expert has more rows than tokens) and configurable banks of blob staging. A batch is the
+                             // next experts in id order (their rows are contiguous) up to `half` streamed ones, 64
+                             // groups or T rows; its host blobs are copied into one half while the other half's batch
+                             // computes, and the half is copied into again only after the kernel that read it.
+@@ -3339,12 +3339,25 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             const size_t avail = (size_t) T * K * N * sizeof(uint16_t);
+                             const size_t xq_b = al((size_t) T * (size_t) (N / 32) * 36);
+                             const size_t io_b = al((size_t) T * 4);
+-                            constexpr int kGrpMax = 64;
++                            static const int kGrpMax = [] {
++                                const char* v = std::getenv("STRATA_PF_GROUPS");
++                                return v ? std::clamp(std::atoi(v), 8, 128) : 64;
++                            }();
++                            static const int banks = [] {
++                                const char* v = std::getenv("STRATA_PF_STAGE_BANKS");
++                                return v ? std::clamp(std::atoi(v), 2, 4) : 2;
++                            }();
++                            static const int slots = [] {
++                                const char* v = std::getenv("STRATA_PF_STAGE_SLOTS");
++                                return v ? std::clamp(std::atoi(v), 1, 128) : 32;
++                            }();
++                            const char* rows_env = std::getenv("STRATA_PF_BATCH_ROWS");
++                            const int64_t batch_rows = rows_env ? std::clamp<int64_t>(std::atoll(rows_env), 1, T) : T;
+                             const size_t gt_b = al(16 + (kGrpMax + 1) * 4) + kGrpMax * 8;
+                             const size_t sc_b = al(strata::kernels::native_expert_scratch_bytes(T, f.n_ff));
+                             const size_t blob = (size_t) lay.blob_bytes(l), slot_b = al(blob);
+                             const size_t fixed = xq_b + io_b + al(gt_b) + sc_b;
+-                            const int64_t half = fixed < avail ? std::min<int64_t>(32, (int64_t) ((avail - fixed) / slot_b) / 2) : 0;
++                            const int64_t half = fixed < avail ? std::min<int64_t>(slots, (int64_t) ((avail - fixed) / slot_b) / banks) : 0;
+                             if (half < 1) { err = "prefill (grouped experts): the chunk's buffers are too small"; return false; }
+                             uint8_t* xq = base;
+                             int32_t* iota = (int32_t*) (base + xq_b);
+@@ -3362,7 +3375,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             if (m.pfg_host.size() < ((size_t) m.g->n_expert + 1) * al(gt_b))
+                                 m.pfg_host.assign(((size_t) m.g->n_expert + 1) * al(gt_b), 0);
+                             size_t host_off = 0;
+-                            sycl::event kev[2];                // the last kernel that read each staging half
++                            sycl::event kev[4];                // last reader of each staging bank
+                             int hcur = 0;
+                             size_t j = 0;
+                             while (j < order.size()) {
+@@ -3378,11 +3391,10 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 bool waited = false;
+                                 sycl::event last_copy;
+                                 bool copied_any = false;
+-                                pt.mark(kPfWaitCopy, cs);
+                                 while (j < order.size() && (int) (j - j0) < kGrpMax) {
+                                     const int32_t e = order[j];
+                                     const int32_t c = m.cnt[(size_t) e];
+-                                    if (row1 + c - row0 > (int32_t) T) break;
++                                    if (row1 > row0 && row1 + c - row0 > batch_rows) break; // one expert always fits T
+                                     const bool res = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                                     if (!res && streamed == half) break;
+                                     const int g = (int) (j - j0);
+@@ -3420,6 +3432,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 if (ng == 0) { err = "prefill (grouped experts): an expert fits no batch"; return false; }
+                                 h_n[0] = ng;
+                                 h_start[ng] = row1 - row0;
++                                // Enqueue the copies before the phase timer waits for previous compute.
++                                // Otherwise A serializes copy/compute and cannot measure overlap.
++                                pt.mark(kPfWaitCopy, cs);
+                                 m.cs->memcpy(gdev, hb, gt_b);
+                                 if (copied_any) m.cs->ext_oneapi_submit_barrier({last_copy});
+                                 pt.mark(kPfGemmGU, cs);
+@@ -3436,7 +3451,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 }
+                                 if (copied_any) {
+                                     kev[hcur] = m.cs->ext_oneapi_submit_barrier();
+-                                    hcur ^= 1;
++                                    hcur = (hcur + 1) % banks;
+                                 }
+                                 host_off += al(gt_b);
+                             }
+-- 
+2.43.0
+

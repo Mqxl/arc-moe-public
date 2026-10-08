@@ -65,7 +65,7 @@ def call(url: str, key: str | None, prompt: str, max_tokens: int, extra: dict | 
         if not body.get("stream"):
             res = json.load(r)
         else:   # SSE: the text and tool calls from the deltas, timings/usage from whichever chunk carries them
-            res, text, calls = {}, "", 0
+            res, text, calls = {}, "", {}
             for raw in r:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:") or line[5:].strip() == "[DONE]":
@@ -77,8 +77,15 @@ def call(url: str, key: str | None, prompt: str, max_tokens: int, extra: dict | 
                 for c in ch.get("choices") or []:
                     d = c.get("delta") or {}
                     text += (d.get("content") or "") + (d.get("reasoning_content") or d.get("reasoning") or "")
-                    calls += len(d.get("tool_calls") or [])
-            res["choices"] = [{"message": {"content": text, "tool_calls": [{}] * calls}}]
+                    for tc in d.get("tool_calls") or []:
+                        index = tc.get("index", 0)
+                        acc = calls.setdefault(index, {"function": {"name": "", "arguments": ""}})
+                        for field in ("id", "type"):
+                            if tc.get(field): acc[field] = tc[field]
+                        fn = tc.get("function") or {}
+                        for field in ("name", "arguments"):
+                            acc["function"][field] += fn.get(field) or ""
+            res["choices"] = [{"message": {"content": text, "tool_calls": [calls[i] for i in sorted(calls)]}}]
     res["_wall"] = time.time() - t
     return res
 
@@ -142,6 +149,7 @@ def main() -> int:
     rows = []
     print(f"{'prompt':18s} {'run':>3s} {'in':>6s} {'out':>5s} {'prompt tok/s':>13s} {'decode tok/s':>13s} {'wall s':>7s}")
     n_broken = 0
+    n_errors = 0
     for name, prompt, extra in cases:
         for i in range(a.runs):
             if extra and extra.get("tools"):
@@ -150,7 +158,25 @@ def main() -> int:
             try:
                 res = call(a.url, a.api_key, prompt + ("" if i == 0 else f" (#{i})"), a.max_tokens, extra)
             except OSError as e:
-                print(f"{name:18s} {i + 1:3d}  failed: {e}")
+                n_errors += 1
+                detail = str(e)
+                # Keep useful engine errors without exposing authentication responses or the key.
+                if isinstance(e, urllib.error.HTTPError) and e.code not in (401, 403):
+                    body = e.read(2048).decode("utf-8", errors="replace")
+                    try:
+                        error = json.loads(body).get("error", {})
+                        message = error.get("message", "") if isinstance(error, dict) else str(error)
+                    except (ValueError, AttributeError):
+                        message = "unparseable error response (body omitted)"
+                    if a.api_key:
+                        message = message.replace(a.api_key, "[REDACTED]")
+                    if message:
+                        detail += ": " + message[:1000]
+                if a.api_key:
+                    detail = detail.replace(a.api_key, "[REDACTED]")
+                rows.append({"case": name, "run": i + 1, "prompt_tokens": None, "tokens": None,
+                             "prompt_tps": None, "decode_tps": None, "wall": None, "error": detail})
+                print(f"{name:18s} {i + 1:3d}  failed: {detail}")
                 continue
             t = res.get("timings") or {}
             u = res.get("usage") or {}
@@ -175,11 +201,13 @@ def main() -> int:
             print(f"{name:18s} decode: median {statistics.median(d):.1f} tok/s (min {min(d):.1f}, max {max(d):.1f})")
     if a.json:
         Path(a.json).write_text(json.dumps(rows, indent=1))
+    if n_errors:
+        print(f"\n{n_errors} API request(s) failed; this run is incomplete")
     if n_broken:
         print(f"\n{n_broken} broken repl{'y' if n_broken == 1 else 'ies'} (see BROKEN REPLY above): "
               f"restart with STRATA_DBG_NAN=1 and send the engine log")
         return 3
-    return 0
+    return 3 if n_errors else 0
 
 
 if __name__ == "__main__":

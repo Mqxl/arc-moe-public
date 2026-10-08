@@ -1,0 +1,203 @@
+From 1e98c7ba99b1a9a6e3434d18ae6a833147d9e571 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 16:30:03 +0500
+Subject: [PATCH] sycl: opt-in pinned host copies of experts lent to prompt
+ scratch
+
+---
+ include/strata/prefill/prefill.hpp |  3 ++
+ sycl/src/prefill/prefill.cpp       | 81 ++++++++++++++++++++++++++----
+ sycl/src/program/generate.cpp      |  7 +++
+ 3 files changed, 82 insertions(+), 9 deletions(-)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 15df6e4..dd3ea13 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -72,6 +72,9 @@ public:
+     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+     int64_t chunk() const;
+ 
++    /// Opt-in pinned host copies of immutable experts before their slots become prompt scratch.
++    bool pin_lent_slots(const std::vector<std::pair<int32_t, int32_t>>& slots, std::string& err);
++
+     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
+     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
+     static void set_pinned_share(double share);
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index b2dc1ad..56965dc 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -44,6 +44,8 @@
+ #include <condition_variable>
+ #include <cstring>
+ #include <future>
++#include <fstream>
++#include <unordered_map>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -555,6 +557,7 @@ struct Prefill::Impl {
+     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
+     // arc-moe (grouped experts): each batch's group table, uploaded from here (kept alive until the layer's wait)
+     std::vector<uint8_t> pfg_host;
++    std::unordered_map<int32_t, uint8_t*> pinned_loan;
+     dpct::event_ptr copied[RING_MAX] = {}, used[RING_MAX] = {};
+     bool stage_live[RING_MAX] = {};
+     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
+@@ -1048,6 +1051,58 @@ bool Prefill::carve(size_t T, void* alloc) {
+     return ok;
+ }
+ 
++bool Prefill::pin_lent_slots(const std::vector<std::pair<int32_t, int32_t>>& slots, std::string& err) {
++    const char* v = std::getenv("STRATA_PF_PIN_LOAN");
++    if (!v || v[0] != '1' || slots.empty()) return true;
++    Impl& m = *impl_;
++    const auto& layout = strata::kernels::cpu::expert_layout();
++    if (!m.cache || !m.g || !layout.native) return true;
++    uint64_t available = 0;
++    std::ifstream info("/proc/meminfo");
++    std::string line;
++    while (std::getline(info, line))
++        if (line.rfind("MemAvailable:", 0) == 0) available = std::strtoull(line.c_str() + 13, nullptr, 10) * 1024;
++    // Keep half of currently available host RAM. If pinning is unavailable the existing Stager stays active.
++    uint64_t budget = available / 2;
++    size_t needed = 0;
++    for (const auto& en : slots) if (!m.pinned_loan.count(en.first))
++        needed += (layout.blob_bytes(en.first / m.g->n_expert) + 255) & ~(size_t)255;
++    if (!needed || !budget) return true;
++    uint8_t* chunk = nullptr;
++    size_t left = 0, bytes = 0;
++    int count = 0;
++    sycl::event done;
++    const auto start = Clock::now();
++    try {
++        for (const auto& en : slots) {
++            if (m.pinned_loan.count(en.first)) continue;
++            const size_t blob = layout.blob_bytes(en.first / m.g->n_expert);
++            const size_t stride = (blob + 255) & ~(size_t)255;
++            if (stride > left) {
++                const size_t take = std::min<uint64_t>({1ull << 30, budget, needed});
++                if (take < stride) break;
++                try { chunk = (uint8_t*)sycl::malloc_host(take, *m.copy); }
++                catch (const sycl::exception&) { chunk = nullptr; }
++                if (!chunk) break;
++                m.owned.push_back(chunk);
++                budget -= take;
++                left = take;
++            }
++            done = m.copy->memcpy(chunk, m.cache->device_slot(en.second), blob);
++            m.pinned_loan.emplace(en.first, chunk);
++            chunk += stride; left -= stride; needed -= stride;
++            bytes += blob; ++count;
++        }
++        if (count) done.wait_and_throw();
++    } catch (const std::exception& ex) {
++        err = std::string("prefill: pinning lent experts: ") + ex.what();
++        return false;
++    }
++    if (count) std::fprintf(stderr, "strata prefill: pin loan %d experts, %.1f MiB in %.1f ms; pinned entries %zu\n",
++                           count, bytes / 1048576.0, ms_since(start), m.pinned_loan.size());
++    return true;
++}
++
+ bool Prefill::relayout(int64_t chunk, void *borrow, uint64_t borrow_bytes,
+                        std::string &err) try {
+     Impl& m = *impl_;
+@@ -1650,6 +1705,14 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+     core::SessionState& ss = *m.ss;
+     const auto t_start = Clock::now();
+     const int64_t LB = stage_lb_, LE = stage_le_;
++    auto source_pinned = [&](int64_t layer, int64_t expert) {
++        return m.pinned_loan.count((int32_t)(layer * m.g->n_expert + expert)) || m.src->pinned(layer, expert);
++    };
++    auto source_blob = [&](int64_t layer, int64_t expert) -> const uint8_t* {
++        const auto it = m.pinned_loan.find((int32_t)(layer * m.g->n_expert + expert));
++        return it != m.pinned_loan.end() ? it->second : m.src->blob(layer, expert);
++    };
++
+     // the next stage reads chunk c on a thread while this one reads chunk c + 1 (declared first: an early return
+     // waits for it before anything it reads goes away)
+     std::string next_err;
+@@ -1978,9 +2041,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         job = (int) js.size();
+                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
+                     } else {
+-                        b = m.src->blob(l, e);
++                        b = source_blob(l, e);
+                         if (!b) { err = "prefill: expert source has no blob"; return false; }
+-                        if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
++                        if (ps_on && source_pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
+                             ps_acc += m.pp->ps_frac;
+                             if (ps_acc >= 1.0) {
+                                 ps_acc -= 1.0;
+@@ -1989,7 +2052,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 continue;
+                             }
+                         }
+-                        if (!m.src->pinned(l, e)) {
++                        if (!source_pinned(l, e)) {
+                             job = (int) js.size();
+                             js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                         }
+@@ -3113,7 +3176,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             for (size_t j = 0; j < order.size(); ++j) {
+                                 const int32_t e = order[j];
+                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+-                                if (m.src->pinned(l, e)) continue;
++                                if (source_pinned(l, e)) continue;
+                                 job_of[j] = (int) js.size();
+                                 if (gsrc != nullptr) {   // SYCL port: --stream-experts - the stager's thread reads it from the GGUF
+                                 js.push_back({nullptr, (size_t) lay.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
+@@ -3123,7 +3186,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                     js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                                     continue;
+                                 }
+-                                const uint8_t* b = m.src->blob(l, e);
++                                const uint8_t* b = source_blob(l, e);
+                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
+                                 js.push_back({b, (size_t) lay.blob_bytes(l)});
+                             }
+@@ -3138,8 +3201,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             const int sl = stage_next;
+                             stage_next = (stage_next + 1) % STAGE;
+                             const auto th = Clock::now();
+-                            const bool pinned = m.src->pinned(l, e);   // pinned: never transient
+-                            const uint8_t* b = pinned ? m.src->blob(l, e) : nullptr;
++                            const bool pinned = source_pinned(l, e);   // pinned: never transient
++                            const uint8_t* b = pinned ? source_blob(l, e) : nullptr;
+                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
+                             if (pinned) {
+                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
+@@ -3409,8 +3472,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                         }
+                                         uint8_t* dst = stage + (size_t) streamed * slot_b;
+                                         const auto th = Clock::now();
+-                                        if (m.src->pinned(l, e)) {
+-                                            const uint8_t* b = m.src->blob(l, e);
++                                        if (source_pinned(l, e)) {
++                                            const uint8_t* b = source_blob(l, e);
+                                             if (!b) { err = "prefill: expert source has no blob"; return false; }
+                                             last_copy = m.copy->memcpy(dst, b, blob);
+                                             ++stats_.experts_dma;
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index c1ce38e..3412eb5 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -6907,6 +6907,13 @@ int main(int argc, char **argv) try {
+                     }
+                     const strata::core::OnDevice on(p.dev);
+                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
++                    std::vector<std::pair<int32_t, int32_t>> to_pin;
++                    for (int64_t l = p.lb; l < p.le; ++l)
++                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
++                            const int32_t index = (int32_t)(l * g.n_expert + ex);
++                            if (host_res[(size_t)index] >= first) to_pin.emplace_back(index, host_res[(size_t)index]);
++                        }
++                    if (!p.sp->pin_lent_slots(to_pin, e)) return false;
+                     if (want != p.sp->chunk() || first != p.first_now) {
+                         if (!p.sp->relayout(want, p.cache->lend_base(first), part_bytes(p, first), e)) return false;
+                         p.first_now = first;
+-- 
+2.43.0
+

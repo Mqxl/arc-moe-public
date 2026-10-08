@@ -28,6 +28,12 @@ arc_engine_env() {   # export the defaults above; a variable already set (even e
     export STRATA_EXTRA_ARGS="${STRATA_EXTRA_ARGS-$ARC_ENGINE_ARGS_DEFAULT}"
     export STRATA_PREFILL_FIRST="${STRATA_PREFILL_FIRST-0}"
     export STRATA_GU_LANES="${STRATA_GU_LANES-32}"
+    # Profiles 20261008-022225 (dual) and 160840 (single): 10K +17% / +18.3% versus DP4A; full checks pass.
+    export STRATA_PF_EXPERT_KERNEL="${STRATA_PF_EXPERT_KERNEL-tile16}"
+    # Full check213531:42/42; normal profile214426 confirms both card modes.
+    # Eager immutable loan copies cost extra host RAM; the engine bounds the pool and falls back.
+    export STRATA_PF_PIN_LOAN="${STRATA_PF_PIN_LOAN-2}"
+    export STRATA_PF_PIN_REFILL="${STRATA_PF_PIN_REFILL-1}"
 }
 
 if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'; else B='' G='' Y='' R='' D='' N=''; fi

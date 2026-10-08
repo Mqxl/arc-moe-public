@@ -1,0 +1,73 @@
+From bbd40fb009afa728a2f51d3f669728856d52a37f Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 20:04:55 +0500
+Subject: [PATCH] sycl: opt-in deferred expert DMA event clocks without
+ per-copy waits
+
+---
+ sycl/src/prefill/prefill.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 868d6b9..f03534e 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1724,6 +1724,14 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+     core::SessionState& ss = *m.ss;
+     const auto t_start = Clock::now();
+     const int64_t LB = stage_lb_, LE = stage_le_;
++    const char* copy_clock_env = std::getenv("STRATA_PF_COPY_TIMING");
++    const bool copy_clock = copy_clock_env && copy_clock_env[0] == '1';
++    struct CopySample { sycl::event event; uint64_t bytes; int kind; };
++    std::vector<CopySample> copy_samples;
++    auto track_copy = [&](const sycl::event& event, size_t bytes, int kind) {
++        if (copy_clock) copy_samples.push_back({event, (uint64_t)bytes, kind});
++    };
++
+     auto source_pinned = [&](int64_t layer, int64_t expert) {
+         return m.pinned_loan.count((int32_t)(layer * m.g->n_expert + expert)) || m.src->pinned(layer, expert);
+     };
+@@ -2295,6 +2303,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             if (!src) { err = "prefill early experts: missing pinned blob"; return false; }
+                             pf_early[(size_t)e] = dst + (size_t)used++ * stride;
+                             pf_early_done = m.copy->memcpy(pf_early[(size_t)e], src, blob);
++                            track_copy(pf_early_done, blob, 3);
+                             pf_early_any = true;
+                             ++stats_.experts_dma;
+                         }
+@@ -3544,10 +3553,12 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                             const uint8_t* b = source_blob(l, e);
+                                             if (!b) { err = "prefill: expert source has no blob"; return false; }
+                                             last_copy = m.copy->memcpy(dst, b, blob);
++                                            track_copy(last_copy, blob, m.pinned_loan.count((int32_t)(l * m.g->n_expert + e)) ? 0 : 1);
+                                             ++stats_.experts_dma;
+                                         } else {
+                                             const uint8_t* hbuf = m.stager->wait(job_of[j]);
+                                             last_copy = m.copy->memcpy(dst, hbuf, blob);
++                                            track_copy(last_copy, blob, 2);
+                                             m.stager->issued_one(job_of[j], m.copy);
+                                         }
+                                         stats_.ms_experts_host += ms_since(th);
+@@ -3916,6 +3927,19 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+               dpct::get_error_string_dummy(cst);
+         return false;
+     }
++    if (copy_clock) {
++        uint64_t bytes[4] = {}, ns[4] = {}, count[4] = {};
++        for (const auto& copy : copy_samples) {
++            const uint64_t start = copy.event.get_profiling_info<sycl::info::event_profiling::command_start>();
++            const uint64_t end = copy.event.get_profiling_info<sycl::info::event_profiling::command_end>();
++            bytes[copy.kind] += copy.bytes; ns[copy.kind] += end - start; ++count[copy.kind];
++        }
++        const char* names[] = {"pinned-loan", "pinned-mirror", "staged-pinned", "early-pinned"};
++        for (int i = 0; i < 4; ++i) if (count[i])
++            std::fprintf(stderr, "strata prefill copy: layers %lld-%lld, %s %llu transfers, %.3f GB, %.3f ms DMA, %.3f GB/s; event clocks, no per-copy waits\n",
++                         (long long)LB, (long long)LE - 1, names[i], (unsigned long long)count[i], bytes[i] / 1e9,
++                         ns[i] / 1e6, ns[i] ? (double)bytes[i] / ns[i] : 0.0);
++    }
+     stats_.ms_total += ms_since(t_start);
+     if (pt.on) {
+         pt.fold();
+-- 
+2.43.0
+

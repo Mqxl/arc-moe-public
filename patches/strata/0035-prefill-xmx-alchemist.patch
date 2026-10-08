@@ -1,0 +1,191 @@
+From 5caa2b3bd33f2f4cd4fb02b5092af76304722d96 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 14:00:44 +0500
+Subject: [PATCH] sycl: opt-in Alchemist SG8 XMX prefill experts with shared
+ weight tiles
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 141 +++++++++++++++++++++++-
+ 1 file changed, 139 insertions(+), 2 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 7e93719..d6d5fa1 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -18,6 +18,7 @@
+ #include "ggml-common.h"
+ 
+ #include <sycl/ext/oneapi/matrix/matrix.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+ #include <algorithm>
+ #include <type_traits>
+ #include <cstdio>
+@@ -2580,6 +2581,119 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
+ 
+ void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+ 
++
++// Alchemist: SG8, FP16 A(8x16), packed B(16x8), FP32 C(8x8).
++// Dequantize eight weight rows once into SLM for up to 64 activation rows.
++// The existing q8_1 activation quantization is retained; FP16 rounding differs
++// from DP4A, so this path stays opt-in until complete reply checks and profiling.
++template <bool Down, int GRF>
++void launch_pf_xmx(unsigned groups, dpct::queue_ptr q, const unsigned long long* ptr,
++                   const int32_t* start, const int32_t* ng, const int32_t* index,
++                   const block_q8_1* x, NativeExpertLayout L, float* gate, float* up) {
++    constexpr int SG = 8, NSG = 8, WG = SG * NSG, SLAB = 256, NT = 8;
++    const int nin = Down ? L.n_ff : L.n_embd, nout = Down ? L.n_embd : 2 * L.n_ff;
++    const size_t rowbytes = Down ? L.d_row : L.gu_row;
++    q->submit([&](sycl::handler& h) {
++        sycl::local_accessor<sycl::half, 1> sm(sycl::range<1>(2 * NT * SLAB + NSG * 8 * 16), h);
++        sycl::local_accessor<float, 1> cm(sycl::range<1>(NSG * 64), h);
++        h.parallel_for<dpct_kernel_name<class pf_xmx_acm, dpct_kernel_scalar<Down>, dpct_kernel_scalar<GRF>>>(
++            sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t)((nout + 7) / 8) * WG),
++                              sycl::range<3>(1, 1, WG)),
++            sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<GRF>},
++            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(8)]] {
++                namespace jm = sycl::ext::oneapi::experimental::matrix;
++                const int g = it.get_group(1);
++                if (g >= *ng) return; // uniform over the work-group
++                const int tid = it.get_local_id(2), sgid = tid / SG, lane = tid % SG;
++                const int f0 = it.get_group(2) * NT, e0 = start[g], e1 = start[g + 1];
++                auto sg = it.get_sub_group();
++                auto lp = [](auto* p) { return sycl::address_space_cast<sycl::access::address_space::local_space,
++                                                sycl::access::decorated::no>(p); };
++                auto* stage = sm.template get_multi_ptr<sycl::access::decorated::no>().get();
++                auto* packed = stage + NT * SLAB;
++                auto* a = packed + NT * SLAB + sgid * 128;
++                auto* c = cm.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * 64;
++                for (int eb = e0; eb < e1; eb += NSG * 8) {
++                    const int em = eb + sgid * 8;
++                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> C;
++                    jm::joint_matrix_fill(sg, C, 0.f);
++                    for (int k0 = 0; k0 < nin; k0 += SLAB) {
++                        it.barrier(sycl::access::fence_space::local_space);
++                        if constexpr (!Down) {
++                            // Each subgroup decodes one 256-element native weight block.
++                            const int row = f0 + sgid;
++                            if (row < nout) {
++                                const int r = row >= L.n_ff ? row - L.n_ff : row;
++                                const size_t off = row >= L.n_ff ? L.up_off : 0;
++                                const auto* wr = (const uint8_t*) ptr[g] + off + (size_t)r * rowbytes;
++                                for (int t = lane; t < 32; t += SG)
++                                    dq_dispatch<sycl::half>(L.gu_type, wr, k0 / 256, stage + sgid * SLAB, t);
++                            } else {
++                                for (int k = lane; k < SLAB; k += SG) stage[sgid * SLAB + k] = sycl::half(0);
++                            }
++                        } else {
++                            for (int i = tid; i < NT * SLAB; i += WG) {
++                                const int r = f0 + i / SLAB, k = k0 + i % SLAB;
++                                float v = 0.f;
++                                if (r < nout && k < nin) {
++                                    const auto* wr = (const uint8_t*)ptr[g] + L.down_off + (size_t)r * rowbytes;
++                                    if (L.d_type == 42) {
++                                        const auto& b = ((const block_q2_0*)wr)[k / 64];
++                                        const int j = k % 64;
++                                        const int code = (b.qs[j / 4] >> (2 * (j % 4))) & 3;
++                                        v = (float)b.d * (code - 1);
++                                    } else {
++                                        const auto& b = ((const block_iq4_nl*)wr)[k / 32];
++                                        const int j = k % 32;
++                                        const int code = j < 16 ? b.qs[j] & 15 : b.qs[j - 16] >> 4;
++                                        v = (float)b.d * kvalues_iq4nl[code];
++                                    }
++                                }
++                                stage[i] = sycl::half(v);
++                            }
++                        }
++                        it.barrier(sycl::access::fence_space::local_space);
++                        for (int i = tid; i < NT * SLAB; i += WG) {
++                            const int n = i / SLAB, k = i % SLAB;
++                            packed[(k / 2) * (NT * 2) + n * 2 + k % 2] = stage[i];
++                        }
++                        it.barrier(sycl::access::fence_space::local_space);
++                        for (int ks = 0; ks < sycl::min(SLAB, nin - k0); ks += 16) {
++                            for (int i = lane; i < 128; i += SG) {
++                                const int e = em + i / 16, k = k0 + ks + i % 16;
++                                float v = 0.f;
++                                if (e < e1) {
++                                    const int t = Down ? e : index[e];
++                                    const auto& b = x[(size_t)t * (nin / 32) + k / 32];
++                                    v = (float)b.ds[0] * b.qs[k % 32];
++                                }
++                                a[i] = sycl::half(v);
++                            }
++                            sycl::group_barrier(sg);
++                            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> A;
++                            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 8, jm::layout::ext_intel_packed> B;
++                            jm::joint_matrix_load(sg, A, lp(a), 16);
++                            jm::joint_matrix_load(sg, B, lp(packed + (ks / 2) * NT * 2), NT * 2);
++                            jm::joint_matrix_mad(sg, C, A, B, C);
++                        }
++                    }
++                    jm::joint_matrix_store(sg, C, lp(c), 8, jm::layout::row_major);
++                    sycl::group_barrier(sg);
++                    for (int i = lane; i < 64; i += SG) {
++                        const int e = em + i / 8, r = f0 + i % 8;
++                        if (e < e1 && r < nout) {
++                            if constexpr (Down) gate[(size_t)index[e] * nout + r] = c[i];
++                            else {
++                                const bool u = r >= L.n_ff;
++                                (u ? up : gate)[(size_t)e * L.n_ff + (u ? r - L.n_ff : r)] = c[i];
++                            }
++                        }
++                    }
++                }
++            });
++    });
++}
++
+ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+@@ -2603,12 +2717,31 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+         return 4; // dp4a: measured baseline, wider kernels opt-in
+     }();
+     const int rows = prefill && !v1 ? pf_rows : 4;
++    static const bool pf_xmx = [] {
++        const char* v = std::getenv("STRATA_PF_EXPERT_KERNEL");
++        return v && std::strcmp(v, "xmx") == 0;
++    }();
++    static const int xmx_min_rows = [] {
++        const char* v = std::getenv("STRATA_PF_XMX_MIN_ROWS");
++        return v ? std::clamp(std::atoi(v), 1, 64) : 16;
++    }();
++    static const bool xmx_grf128 = [] {
++        const char* v = std::getenv("STRATA_PF_XMX_GRF");
++        return v && std::atoi(v) == 128;
++    }();
++    // Tiny groups keep DP4A: an XMX work-group stages weights for 64 entries.
++    const bool use_xmx = prefill && !v1 && pf_xmx && (L.gu_type == 16 || L.gu_type == 22 || L.gu_type == 29) && (L.d_type == 20 || L.d_type == 42) &&
++                         cap_entries >= cap_groups * xmx_min_rows;
+     // #363: a verify window's PCIe call usually has no group: `grid_groups` block rows stride over the groups instead
+     // of one row per possible group (the results do not depend on it)
+     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
+                          (unsigned)gy);
+-    if (rows > 4 && L.gu_type == 22) {
++    if (use_xmx) {
++        if (xmx_grf128) launch_pf_xmx<false, 128>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        else launch_pf_xmx<false, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++    }
++    else if (rows > 4 && L.gu_type == 22) {
+         if (rows == 8) launch_gu_port<22, 32, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         else launch_gu_port<22, 32, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     } else switch (L.gu_type) {
+@@ -2667,7 +2800,11 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     }
+     check("native_expert_grouped/swiglu");
+     const dpct::dim3 gd((unsigned)((L.n_embd + kExpertRows - 1) / kExpertRows), (unsigned)gy);
+-    if (rows > 4 && L.d_type == 42) {
++    if (use_xmx) {
++        if (xmx_grf128) launch_pf_xmx<true, 128>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
++        else launch_pf_xmx<true, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
++    }
++    else if (rows > 4 && L.d_type == 42) {
+         if (rows == 8) launch_down_port<42, 8, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         else launch_down_port<42, 8, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+     } else if (rows > 4 && L.d_type == 20) {
+-- 
+2.43.0
+

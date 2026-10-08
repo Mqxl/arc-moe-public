@@ -1,0 +1,69 @@
+From 3f5681177b3a7ef3fe70daf8b6921617af5e17f1 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 20:04:54 +0500
+Subject: [PATCH] sycl: opt-in immutable pinned loan sources for queued cache
+ refill
+
+---
+ include/strata/prefill/prefill.hpp | 1 +
+ sycl/src/prefill/prefill.cpp       | 5 +++++
+ sycl/src/program/generate.cpp      | 9 +++++++--
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index dd3ea13..59f7dfb 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -74,6 +74,7 @@ public:
+ 
+     /// Opt-in pinned host copies of immutable experts before their slots become prompt scratch.
+     bool pin_lent_slots(const std::vector<std::pair<int32_t, int32_t>>& slots, std::string& err);
++    const uint8_t* pinned_lent_blob(int32_t index) const;
+ 
+     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
+     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 03967d3..37a22d9 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1065,6 +1065,11 @@ bool Prefill::carve(size_t T, void* alloc) {
+     return ok;
+ }
+ 
++const uint8_t* Prefill::pinned_lent_blob(int32_t index) const {
++    const auto it = impl_->pinned_loan.find(index);
++    return it == impl_->pinned_loan.end() ? nullptr : it->second;
++}
++
+ bool Prefill::pin_lent_slots(const std::vector<std::pair<int32_t, int32_t>>& slots, std::string& err) {
+     const char* v = std::getenv("STRATA_PF_PIN_LOAN");
+     if (!v || v[0] != '1' || slots.empty()) return true;
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 3412eb5..c4a7784 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -6830,14 +6830,19 @@ int main(int argc, char **argv) try {
+                 const strata::core::OnDevice on(p.dev);
+                 size_t queued = 0;
+                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
++                    static const bool pinned_refill = [] {
++                        const char* v = std::getenv("STRATA_PF_PIN_REFILL");
++                        return v && v[0] == '1';
++                    }();
++                    const uint8_t* pinned = pinned_refill ? p.sp->pinned_lent_blob(i) : nullptr;
++                    const uint8_t* b = pinned ? pinned : srcp->blob(i / g.n_expert, i % g.n_expert);
+                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                     if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
+                         return false;
+                     host_res[(size_t) i] = slot;
+                     // SYCL port: drain before GgufExpertSource's 512-buffer blob ring can wrap onto a queued copy
+-                    if (!refill_blocking() && ++queued % 256 == 0 && !p.cache->sync_queued(e)) return false;
++                    if (!refill_blocking() && !pinned && ++queued % 256 == 0 && !p.cache->sync_queued(e)) return false;
+                 }
+                 return true;
+             };
+-- 
+2.43.0
+

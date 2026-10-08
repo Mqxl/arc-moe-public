@@ -1,0 +1,127 @@
+From b054223c5ed2c1e50ea98a8025d4b68d5098428c Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 16:56:52 +0500
+Subject: [PATCH] sycl: opt-in pinned expert prefetch during attention in a
+ disjoint pool
+
+---
+ sycl/src/prefill/prefill.cpp | 61 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 56965dc..4c5dc41 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -557,6 +557,8 @@ struct Prefill::Impl {
+     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
+     // arc-moe (grouped experts): each batch's group table, uploaded from here (kept alive until the layer's wait)
+     std::vector<uint8_t> pfg_host;
++    uint8_t* early_pool = nullptr;
++    size_t early_bytes = 0;
+     std::unordered_map<int32_t, uint8_t*> pinned_loan;
+     dpct::event_ptr copied[RING_MAX] = {}, used[RING_MAX] = {};
+     bool stage_live[RING_MAX] = {};
+@@ -956,6 +958,18 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
+         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+         return false;
+     }
++    const char* ep = std::getenv("STRATA_PF_PREFETCH_SLOTS");
++    const int ep_slots = ep ? std::clamp(std::atoi(ep), 0, 256) : 0;
++    if (ep_slots) {
++        size_t free_b = 0, total_b = 0;
++        dpct::get_current_device().get_memory_info(free_b, total_b);
++        const size_t desired = ((MAXBLOB() + 255) & ~(size_t)255) * ep_slots;
++        const size_t bytes = std::min(desired, free_b / 2);
++        try { m.early_pool = sycl::malloc_device<uint8_t>(bytes, *m.cs); }
++        catch (const sycl::exception&) { m.early_pool = nullptr; }
++        if (m.early_pool) { m.early_bytes = bytes; m.owned.push_back(m.early_pool); }
++        std::fprintf(stderr, "strata prefill: early expert pool %.1f MiB (separate from attention/MoE scratch)\n", m.early_bytes / 1048576.0);
++    }
+     return true;
+ }
+ catch (sycl::exception const &exc) {
+@@ -2240,6 +2254,46 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+         }
+         };
+         for (int64_t l = LB; l < LE; ++l) {
++            // Opt-in: preload a prefix of this layer's pinned misses while its attention runs.
++            // Use separate device memory: Xs overlaps attention scratch and is not safe during attention.
++            std::vector<uint8_t*> pf_early((size_t)m.g->n_expert, nullptr);
++            size_t pf_early_bytes = 0;
++            sycl::event pf_early_done;
++            bool pf_early_any = false;
++            const char* early_env = std::getenv("STRATA_PF_PREFETCH_SLOTS");
++            const int early_want = early_env ? std::clamp(std::atoi(early_env), 0, 256) : 0;
++            const auto& early_lay = strata::kernels::cpu::expert_layout();
++            if (early_want && T >= 1024 && pf_grouped_env() && early_lay.native && !stream_all &&
++                m.Xs && !m.pp && m.src && m.cache && m.host_res &&
++                !(mmq_plan().any && mmq_plan().layer[(size_t)l])) {
++                const auto& ef = early_lay.fmt[(size_t)l];
++                if (strata::kernels::native_expert_supported(ef.gu_type, ef.d_type, N, ef.n_ff)) {
++                    auto align256 = [](size_t b) { return (b + 255) & ~(size_t)255; };
++                    auto knob = [](const char* name, int fallback, int lo, int hi) {
++                        const char* v = std::getenv(name);
++                        return v ? std::clamp(std::atoi(v), lo, hi) : fallback;
++                    };
++                    const size_t blob = (size_t)early_lay.blob_bytes(l), stride = align256(blob);
++                    const int cap = m.early_pool ? (int)std::min<size_t>(early_want, m.early_bytes / stride) : 0;
++                    if (cap) {
++                        pf_early_bytes = 0;
++                        uint8_t* dst = m.early_pool;
++                        // The previous layer may still use Xs: release its tail before the copy queue writes it.
++                        m.copy->ext_oneapi_submit_barrier({m.cs->ext_oneapi_submit_barrier()});
++                        int used = 0;
++                        for (int32_t e = 0; e < m.g->n_expert && used < cap; ++e) {
++                            if (m.host_res[(size_t)l * m.g->n_expert + e] >= 0 || !source_pinned(l, e)) continue;
++                            const uint8_t* src = source_blob(l, e);
++                            if (!src) { err = "prefill early experts: missing pinned blob"; return false; }
++                            pf_early[(size_t)e] = dst + (size_t)used++ * stride;
++                            pf_early_done = m.copy->memcpy(pf_early[(size_t)e], src, blob);
++                            pf_early_any = true;
++                            ++stats_.experts_dma;
++                        }
++                        if (!pf_early_any) pf_early_bytes = 0;
++                    }
++                }
++            }
+             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
+             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
+@@ -3388,6 +3442,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         }
+                         };
+                         if (grouped_l) {
++                            if (pf_early_any) m.cs->ext_oneapi_submit_barrier({pf_early_done});
+                             // ---- arc-moe: the grouped walk.  Xs (T*K*N halves) is carved into: q8_1 activations
+                             // (T rows), the entry index (T ints), a group table, the kernels' scratch for T entries
+                             // (no expert has more rows than tokens) and configurable banks of blob staging. A batch is the
+@@ -3454,6 +3509,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 bool waited = false;
+                                 sycl::event last_copy;
+                                 bool copied_any = false;
++                                bool early_used = false;
+                                 while (j < order.size() && (int) (j - j0) < kGrpMax) {
+                                     const int32_t e = order[j];
+                                     const int32_t c = m.cnt[(size_t) e];
+@@ -3465,6 +3521,10 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                     if (res) {
+                                         h_ptr[g] = (unsigned long long) m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                         ++stats_.experts_resident;
++                                    } else if (pf_early[(size_t)e]) {
++                                        h_ptr[g] = (unsigned long long)pf_early[(size_t)e];
++                                        early_used = true;
++                                        ++stats_.experts_streamed;
+                                     } else {
+                                         if (!waited) {   // the half's previous batch has read it
+                                             m.copy->ext_oneapi_submit_barrier({kev[hcur]});
+@@ -3500,6 +3560,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 pt.mark(kPfWaitCopy, cs);
+                                 m.cs->memcpy(gdev, hb, gt_b);
+                                 if (copied_any) m.cs->ext_oneapi_submit_barrier({last_copy});
++                                if (early_used) m.cs->ext_oneapi_submit_barrier({pf_early_done});
+                                 pt.mark(kPfGemmGU, cs);
+                                 const int32_t* d_n = (const int32_t*) gdev;
+                                 const int32_t* d_start = d_n + 4;
+-- 
+2.43.0
+

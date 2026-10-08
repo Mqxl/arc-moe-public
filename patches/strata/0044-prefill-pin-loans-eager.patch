@@ -1,0 +1,58 @@
+From 98a7701b21d94c3fa31e5fd8402768311fcdbf7f Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 20:04:55 +0500
+Subject: [PATCH] sycl: optionally prepare immutable pinned loan copies before
+ serving
+
+---
+ sycl/src/prefill/prefill.cpp  |  2 +-
+ sycl/src/program/generate.cpp | 20 ++++++++++++++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 37a22d9..868d6b9 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1072,7 +1072,7 @@ const uint8_t* Prefill::pinned_lent_blob(int32_t index) const {
+ 
+ bool Prefill::pin_lent_slots(const std::vector<std::pair<int32_t, int32_t>>& slots, std::string& err) {
+     const char* v = std::getenv("STRATA_PF_PIN_LOAN");
+-    if (!v || v[0] != '1' || slots.empty()) return true;
++    if (!v || (v[0] != '1' && v[0] != '2') || slots.empty()) return true;
+     Impl& m = *impl_;
+     const auto& layout = strata::kernels::cpu::expert_layout();
+     if (!m.cache || !m.g || !layout.native) return true;
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index c4a7784..686eded 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -6217,6 +6217,26 @@ int main(int argc, char **argv) try {
+                     }
+                 }).detach();
+         }
++        // Mode 2 pays for immutable pinned loan copies during loading, before any client request.
++        // The ordinary lazy mode 1 remains available for limited RAM / short-lived processes.
++        const char* pin_mode = std::getenv("STRATA_PF_PIN_LOAN");
++        if (pin_mode && pin_mode[0] == '2') {
++            for (PfPart& p : pf_parts) {
++                if (p.first < 0) continue;
++                const strata::core::OnDevice on(p.dev);
++                std::vector<std::pair<int32_t, int32_t>> slots;
++                for (int64_t l = p.lb; l < p.le; ++l)
++                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
++                        const int32_t index = (int32_t)(l * g.n_expert + ex);
++                        if (host_res[(size_t)index] >= p.first) slots.emplace_back(index, host_res[(size_t)index]);
++                    }
++                std::string e;
++                if (!p.sp->pin_lent_slots(slots, e)) {
++                    std::fprintf(stderr, "strata serve: %s\n", e.c_str());
++                    return 1;
++                }
++            }
++        }
+         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+         std::fflush(stdout);
+         std::string line;
+-- 
+2.43.0
+

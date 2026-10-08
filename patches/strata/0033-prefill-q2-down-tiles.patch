@@ -1,0 +1,29 @@
+From 45fe9349e0f6bb96c888cf80bcb1cbd78a9bc37a Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 02:08:32 +0500
+Subject: [PATCH] sycl: widen Q2_0 prefill down tiles for the diagnostic IQ2_XS
+ pack
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 665c028..7e93719 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2667,7 +2667,10 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     }
+     check("native_expert_grouped/swiglu");
+     const dpct::dim3 gd((unsigned)((L.n_embd + kExpertRows - 1) / kExpertRows), (unsigned)gy);
+-    if (rows > 4 && L.d_type == 20) {
++    if (rows > 4 && L.d_type == 42) {
++        if (rows == 8) launch_down_port<42, 8, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++        else launch_down_port<42, 8, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++    } else if (rows > 4 && L.d_type == 20) {
+         if (rows == 8) launch_down_port<20, 8, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         else launch_down_port<20, 8, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+     } else switch (L.d_type) {
+-- 
+2.43.0
+

@@ -19,20 +19,20 @@ want=${pos[0]:-${ARC_MODEL:-iq2_xs}}
 want=$(echo "$want" | tr '[:upper:]' '[:lower:]')
 cfg="strata-$want.json"
 [ -f "$cfg" ] || die "no $cfg: ./arc setup first (or ./arc check <model>)"
-read -r port key log < <(python3 -c '
+read -r port log < <(python3 -c '
 import json, sys
 c = json.load(open(sys.argv[1]))
-print(c.get("port", 8080), c.get("api_key") or "-", c.get("log") or "-")' "$cfg")
+print(c.get("port", 8080), c.get("log") or "-")' "$cfg")
 url="http://127.0.0.1:$port"
-keyarg=(); [ "$key" != "-" ] && keyarg=(--api-key "$key")
 
 if curl -fsS -m 3 "$url/health" >/dev/null 2>&1; then
     say "${B}checking the running server${N} at $url (stop it for the full run over several configurations)"
-    exec python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" "${pass[@]}"
+    exec python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/check.py" --url "$url"  "${pass[@]}"
 fi
 
 [ "$log" != "-" ] || die "$cfg has no \"log\": the engine's lines are needed"
 case "$log" in /*) ;; *) log="$STRATA/$log" ;; esac
+arc_engine_env
 out="$ROOT/check-$(date +%Y%m%d-%H%M%S).txt"
 
 srv_pid=""
@@ -67,7 +67,7 @@ run() {   # run <name> <env...>
         [ $t -lt 900 ] || { warn "not loaded after 15 minutes"; break; }
     done
     echo "================ $name: $*" >>"$out"
-    if python3 "$ROOT/tools/check.py" --url "$url" "${keyarg[@]}" "${pass[@]}" 2>&1 | tee -a "$out"; then
+    if python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/check.py" --url "$url"  "${pass[@]}" 2>&1 | tee -a "$out"; then
         :
     else
         failures=$((failures + 1))
@@ -83,6 +83,10 @@ run() {   # run <name> <env...>
 
 {
     echo "arc-moe check, $(date), $(git -C "$ROOT" rev-parse --short HEAD), model $want, $(arc_bdfs | wc -l) Arc(s)"
+    echo "engine source: $(git -C "$STRATA" rev-parse --short HEAD); patch fingerprint: $(git -C "$STRATA" config --get arcmoe.applied)"
+    for knob in STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT; do
+        [ -z "${!knob-}" ] || echo "$knob=${!knob}"
+    done
     echo
 } >"$out"
 BASE_ARGS="$ARC_ENGINE_ARGS_DEFAULT"
