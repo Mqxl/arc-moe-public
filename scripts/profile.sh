@@ -67,7 +67,7 @@ stop_server() {   # SIGTERM to Python only sends the engine QUIT; background job
 trap stop_server EXIT
 
 keep='PCIe probe|prefill copy|prefill timing|prompt chunk|prompt path|borrow|serve: prompt|verify stages|window: since|split|mirror|expert cache'
-keep+='|pin loan|early expert pool|prompt attention|strata decode timing|strata decode GPU|strata dbg|head sampling|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
+keep+='|gate/up split weight reuse|integer XMX|pin loan|early expert pool|prompt attention|strata decode timing|strata decode GPU|strata dbg|head sampling|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
 
 run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model, bench, stop, keep the engine's lines
     local name=$1 cases=$2 maxt=$3; shift 3
@@ -118,8 +118,19 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     else
         failures=$((failures + 1))
     fi
+    if [ "$name" = LANG-S6 ]; then
+        # The API supports per-request confidence: compare without two model reloads.
+        for prob in 0.35 0.65; do
+            echo "================ LANG-P$prob: --spec 6, per-request spec_min_p=$prob; cases=$cases max_tokens=$maxt runs=${ARC_PROFILE_RUNS:-2}" >>"$out"
+            if ! python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/bench.py" --url "$url" --runs "${ARC_PROFILE_RUNS:-2}" --max-tokens "$maxt" --cases "$cases" --spec-min-p "$prob" --json "$out.LANG-P$prob.json" >>"$out" 2>&1; then
+                failures=$((failures + 1))
+            fi
+        done
+    fi
     if [ "$name" = C128 ]; then
-        if ! python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/context-check.py" --url "$url" --json "$out.$name.context.json" >>"$out" 2>&1; then
+        local context_args=()
+        [ "${ARC_CONTEXT_COMBINED:-0}" != 1 ] || context_args+=(--combined-agent --decode-tokens 256)
+        if ! python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/context-check.py" --url "$url" --json "$out.$name.context.json" "${context_args[@]}" >>"$out" 2>&1; then
             failures=$((failures + 1))
         fi
     fi
@@ -135,7 +146,7 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     echo "arc-moe profile, $(date), $(git -C "$ROOT" rev-parse --short HEAD), model $want"
     echo "screen=${ARC_PROFILE_SCREEN:-0}; runs=${ARC_PROFILE_RUNS:-2}; screen decode rates are not final speed measurements"
     echo "engine source: $(git -C "$STRATA" rev-parse --short HEAD); patch fingerprint: $(git -C "$STRATA" config --get arcmoe.applied)"
-    for knob in STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_COPY_TIMING STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT; do
+    for knob in STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_COPY_TIMING STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT STRATA_PF_GU_I8_XMX STRATA_PF_DOWN_I8_XMX STRATA_PF_I8_SLAB STRATA_PF_I8_PAD STRATA_PF_I8_GROUP_MIN STRATA_PF_GU_SPLIT STRATA_PF_GU_SPLIT_LANES; do
         [ -z "${!knob-}" ] || echo "$knob=${!knob}"
     done
     for b in $(arc_bdfs); do
@@ -156,6 +167,92 @@ if [ "${ARC_PROFILE_FINAL_FAST:-0}" = 1 ]; then
     run N short,prose,1k,2k,10k,sampled,agent 128
     if [ "${ARC_PROFILE_FINAL_CONTROL:-0}" = 1 ]; then run G1-BASE32 agent,1k,2k,10k 128 ARC_GPUS=0 STRATA_PF_PIN_LOAN=0 STRATA_PF_PIN_REFILL=0 STRATA_PF_PREFETCH_SLOTS=0 STRATA_PF_PIPELINE=1 STRATA_PROMPT_ATTN_XMX=0 STRATA_PF_SPLIT_ROWS=4 STRATA_PF_FUSE_EXPERT=0 "STRATA_EXTRA_ARGS=--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 64"; fi
     run G1 short,prose,1k,2k,10k,sampled,agent 128 ARC_GPUS=0
+elif [ "${ARC_PROFILE_DRAFT_VOCAB_SINGLE:-0}" = 1 ]; then
+    run G1-DV-CJK short,prose-ru-long,prose-en,prose-zh 256 ARC_GPUS=0
+    dir="$ROOT/test-logs/mtp-union"
+    quoted=$(python3 -c 'import shlex,sys;print(shlex.quote(sys.argv[1]))' "$dir")
+    run G1-DV-union short,prose-ru-long,prose-en,prose-zh 256 ARC_GPUS=0 "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --mtp $quoted"
+elif [ "${ARC_PROFILE_DRAFT_VOCAB_SWEEP:-0}" = 1 ]; then
+    run DV-CJK short,prose-ru-long,prose-en,prose-zh 256
+    for kind in union full; do
+        dir="$ROOT/test-logs/mtp-$kind"
+        [ -d "$dir" ] || die "prepare $dir with the existing MTP files first"
+        quoted=$(python3 -c 'import shlex,sys;print(shlex.quote(sys.argv[1]))' "$dir")
+        run "DV-$kind" short,prose-ru-long,prose-en,prose-zh 256 "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --mtp $quoted"
+    done
+elif [ "${ARC_PROFILE_LANGUAGE_SWEEP:-0}" = 1 ]; then
+    for spec in 2 6; do
+        run "LANG-S$spec" short,prose-ru-long,prose-en,prose-zh 256 "STRATA_EXTRA_ARGS=--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec $spec --short-read 64"
+    done
+elif [ "${ARC_PROFILE_GU_REUSE_LANES_SWEEP:-0}" = 1 ]; then
+    nc=${ARC_PROFILE_GU_ROWS:-4}
+    run GUL32 2k,10k 128 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc" STRATA_PF_GU_SPLIT_LANES=32
+    run GUL8 2k,10k 128 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc" STRATA_PF_GU_SPLIT_LANES=8
+    run GUL16 2k,10k 128 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc" STRATA_PF_GU_SPLIT_LANES=16
+    lane_winners=()
+    for lanes in 8 16; do
+        if python3 "$ROOT/tools/screen-improvement.py" "$out.GUL32.json" "$out.GUL$lanes.json"; then lane_winners+=("$lanes"); fi
+    done
+    if [ ${#lane_winners[@]} -gt 0 ]; then
+        run G1-GUL32 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc" STRATA_PF_GU_SPLIT_LANES=32
+        for lanes in "${lane_winners[@]}"; do run "G1-GUL$lanes" 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc" STRATA_PF_GU_SPLIT_LANES="$lanes"; done
+    fi
+elif [ "${ARC_PROFILE_GU_REUSE_SWEEP:-0}" = 1 ]; then
+    run GUBASE 2k,10k 128 STRATA_PF_GU_SPLIT=0 STRATA_PF_SPLIT_ROWS=4
+    for nc in 4 8 16; do run "GUR$nc" 2k,10k 128 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc"; done
+    gu_winners=()
+    for nc in 4 8 16; do
+        if python3 "$ROOT/tools/screen-improvement.py" "$out.GUBASE.json" "$out.GUR$nc.json"; then gu_winners+=("$nc"); fi
+    done
+    if [ ${#gu_winners[@]} -gt 0 ]; then
+        run G1-GUBASE 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_SPLIT=0 STRATA_PF_SPLIT_ROWS=4
+        for nc in "${gu_winners[@]}"; do run "G1-GUR$nc" 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_SPLIT=1 STRATA_PF_SPLIT_ROWS="$nc"; done
+    fi
+elif [ "${ARC_PROFILE_I8_PAD_SWEEP:-0}" = 1 ]; then
+    run I8PADBASE 2k,10k 128 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=0
+    run I8GUPAD 2k,10k 128 STRATA_PF_GU_I8_XMX=1 STRATA_PF_DOWN_I8_XMX=0 STRATA_PF_I8_SLAB=256 STRATA_PF_I8_PAD=16 STRATA_PF_I8_GROUP_MIN=32
+    run I8DPAD 2k,10k 128 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=1 STRATA_PF_I8_SLAB=256 STRATA_PF_I8_PAD=16 STRATA_PF_I8_GROUP_MIN=32
+    i8_winners=()
+    for candidate in I8GUPAD I8DPAD; do
+        if python3 "$ROOT/tools/screen-improvement.py" "$out.I8PADBASE.json" "$out.$candidate.json"; then i8_winners+=("$candidate"); fi
+    done
+    if [ ${#i8_winners[@]} -gt 0 ]; then
+        run G1-I8PADBASE 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=0
+        for candidate in "${i8_winners[@]}"; do
+            if [ "$candidate" = I8GUPAD ]; then run G1-I8GUPAD 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=1 STRATA_PF_DOWN_I8_XMX=0 STRATA_PF_I8_SLAB=256 STRATA_PF_I8_PAD=16 STRATA_PF_I8_GROUP_MIN=32
+            else run G1-I8DPAD 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=1 STRATA_PF_I8_SLAB=256 STRATA_PF_I8_PAD=16 STRATA_PF_I8_GROUP_MIN=32; fi
+        done
+    fi
+elif [ "${ARC_PROFILE_I8_SLAB_SWEEP:-0}" = 1 ]; then
+    run I8B 2k,10k 128 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=0
+    run I8GU256 2k,10k 128 STRATA_PF_GU_I8_XMX=1 STRATA_PF_DOWN_I8_XMX=0 STRATA_PF_I8_SLAB=256
+    run I8D256 2k,10k 128 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=1 STRATA_PF_I8_SLAB=256
+    i8_winners=()
+    for candidate in I8GU256 I8D256; do
+        if ! python3 "$ROOT/tools/screen-reject.py" "$out.I8B.json" "$out.$candidate.json"; then i8_winners+=("$candidate"); fi
+    done
+    if [ ${#i8_winners[@]} -gt 0 ]; then
+        run G1-I8B 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=0
+        for candidate in "${i8_winners[@]}"; do
+            if [ "$candidate" = I8GU256 ]; then run G1-I8GU256 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=1 STRATA_PF_DOWN_I8_XMX=0 STRATA_PF_I8_SLAB=256
+            else run G1-I8D256 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=1 STRATA_PF_I8_SLAB=256; fi
+        done
+    fi
+elif [ "${ARC_PROFILE_I8_SWEEP:-0}" = 1 ]; then
+    run I8BASE 2k,10k 128 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=0
+    run I8GU 2k,10k 128 STRATA_PF_GU_I8_XMX=1 STRATA_PF_DOWN_I8_XMX=0
+    run I8XMX 2k,10k 128 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=1
+    i8_winners=()
+    for candidate in I8GU I8XMX; do
+        if ! python3 "$ROOT/tools/screen-reject.py" "$out.I8BASE.json" "$out.$candidate.json"; then i8_winners+=("$candidate"); fi
+    done
+    if [ ${#i8_winners[@]} -gt 0 ]; then
+        run G1-I8BASE 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=0
+        for candidate in "${i8_winners[@]}"; do
+            if [ "$candidate" = I8GU ]; then run G1-I8GU 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=1 STRATA_PF_DOWN_I8_XMX=0
+            else run G1-I8XMX 2k,10k 128 ARC_GPUS=0 STRATA_PF_GU_I8_XMX=0 STRATA_PF_DOWN_I8_XMX=1; fi
+        done
+    fi
 elif [ "${ARC_PROFILE_CONTEXT128:-0}" = 1 ]; then
     run C128 short,prose,2k,10k,sampled,agent 128
 elif [ "${ARC_PROFILE_BALANCE_SWEEP:-0}" = 1 ]; then

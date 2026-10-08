@@ -116,8 +116,10 @@ flowchart LR
 На этой машине также были два сбоя ядра в управлении памятью; проверки после перезагрузки прошли,
 но первопричина сбоя хоста не установлена. Подробные положительные и отрицательные результаты — в ENGINEERING.
 CPU-тест `memtester 4G 1` затем обнаружил 8 ошибок данных без работающего движка.
-До исправления целостности памяти хоста дальнейшие проверки GPU и 128K остановлены; таблица относится к 32K,
-а 1000 tok/s и долговременная стабильность ещё не достигнуты.
+На время диагностики хоста проверки были остановлены. После возврата базовых настроек RAM
+и перезагрузки пользователь разрешил продолжение без повторных тестов RAM; новые GPU/128K
+результаты приведены ниже. Эта таблица относится к 32K. 1000 tok/s и долговременная стабильность
+ещё не достигнуты.
 
 Второй запрос того же размера обычно быстрее первого. Скорость декода зависит от того, сколько
 черновиков MTP принято, поэтому длинный промпт не гарантирует одинаковую скорость генерации.
@@ -269,3 +271,73 @@ docs/ENGINEERING.md       подробности: как найдено, что 
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp): CPU-ядра экспертов и энкодер картинок (mtmd).
 
 Код arc-moe распространяется под MIT ([LICENSE](LICENSE)). У Strata и у моделей свои лицензии.
+
+
+### 128K and focused follow-up measurements (2026-10-08)
+
+An explicit 131072-token configuration passed an API request with 123888 actual
+prompt tokens (525.1 prompt tok/s), recovered three labels placed across the
+input, emitted a valid streaming `read_file` tool call on a second long request,
+and rejected an input beyond the configured limit with HTTP 400. This is an API
+capacity/retrieval check, not a guarantee of answer quality on every long task or
+an end-to-end OpenCode session test. The normal 10K cases on this configuration
+measured 461.3/466.6 prompt tok/s and 27.8/29.4 decode tok/s; 128K remains opt-in.
+Use the existing setup option `--context 131072` when provisioning a large-context
+configuration; setup chooses KV residency from available RAM. The measured
+configuration kept all int8 KV in VRAM. A subsequent streaming run with
+32768 resident KV tokens and prompt weight reuse processed 124209 fresh tokens
+at 593.5 tok/s and passed distributed-label/tool checks. A separate 256-token
+code reply at 124219 context tokens decoded at 25.0 tok/s; its reused prefix
+is excluded from fresh prefill throughput. Do not hardcode a two-card layer split for users.
+
+Patch 46 adds experimental integer XMX prompt experts:
+`STRATA_PF_GU_I8_XMX=1` for IQ2_XXS gate/up and
+`STRATA_PF_DOWN_I8_XMX=1` for Q2_0 down. Both are off by default. Runtime matrix
+shape/type and subgroup queries preserve the DP4A fallback on unsupported GPUs.
+Integer grid bytes, scales and truncation are retained; FP32 summation order can
+change. `STRATA_PF_XMX_MIN_ROWS` also controls the minimum average group size for
+these kernels. `ARC_PROFILE_I8_SWEEP=1 ARC_PROFILE_SCREEN=1 ./arc profile` screens
+2K/10K cases and avoids single-card repeats for candidates that lose clearly.
+
+`ARC_PROFILE_LANGUAGE_SWEEP=1 ./arc profile` measures equal-length code and Russian,
+English and Chinese prose with draft windows 2 and 6, then tests draft confidence
+0.35 and 0.65 through per-request `strata_tune` without extra model reloads.
+`tools/bench.py --spec-min-p P` exposes the same existing server option. These
+comparisons must precede any claim of stable 35–40 decode tok/s across languages.
+
+
+Patch 47 adds `STRATA_PF_I8_SLAB=256`; patch 48 adds experimental
+`STRATA_PF_I8_PAD=16` and `STRATA_PF_I8_GROUP_MIN=32`. Integer XMX remained slower
+in the first two screens and is still disabled. Patch49 exposes actual prefill
+weight reuse with `STRATA_PF_GU_SPLIT=1` and `STRATA_PF_SPLIT_ROWS=4/8/16`, avoiding
+the legacy launcher's early fallback without changing decode. Decoded-weight reuse is now enabled by the launcher with four rows: numeric
+parity and all 42 full-response checks pass, and 10K prefill improves on both
+one- and two-card runs. `STRATA_PF_GU_SPLIT=0` restores the prior prompt path.
+The earlier split-row sweep did not reach that kernel under the defaults and
+must not be cited as a measurement of its performance.
+
+## Optional media inputs
+
+Images use Strata's CPU vision encoder. The optional portable `tools/media_mcp.py` bridge adds CPU speech transcription and sampled video for MCP-capable editors; it does not advertise native audio/video support. Setup, limitations and client configuration: [docs/MULTIMODAL.md](docs/MULTIMODAL.md).
+
+Patch 50 exposes `STRATA_PF_GU_SPLIT_LANES=8/16`; neither beat the 32-lane control sufficiently in the screen, so 32 remains selected. Numeric parity passes, but these variants are experiments rather than advertised speed improvements.
+
+### Optional multilingual draft subset
+
+The shipped CJK draft subset omits 18438 IDs in the Cyrillic subset. An isolated
+union improves Russian draft acceptance without changing the model's weights:
+
+```bash
+python3 tools/prepare-draft-vocab.py --rt third_party/strata/data/mtp/rt \
+  --out third_party/strata/data/mtp/rt-multilingual --mode union \
+  --vocab third_party/strata/data/draft_vocab.bin \
+  --vocab third_party/strata/data/draft_vocab_cyrillic.bin
+STRATA_EXTRA_ARGS="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 64 --mtp $PWD/third_party/strata/data/mtp/rt-multilingual" ./arc start
+```
+
+The original MTP directory stays unchanged. This union covers English/code, CJK
+and Cyrillic tokens; it is not a guarantee for every language. The helper also
+supports `--mode full`, which reuses the main classifier head, but that variant
+was slightly slower in the measured cases. `ARC_PROFILE_DRAFT_VOCAB_SWEEP=1`
+and `ARC_PROFILE_DRAFT_VOCAB_SINGLE=1` compare isolated views under
+`test-logs/mtp-union` and `test-logs/mtp-full`; prepare those views first.

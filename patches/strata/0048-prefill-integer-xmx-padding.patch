@@ -1,0 +1,161 @@
+From d7de3b0b103d6766c3053605573a068bc20c685c Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 23:10:30 +0500
+Subject: [PATCH] sycl: opt-in integer XMX padding and small-group DP4A
+ fallback
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 76 +++++++++++++++++++------
+ 1 file changed, 60 insertions(+), 16 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 510bb04..2ecf930 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2707,7 +2707,7 @@ bool pf_i8_supported(const sycl::device& device) {
+         const auto widths = device.get_info<sycl::info::device::sub_group_sizes>();
+         const bool sg8 = std::find(widths.begin(), widths.end(), 8) != widths.end() &&
+                          device.get_info<sycl::info::device::max_work_group_size>() >= 64 &&
+-                         device.get_info<sycl::info::device::local_mem_size>() >= 10752;
++                         device.get_info<sycl::info::device::local_mem_size>() >= 11264;
+         for (const auto& c : device.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>()) {
+             auto fits = [](size_t size, size_t limit, size_t wanted) { return size == wanted || (!size && limit >= wanted); };
+             supported |= sg8 && c.atype == jm::matrix_type::sint8 && c.btype == jm::matrix_type::sint8 &&
+@@ -2724,18 +2724,19 @@ bool pf_i8_supported(const sycl::device& device) {
+ 
+ // Wider K slabs reduce work-group barriers; matrix copies keep coordinate
+ // mapping implementation-defined rather than assuming one column per lane.
+-template <bool Down, int SLAB = 32>
++template <bool Down, int SLAB = 32, int PAD = 0>
+ void launch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long* ptr,
+                    const int32_t* start, const int32_t* ng, const int32_t* dst,
+-                   const block_q8_1* x, NativeExpertLayout L, float* out, float* up) {
++                   const block_q8_1* x, NativeExpertLayout L, float* out, float* up, int group_min) {
+     constexpr int SG = 8, NSG = SLAB > 32 ? 4 : 8, WG = SG * NSG, NT = 8;
++    constexpr int AS = SLAB + PAD;
+     const int nin = Down ? L.n_ff : L.n_embd, nout = Down ? L.n_embd : 2 * L.n_ff;
+     q->submit([&](sycl::handler& h) {
+         sycl::local_accessor<int8_t, 1> bm(sycl::range<1>(NT * SLAB), h);
+         sycl::local_accessor<int, 1> factors(sycl::range<1>(NT * SLAB / 32), h);
+         sycl::local_accessor<float, 1> scales(sycl::range<1>(NT * SLAB / 32), h);
+-        sycl::local_accessor<int8_t, 1> am(sycl::range<1>(NSG * 8 * SLAB), h);
+-        h.parallel_for<dpct_kernel_name<class pf_i8_slab_acm, dpct_kernel_scalar<Down>, dpct_kernel_scalar<SLAB>>>(
++        sycl::local_accessor<int8_t, 1> am(sycl::range<1>(NSG * 8 * AS), h);
++        h.parallel_for<dpct_kernel_name<class pf_i8_slab_acm, dpct_kernel_scalar<Down>, dpct_kernel_scalar<SLAB>, dpct_kernel_scalar<PAD>>>(
+             sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t)((nout + NT - 1) / NT) * WG),
+                               sycl::range<3>(1, 1, WG)),
+             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(8)]] {
+@@ -2752,7 +2753,39 @@ void launch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long*
+                 auto* b = bm.template get_multi_ptr<sycl::access::decorated::no>().get();
+                 auto* ls = factors.template get_multi_ptr<sycl::access::decorated::no>().get();
+                 auto* d = scales.template get_multi_ptr<sycl::access::decorated::no>().get();
+-                auto* a = am.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * 8 * SLAB;
++                auto* a = am.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * 8 * AS;
++                if (group_min > 0 && e1 - e0 < group_min) {
++                    // This branch is uniform over the work-group and precedes all
++                    // work-group barriers. Tiny routed groups avoid padded DPAS work.
++                    constexpr int TY = Down ? 42 : 16;
++                    using S = Split<TY>; using T = Fmt<TY>;
++                    for (int r = f0 + sgid; r < nout && r < f0 + NT; r += NSG) {
++                        const int row = !Down && r >= L.n_ff ? r - L.n_ff : r;
++                        const size_t off = Down ? L.down_off : r >= L.n_ff ? L.up_off : 0;
++                        const auto* w = (const uint8_t*)ptr[g] + off + (size_t)row * (Down ? L.d_row : L.gu_row);
++                        for (int eb = e0; eb < e1; eb += 4) {
++                            const int n = sycl::min(4, e1 - eb);
++                            float sum[4] = {};
++                            for (int j = lane; j < (nin / T::qk) * T::ipb; j += SG) {
++                                const int kb = j / T::ipb, iq = T::step * (j % T::ipb);
++                                const auto wv = S::load(w, kb, iq);
++                                for (int c = 0; c < n; ++c) {
++                                    const int e = eb + c;
++                                    sum[c] += S::apply(wv, x + (size_t)(Down ? e : dst[e]) * (nin / 32) + kb * (T::qk / 32), iq);
++                                }
++                            }
++                            for (int c = 0; c < n; ++c) {
++                                const float value = lanes_sum<8>(sum[c]);
++                                const int e = eb + c;
++                                if (lane == 0) {
++                                    if constexpr (Down) out[(size_t)dst[e] * nout + r] = value;
++                                    else (r >= L.n_ff ? up : out)[(size_t)e * L.n_ff + row] = value;
++                                }
++                            }
++                        }
++                    }
++                    return;
++                }
+                 for (int eb = e0; eb < e1; eb += NSG * 8) {
+                     const int em = eb + sgid * 8;
+                     jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> F;
+@@ -2790,16 +2823,17 @@ void launch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long*
+                         }
+                         for (int i = lane; i < 8 * SLAB; i += SG) {
+                             const int e = em + i / SLAB, k = k0 + i % SLAB;
+-                            a[i] = e < e1 && k < nin ? x[(size_t)(Down ? e : dst[e]) * (nin / 32) + k / 32].qs[k % 32] : 0;
++                            a[(i / SLAB) * AS + i % SLAB] = e < e1 && k < nin ? x[(size_t)(Down ? e : dst[e]) * (nin / 32) + k / 32].qs[k % 32] : 0;
+                         }
+                         it.barrier(sycl::access::fence_space::local_space);
+                         for (int ks = 0; ks < SLAB && k0 + ks < nin; ks += 32) {
++                            if (em >= e1) continue; // subgroup-uniform; outer work-group barriers still execute
+                             jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> A;
+                             jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> B;
+                             jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 8> C;
+                             jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> V;
+                             jm::joint_matrix_fill(sg, C, 0);
+-                            jm::joint_matrix_load(sg, A, lp(a + ks), SLAB);
++                            jm::joint_matrix_load(sg, A, lp(a + ks), AS);
+                             jm::joint_matrix_load(sg, B, lp(b + ks * NT), NT * 4);
+                             jm::joint_matrix_mad(sg, C, A, B, C);
+                             jm::joint_matrix_copy(sg, C, V); // int32 dots fit exactly in FP32
+@@ -2824,6 +2858,22 @@ void launch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long*
+     });
+ }
+ 
++template <bool Down>
++void dispatch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long* ptr,
++                     const int32_t* start, const int32_t* ng, const int32_t* dst,
++                     const block_q8_1* x, NativeExpertLayout L, float* out, float* up) {
++    static const int slab = [] { const char* v = std::getenv("STRATA_PF_I8_SLAB"); return v && std::atoi(v) == 256 ? 256 : 32; }();
++    static const int pad = [] { const char* v = std::getenv("STRATA_PF_I8_PAD"); return v && std::atoi(v) == 16 ? 16 : 0; }();
++    static const int group_min = [] { const char* v = std::getenv("STRATA_PF_I8_GROUP_MIN"); return v ? std::clamp(std::atoi(v), 0, 64) : 0; }();
++    if (slab == 256) {
++        if (pad) launch_pf_i8<Down, 256, 16>(groups, q, ptr, start, ng, dst, x, L, out, up, group_min);
++        else launch_pf_i8<Down, 256, 0>(groups, q, ptr, start, ng, dst, x, L, out, up, group_min);
++    } else {
++        if (pad) launch_pf_i8<Down, 32, 16>(groups, q, ptr, start, ng, dst, x, L, out, up, group_min);
++        else launch_pf_i8<Down, 32, 0>(groups, q, ptr, start, ng, dst, x, L, out, up, group_min);
++    }
++}
++
+ // Prompt-only full expert fusion: gate/up, SwiGLU/q8_1 and down in one work-group.
+ // Hidden activations stay in local memory. The original three kernels remain the default.
+ template <int TG, int NC>
+@@ -2957,15 +3007,10 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
+                          (unsigned)gy);
+-    static const int pf_i8_slab = [] {
+-        const char* v = std::getenv("STRATA_PF_I8_SLAB");
+-        return v && std::atoi(v) == 256 ? 256 : 32;
+-    }();
+     static const bool pf_i8_gu = env_on("STRATA_PF_GU_I8_XMX");
+     if (prefill && !v1 && pf_i8_gu && L.gu_type == 16 && L.n_embd % 256 == 0 &&
+         cap_groups > 0 && cap_entries >= cap_groups * xmx_min_rows && pf_i8_supported(s->get_device())) {
+-        if (pf_i8_slab == 256) launch_pf_i8<false, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+-        else launch_pf_i8<false, 32>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        dispatch_pf_i8<false>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     } else if (use_xmx) {
+         if (xmx_grf128) launch_pf_xmx<false, 128>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         else launch_pf_xmx<false, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+@@ -3040,8 +3085,7 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     static const bool pf_i8 = env_on("STRATA_PF_DOWN_I8_XMX");
+     if (prefill && !v1 && pf_i8 && L.d_type == 42 && L.n_ff % 64 == 0 &&
+         cap_groups > 0 && cap_entries >= cap_groups * xmx_min_rows && pf_i8_supported(s->get_device())) {
+-        if (pf_i8_slab == 256) launch_pf_i8<true, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+-        else launch_pf_i8<true, 32>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
++        dispatch_pf_i8<true>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+     } else if (use_xmx) {
+         if (xmx_grf128) launch_pf_xmx<true, 128>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+         else launch_pf_xmx<true, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+-- 
+2.43.0
+

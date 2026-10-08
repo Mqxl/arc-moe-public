@@ -113,14 +113,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--api-key")
+    ap.add_argument("--spec-min-p", type=float, help="per-request draft confidence threshold (strata_tune)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--long", action="store_true", help="also the ~2K-token code prompt")
     ap.add_argument("--json", help="write the raw rows here")
-    ap.add_argument("--cases", help="comma list of short, prose, 1k, 1.5k, 2k, 8k, 10k, sampled, agent "
+    ap.add_argument("--cases", help="comma list of short, prose, prose-en, prose-zh, prose-ru-long, 1k, 1.5k, 2k, 8k, 10k, sampled, agent "
                                     "(default: short,prose, and 2k with --long)")
     ap.add_argument("--show", action="store_true", help="print every reply's start")
     a = ap.parse_args()
+    if a.spec_min_p is not None and not 0 <= a.spec_min_p <= 1:
+        ap.error("--spec-min-p must be between 0 and 1")
 
     try:
         with urllib.request.urlopen(a.url.rstrip("/") + "/health", timeout=5) as r:
@@ -130,6 +133,9 @@ def main() -> int:
         return 1
 
     known = {"short": ("short code", lambda: SHORT_CODE, None), "prose": ("short prose (ru)", lambda: SHORT_PROSE, None),
+             "prose-en": ("short prose (en)", lambda: "Explain how a mixture of experts language model works, with concrete examples. Write at least ten sentences in English.", None),
+             "prose-zh": ("short prose (zh)", lambda: "用中文解释混合专家语言模型的工作原理，并给出具体例子。请写至少十句话。", None),
+             "prose-ru-long": ("long prose (ru)", lambda: "Объясни устройство языковой модели со смесью экспертов, с конкретными примерами. Напиши не менее десяти предложений по-русски.", None),
              "1k": ("0.7K code", lambda: long_code(2400), None),
              "1.5k": ("1.5K code", lambda: long_code(5000), None),
              "2k": ("2K code", long_code, None), "8k": ("8K code", lambda: long_code(28000), None),
@@ -146,6 +152,8 @@ def main() -> int:
         print(f"unknown case(s) {bad}: pick from {sorted(known)}", file=sys.stderr)
         return 2
     cases = [(known[c][0], known[c][1](), known[c][2]) for c in want]
+    if a.spec_min_p is not None:
+        cases = [(name, prompt, {**(extra or {}), "strata_tune": {"spec_min_p": a.spec_min_p}}) for name, prompt, extra in cases]
     rows = []
     print(f"{'prompt':18s} {'run':>3s} {'in':>6s} {'out':>5s} {'prompt tok/s':>13s} {'decode tok/s':>13s} {'wall s':>7s}")
     n_broken = 0

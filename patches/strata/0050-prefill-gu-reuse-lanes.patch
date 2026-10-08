@@ -1,0 +1,84 @@
+From f55a881568f0d697eb122e11b022f555b3dfc4af Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 23:32:48 +0500
+Subject: [PATCH] sycl: opt-in prompt weight reuse with 8 or 16 lanes per row
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 55 +++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index d68432c..1d846b9 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2273,12 +2273,67 @@ void launch_down_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long l
+     }
+ }
+ 
++// Prompt-only decoded-weight reuse with fewer lanes per row. Formats 16/29
++// do not have a Multi port trait; use their exact Split trait without modifying
++// decode's dispatch or adding a persistent dequantized weight buffer.
++template <int TG, int LN, int NC>
++void launch_gu_reuse_port(unsigned groups, dpct::queue_ptr q,
++                          const unsigned long long* ptr, const int32_t* starts,
++                          const int32_t* ng, const int32_t* tok, const block_q8_1* x,
++                          NativeExpertLayout L, float* gate, float* up) {
++    constexpr int ROWS = 256 / LN;
++    q->parallel_for<dpct_kernel_name<class pf_gu_reuse_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<NC>>>(
++        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t)((2 * L.n_ff + ROWS - 1) / ROWS) * 256), sycl::range<3>(1, 1, 256)),
++        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
++            const int g = it.get_group(1), tid = it.get_local_id(2), lane = tid % LN;
++            const int r = it.get_group(2) * ROWS + tid / LN;
++            if (g >= *ng || r >= 2 * L.n_ff) return;
++            using T = Fmt<TG>; using S = Split<TG>;
++            const bool is_up = r >= L.n_ff;
++            const int row = is_up ? r - L.n_ff : r;
++            const auto* w = (const uint8_t*)ptr[g] + (is_up ? L.up_off : 0) + (size_t)row * L.gu_row;
++            for (int e0 = starts[g]; e0 < starts[g + 1]; e0 += NC) {
++                const int n = sycl::min(NC, starts[g + 1] - e0);
++                int offset[NC]; float sum[NC] = {};
++                for (int c = 0; c < n; ++c) offset[c] = tok[e0 + c] * (L.n_embd / 32);
++                for (int k = lane; k < (L.n_embd / T::qk) * T::ipb; k += LN) {
++                    const int kb = k / T::ipb, iq = T::step * (k % T::ipb);
++                    const auto v = S::load(w, kb, iq);
++#pragma unroll
++                    for (int c = 0; c < NC; ++c)
++                        if (c < n) sum[c] += S::apply(v, x + offset[c] + kb * (T::qk / 32), iq);
++                }
++#pragma unroll
++                for (int c = 0; c < NC; ++c) {
++                    if (c < n) {
++                        const float value = lanes_sum<LN>(sum[c]);
++                        if (lane == 0) (is_up ? up : gate)[(size_t)(e0 + c) * L.n_ff + row] = value;
++                    }
++                }
++            }
++        });
++}
++
+ template <int TG, int NC = GRP_NC>
+ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+                const unsigned long long *grp_ptr, const int32_t *grp_start,
+                const int32_t *n_groups, const int32_t *ent_tok,
+                const block_q8_1 *X, const NativeExpertLayout &L, float *gate,
+                float *up, bool force_split = false) {
++    if constexpr (TG == 16 || TG == 29) {
++        static const int pf_lanes = [] {
++            const char* v = std::getenv("STRATA_PF_GU_SPLIT_LANES");
++            const int n = v ? std::atoi(v) : 32;
++            return n == 8 || n == 16 ? n : 32;
++        }();
++        // Keep tail work subgroup-uniform; arbitrary geometries retain SG32.
++        if (force_split && pf_lanes == 8 && (2 * L.n_ff) % 4 == 0) {
++            launch_gu_reuse_port<TG, 8, NC>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); return;
++        }
++        if (force_split && pf_lanes == 16 && (2 * L.n_ff) % 2 == 0) {
++            launch_gu_reuse_port<TG, 16, NC>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); return;
++        }
++    }
+     if constexpr (!kSplit<TG>) {
+ 
+         launch_gu_lanes<TG>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+-- 
+2.43.0
+

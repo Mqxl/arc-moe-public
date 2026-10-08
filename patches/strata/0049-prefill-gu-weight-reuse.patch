@@ -1,0 +1,69 @@
+From 286c1e8209b1420125a3e819d1936c3891f08c58 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 23:16:21 +0500
+Subject: [PATCH] sycl: select decoded-weight reuse for prefill independently
+ of decode
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 2ecf930..d68432c 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2278,11 +2278,11 @@ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
+                const unsigned long long *grp_ptr, const int32_t *grp_start,
+                const int32_t *n_groups, const int32_t *ent_tok,
+                const block_q8_1 *X, const NativeExpertLayout &L, float *gate,
+-               float *up) {
++               float *up, bool force_split = false) {
+     if constexpr (!kSplit<TG>) {
+ 
+         launch_gu_lanes<TG>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+-    } else if (g_old_kernels || !g_split_multi) {
++    } else if (g_old_kernels || (!g_split_multi && !force_split)) {
+ 
+         launch_gu_lanes<TG>(grid, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     } else {
+@@ -2984,9 +2984,16 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+         const int n = v ? std::atoi(v) : 4;
+         return n == 8 || n == 16 ? n : 4;
+     }();
++    static const bool pf_gu_split = env_on("STRATA_PF_GU_SPLIT");
++    const bool force_gu_split = prefill && !v1 && pf_gu_split && !g_old_kernels;
+     const int average_rows = cap_groups > 0 ? (int)(cap_entries / cap_groups) : 0;
+     const int nc = !prefill || v1 ? 4 : split_rows < 0 ? (average_rows >= 32 ? 16 : average_rows >= 8 ? 8 : 4) : split_rows;
+ 
++    static thread_local int logged_split_rows = -1;
++    if (force_gu_split && logged_split_rows != nc) {
++        std::fprintf(stderr, "strata prefill: gate/up split weight reuse enabled, %d rows (prompt only)\n", nc);
++        logged_split_rows = nc;
++    }
+     static const bool pf_xmx = [] {
+         const char* v = std::getenv("STRATA_PF_EXPERT_KERNEL");
+         return v && std::strcmp(v, "xmx") == 0;
+@@ -3018,13 +3025,15 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     else if (rows > 4 && L.gu_type == 22) {
+         if (rows == 8) launch_gu_port<22, 32, 8>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         else launch_gu_port<22, 32, 16>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+-    } else if (nc > 4 && (L.gu_type == 16 || L.gu_type == 29)) {
++    } else if ((nc > 4 || force_gu_split) && (L.gu_type == 16 || L.gu_type == 29)) {
+         if (L.gu_type == 16) {
+-            if (nc == 8) launch_gu<16, 8>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+-            else launch_gu<16, 16>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++            if (nc == 8) launch_gu<16, 8>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, force_gu_split);
++            else if (nc == 16) launch_gu<16, 16>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, force_gu_split);
++            else launch_gu<16, 4>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, force_gu_split);
+         } else {
+-            if (nc == 8) launch_gu<29, 8>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+-            else launch_gu<29, 16>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++            if (nc == 8) launch_gu<29, 8>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, force_gu_split);
++            else if (nc == 16) launch_gu<29, 16>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, force_gu_split);
++            else launch_gu<29, 4>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, force_gu_split);
+         }
+     } else switch (L.gu_type) {
+ #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+-- 
+2.43.0
+

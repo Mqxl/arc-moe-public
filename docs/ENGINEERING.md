@@ -710,3 +710,101 @@ Before the128K capacity probe, CPU-only memtester4.6.0 tested4GiB of successfull
 The shell chain stopped on memtester's failure, before creating a128K config or issuing128K inference. No128K capacity, quality, throughput or editor compatibility result is claimed. GPU/server tests are left stopped pending repair of host memory integrity;8790 was not started. All earlier speed tables describe observed measurements, not long-term host stability or a proven performance ceiling. New1024+prefill designs should be screened only after the host passes memory tests.
 
 The fresh4GiB confirmation using only SolidBits/Checkerboard (MEMTESTER_TEST_MASK0x500) completed exit0. This narrower pass does not clear the earlier8 failures or test all48GiB. Full offline per-module testing is needed; no module is declared faulty solely from these offsets.
+
+
+## Follow-up after the 2026-10-08 reboot
+
+The operator restored base memory clocks and requested no further RAM tests.
+Optimization resumed with kernel-log observation only. Historical failures above
+remain historical evidence; no new RAM certification is implied.
+
+`profile-20261008-222222.txt` and its C128 context JSON passed the three-label
+124K retrieval, long streaming tool call, and >131072 input rejection checks.
+This configuration uses all-VRAM int8 KV and automatic device placement. Its long
+request achieved 525.1 prompt tok/s, with only nine answer tokens; the 19.3 decode
+rate on that very short answer is not a steady-state decode benchmark.
+
+Patch 46 is a separate opt-in integer XMX experiment: legal SG8 8x8x32 signed
+int8 multiply/int32 accumulate, with original IQ2_XXS integer post-dot scaling and
+Q2_0 signed codes, converted to FP32 at each 32-element activation block. No
+full dequantized weight matrix is allocated. Cached per-thread device queries
+check matrix type, shape and SG8 before dispatch. Other formats and decode keep
+the existing path. Numeric and performance results are recorded below once run.
+
+
+The first integer XMX screen (`profile-20261008-223950.txt`, 32 output tokens,
+two runs) regressed: 10K means DP4A 472.05, integer GU 255.15, integer down 211.4
+prompt tok/s. No single-card repeats were spent on those clear losses. Patch 47
+adds 256-element K slabs and register-only coordinate-preserving accumulation;
+its `profile-20261008-230026.txt` still lost (GU about 262, down 215 prompt tok/s).
+All 48 slab32/slab256 numeric cases passed. Patch 48's padding/small-group DP4A
+fallback is opt-in; only numeric validation is scheduled, with full performance
+screening deferred after the repeated XMX losses.
+
+`profile-20261008-224701.txt` multilingual means (256 output cap, two runs):
+| mode | code | Russian | English | Chinese |
+| --- | ---: | ---: | ---: | ---: |
+| spec2 | 22.75 | 21.45 | 25.70 | 23.60 |
+| spec6 | 32.00 | 19.90 | 25.80 | 23.80 |
+| spec6, confidence0.35 | 31.70 | 18.45 | 23.70 | 22.65 |
+| spec6, confidence0.65 | 32.55 | 20.90 | 25.65 | 24.30 |
+The optional spec0 arm failed because native packs require spec>=2, and remains
+explicitly marked failed in that report; future sweeps omit it. Supported arms
+completed without HTTP/BROKEN errors. No confidence default was changed for the
+small/variable gains.
+
+`profile-20261008-230726.txt` passed the same real 128K tests with KV resident32768
+and automatic placement: retrieval 123888 tokens at 527.9 prompt tok/s, streaming
+tool request 124184 tokens at 529.8. Normal 10K mean 468.55 prompt /29.8 decode,
+short code33.15, short Russian18.9. Relative to the all-VRAM128K run, measured
+cases show a small decode improvement without a prefill loss. Tool decode35.1
+on only26 output tokens is not a steady-state35–40 guarantee.
+
+Dispatch inspection found the old PF_SPLIT_ROWS sweep did not force the split
+kernel: g_split_multi was false (STRATA_EXPERT_SPLIT was verified unset in the
+live engine and runtime config), and launch_gu returned the port kernel before
+the multi-column implementation. Multi<16> and Multi<29> are absent, so the port
+path falls back to per-entry dots for these formats. The old4/8/16 sweep cannot
+be treated as a speed comparison of actual decoded-weight reuse. Patch49 adds a
+prompt-only STRATA_PF_GU_SPLIT switch and explicit force_split argument; it uses
+the existing Split traits and leaves decode dispatch unchanged. New numeric and
+matched speed measurements are required before changing its default.
+
+### Prompt decoded-weight reuse (patches 49–50)
+
+The earlier NC4/NC8/NC16 sweep did not actually select `Split<TG>` for formats 16 and 29: `STRATA_EXPERT_SPLIT` was off, and `launch_gu` returned the port fallback before reaching the multi-column path. Those results cannot establish the performance of weight reuse. Patch 49 adds a prompt-only force flag; decode stays on its original dispatch. No persistent unpacked weight matrix is allocated.
+
+After reboot at the user's baseline RAM settings (no RAM test), `profile-20261008-232414` gives dual-card 10K means: control 472.0, NC4 512.3, NC8 519.6, NC16 518.7 tok/s. All three also improve single-card prefill. Select NC4: within 2% of the best common score, with fewer live accumulators. The 36 focused numeric cases match the decode DP4A result exactly; `check-20261008-234748` passes all 42 cases across base, own-buffers and one-GPU, including long prompts and tool streams.
+
+Patch 50 makes 8/16 lanes per row available only for the new prompt reuse path. Its 72 focused numeric cases pass, but `profile-20261008-234313` finds no >=3% dual-card improvement, so the 32-lane path remains selected. It is an opt-in experiment, not a default speed claim.
+
+Normal-length confirmation (`profile-20261008-235624`, two runs, 128-token cap):
+
+| Mode | 2K prefill | 10K prefill | Short code decode | RU prose decode | 10K code decode | Agent decode |
+|---|---:|---:|---:|---:|---:|---:|
+| Two GPUs | 360.9 | 511.8 | 33.6 | 19.1 | 30.2 | 37.4 |
+| One GPU | 342.9 | 423.2 | 24.8 | 14.1 | 22.0 | 25.9 |
+
+This demonstrates a prompt throughput gain, not 1000 prefill or universal 35–40 decode. Agent replies are shorter than the 128-token cap; language and draft acceptance still affect decode. Launcher defaults now select `STRATA_PF_GU_SPLIT=1` and `STRATA_PF_SPLIT_ROWS=4`; explicit environment overrides remain effective. Context size and layer placement remain user-/hardware-selected.
+
+128K streaming after the GU change (`profile-20261009-000204`): the actual 124209-token request processes fresh input at **593.5 tok/s** and retrieves all three distributed labels into a streaming tool call; oversized input is rejected with HTTP400. A separate 256-token code generation at 124219 tokens decodes at **25.0 tok/s**, not 35–40. It reuses 114688 tokens and reads 9531; do not count reused tokens as fresh prefill throughput. Both requests are saved in the context JSON.
+
+
+### Draft vocabulary coverage
+
+`profile-20261009-002531` compares CJK (106299 IDs), CJK/Cyrillic union
+(124737 IDs) and full classifier with two 256-token runs per language.
+
+| Draft subset | Code decode | Russian decode | English decode | Chinese decode |
+|---|---:|---:|---:|---:|
+| CJK | 32.10 | 19.95 | 25.85 | 23.85 |
+| Union | 31.70 | 29.85 | 25.65 | 23.60 |
+| Full | 31.45 | 29.55 | 25.05 | 23.20 |
+
+All 24 cases pass. The union's Russian gain is about 50%; other measured
+languages lose about 1%. This does not establish universal 35–40 tok/s.
+`tools/prepare-draft-vocab.py` creates separate MTP views with shared dense/expert
+files, so the existing runtime subset is not overwritten.
+Single-card confirmation (`profile-20261009-003400`, 16 clean cases): code
+23.65 -> 23.60, Russian 14.50 -> 21.85, English 20.10 -> 20.05, Chinese
+16.85 -> 16.80 tok/s. The same relative language-specific gain holds on one GPU.

@@ -1,0 +1,218 @@
+From 7489f2fcdf097fbf35cd62c6ed1d1806ddb49794 Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Thu, 8 Oct 2026 22:48:52 +0500
+Subject: [PATCH] sycl: stage wider integer XMX slabs and keep scaled
+ accumulation in registers
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp | 143 +++++++++++++-----------
+ 1 file changed, 78 insertions(+), 65 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index cfae2f5..510bb04 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -2705,7 +2705,9 @@ bool pf_i8_supported(const sycl::device& device) {
+     bool supported = false;
+     try {
+         const auto widths = device.get_info<sycl::info::device::sub_group_sizes>();
+-        const bool sg8 = std::find(widths.begin(), widths.end(), 8) != widths.end();
++        const bool sg8 = std::find(widths.begin(), widths.end(), 8) != widths.end() &&
++                         device.get_info<sycl::info::device::max_work_group_size>() >= 64 &&
++                         device.get_info<sycl::info::device::local_mem_size>() >= 10752;
+         for (const auto& c : device.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>()) {
+             auto fits = [](size_t size, size_t limit, size_t wanted) { return size == wanted || (!size && limit >= wanted); };
+             supported |= sg8 && c.atype == jm::matrix_type::sint8 && c.btype == jm::matrix_type::sint8 &&
+@@ -2720,24 +2722,26 @@ bool pf_i8_supported(const sycl::device& device) {
+     return supported;
+ }
+ 
+-template <bool Down>
++// Wider K slabs reduce work-group barriers; matrix copies keep coordinate
++// mapping implementation-defined rather than assuming one column per lane.
++template <bool Down, int SLAB = 32>
+ void launch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long* ptr,
+-                        const int32_t* start, const int32_t* ng, const int32_t* dst,
+-                        const block_q8_1* x, NativeExpertLayout L, float* out, float* up) {
+-    constexpr int SG = 8, NSG = 8, WG = SG * NSG, NT = 8;
++                   const int32_t* start, const int32_t* ng, const int32_t* dst,
++                   const block_q8_1* x, NativeExpertLayout L, float* out, float* up) {
++    constexpr int SG = 8, NSG = SLAB > 32 ? 4 : 8, WG = SG * NSG, NT = 8;
+     const int nin = Down ? L.n_ff : L.n_embd, nout = Down ? L.n_embd : 2 * L.n_ff;
+     q->submit([&](sycl::handler& h) {
+-        sycl::local_accessor<int8_t, 1> bm(sycl::range<1>(NT * 32), h);
+-        sycl::local_accessor<int, 1> factors(sycl::range<1>(NT), h);
+-        sycl::local_accessor<float, 1> scales(sycl::range<1>(NT), h);
+-        sycl::local_accessor<int8_t, 1> am(sycl::range<1>(NSG * 8 * 32), h);
+-        sycl::local_accessor<int32_t, 1> cm(sycl::range<1>(NSG * 64), h);
+-        h.parallel_for<dpct_kernel_name<class pf_i8_acm, dpct_kernel_scalar<Down>>>(
++        sycl::local_accessor<int8_t, 1> bm(sycl::range<1>(NT * SLAB), h);
++        sycl::local_accessor<int, 1> factors(sycl::range<1>(NT * SLAB / 32), h);
++        sycl::local_accessor<float, 1> scales(sycl::range<1>(NT * SLAB / 32), h);
++        sycl::local_accessor<int8_t, 1> am(sycl::range<1>(NSG * 8 * SLAB), h);
++        h.parallel_for<dpct_kernel_name<class pf_i8_slab_acm, dpct_kernel_scalar<Down>, dpct_kernel_scalar<SLAB>>>(
+             sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t)((nout + NT - 1) / NT) * WG),
+                               sycl::range<3>(1, 1, WG)),
+             [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(8)]] {
+ #pragma clang fp contract(off)
+                 namespace jm = sycl::ext::oneapi::experimental::matrix;
++                namespace im = sycl::ext::intel::experimental::matrix;
+                 const int g = it.get_group(1);
+                 if (g >= *ng) return;
+                 const int tid = it.get_local_id(2), sgid = tid / SG, lane = tid % SG;
+@@ -2748,70 +2752,73 @@ void launch_pf_i8(unsigned groups, dpct::queue_ptr q, const unsigned long long*
+                 auto* b = bm.template get_multi_ptr<sycl::access::decorated::no>().get();
+                 auto* ls = factors.template get_multi_ptr<sycl::access::decorated::no>().get();
+                 auto* d = scales.template get_multi_ptr<sycl::access::decorated::no>().get();
+-                auto* a = am.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * 256;
+-                auto* c = cm.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * 64;
++                auto* a = am.template get_multi_ptr<sycl::access::decorated::no>().get() + sgid * 8 * SLAB;
+                 for (int eb = e0; eb < e1; eb += NSG * 8) {
+                     const int em = eb + sgid * 8;
+-                    float sum[8] = {};
+-                    for (int k0 = 0; k0 < nin; k0 += 32) {
++                    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> F;
++                    jm::joint_matrix_fill(sg, F, 0.f);
++                    for (int k0 = 0; k0 < nin; k0 += SLAB) {
+                         it.barrier(sycl::access::fence_space::local_space);
+-                        if constexpr (Down) {
+-                            for (int i = tid; i < NT * 32; i += WG) {
+-                                const int n = i % NT, k = i / NT, r = f0 + n, j = (k0 + k) % 64;
+-                                int value = 0;
+-                                if (r < nout) {
+-                                    const auto* w = (const block_q2_0*)((const uint8_t*)ptr[g] + L.down_off + (size_t)r * L.d_row);
+-                                    value = ((w[k0 / 64].qs[j / 4] >> (2 * (j % 4))) & 3) - 1;
++                        for (int block = tid; block < NT * SLAB / 32; block += WG) {
++                            const int col = block % NT, ks = (block / NT) * 32, r = f0 + col;
++                            float scale = 0.f; int factor = 0;
++                            if constexpr (Down) {
++                                const block_q2_0* w = r < nout ? (const block_q2_0*)((const uint8_t*)ptr[g] + L.down_off + (size_t)r * L.d_row) : nullptr;
++                                const int kk = k0 + ks;
++                                if (w && kk < nin) scale = (float)w[kk / 64].d;
++                                for (int j = 0; j < 32; ++j) {
++                                    const int k = ks + j, jj = (kk + j) % 64;
++                                    const int value = w && kk < nin ? ((w[kk / 64].qs[jj / 4] >> (2 * (jj % 4))) & 3) - 1 : 0;
++                                    b[(k / 4) * (NT * 4) + col * 4 + k % 4] = (int8_t)value;
+                                 }
+-                                b[(k / 4) * (NT * 4) + n * 4 + k % 4] = (int8_t)value;
+-                            }
+-                            if (tid < NT) {
+-                                const int r = f0 + tid;
+-                                d[tid] = r < nout ? (float)((const block_q2_0*)((const uint8_t*)ptr[g] + L.down_off + (size_t)r * L.d_row))[k0 / 64].d : 0.f;
+-                            }
+-                        } else if (tid < NT) {
+-                            const int r = f0 + tid;
+-                            Split<16>::W w{};
+-                            if (r < nout) {
+-                                const int row = r >= L.n_ff ? r - L.n_ff : r;
+-                                const size_t off = r >= L.n_ff ? L.up_off : 0;
+-                                w = Split<16>::load((const uint8_t*)ptr[g] + off + (size_t)row * L.gu_row,
+-                                                    k0 / 256, 2 * ((k0 % 256) / 32));
++                            } else {
++                                Split<16>::W w{};
++                                const int kk = k0 + ks;
++                                if (r < nout && kk < nin) {
++                                    const int row = r >= L.n_ff ? r - L.n_ff : r;
++                                    const size_t off = r >= L.n_ff ? L.up_off : 0;
++                                    w = Split<16>::load((const uint8_t*)ptr[g] + off + (size_t)row * L.gu_row,
++                                                        kk / 256, 2 * ((kk % 256) / 32));
++                                }
++                                for (int j = 0; j < 32; ++j) {
++                                    const int k = ks + j;
++                                    b[(k / 4) * (NT * 4) + col * 4 + k % 4] = (int8_t)((uint32_t)w.g[j / 4] >> (8 * (j % 4)));
++                                }
++                                scale = w.dw; factor = w.ls;
+                             }
+-                            for (int j = 0; j < 32; ++j)
+-                                b[(j / 4) * (NT * 4) + tid * 4 + j % 4] = (int8_t)((uint32_t)w.g[j / 4] >> (8 * (j % 4)));
+-                            d[tid] = w.dw; ls[tid] = w.ls;
++                            d[block] = scale; ls[block] = factor;
+                         }
+-                        for (int i = lane; i < 256; i += SG) {
+-                            const int e = em + i / 32;
+-                            a[i] = e < e1 ? x[(size_t)(Down ? e : dst[e]) * (nin / 32) + k0 / 32].qs[i % 32] : 0;
++                        for (int i = lane; i < 8 * SLAB; i += SG) {
++                            const int e = em + i / SLAB, k = k0 + i % SLAB;
++                            a[i] = e < e1 && k < nin ? x[(size_t)(Down ? e : dst[e]) * (nin / 32) + k / 32].qs[k % 32] : 0;
+                         }
+                         it.barrier(sycl::access::fence_space::local_space);
+-                        jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> A;
+-                        jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> B;
+-                        jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 8> C;
+-                        jm::joint_matrix_fill(sg, C, 0);
+-                        jm::joint_matrix_load(sg, A, lp(a), 32);
+-                        jm::joint_matrix_load(sg, B, lp(b), NT * 4);
+-                        jm::joint_matrix_mad(sg, C, A, B, C);
+-                        jm::joint_matrix_store(sg, C, lp(c), 8, jm::layout::row_major);
+-                        sycl::group_barrier(sg);
+-                        for (int t = 0; t < 8; ++t) {
+-                            const int e = em + t;
+-                            if (e < e1) {
+-                                // Preserve IQ2_XXS integer scaling/truncation before conversion to FP32.
+-                                const int dot = Down ? c[t * 8 + lane] : c[t * 8 + lane] * ls[lane] / 8;
+-                                sum[t] += (d[lane] * (float)x[(size_t)(Down ? e : dst[e]) * (nin / 32) + k0 / 32].ds[0]) * dot;
+-                            }
++                        for (int ks = 0; ks < SLAB && k0 + ks < nin; ks += 32) {
++                            jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, 8, 32, jm::layout::row_major> A;
++                            jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, 32, 8, jm::layout::ext_intel_packed> B;
++                            jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, 8, 8> C;
++                            jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 8, 8> V;
++                            jm::joint_matrix_fill(sg, C, 0);
++                            jm::joint_matrix_load(sg, A, lp(a + ks), SLAB);
++                            jm::joint_matrix_load(sg, B, lp(b + ks * NT), NT * 4);
++                            jm::joint_matrix_mad(sg, C, A, B, C);
++                            jm::joint_matrix_copy(sg, C, V); // int32 dots fit exactly in FP32
++                            im::joint_matrix_apply(sg, V, [&](float& value, size_t row, size_t col) {
++                                const int e = em + row;
++                                const int idx = (ks / 32) * NT + col;
++                                const int dot = Down ? (int)value : (int)value * ls[idx] / 8;
++                                value = e < e1 ? (d[idx] * (float)x[(size_t)(Down ? e : dst[e]) * (nin / 32) + (k0 + ks) / 32].ds[0]) * dot : 0.f;
++                            });
++                            jm::joint_matrix_apply(sg, V, F, [](const float& value, float& sum) { sum += value; });
+                         }
+                     }
+-                    for (int t = 0; t < 8; ++t) {
+-                        const int e = em + t, r = f0 + lane;
++                    im::joint_matrix_apply(sg, F, [&](float& value, size_t row, size_t col) {
++                        const int e = em + row, r = f0 + col;
+                         if (e < e1 && r < nout) {
+-                            if constexpr (Down) out[(size_t)dst[e] * nout + r] = sum[t];
+-                            else (r >= L.n_ff ? up : out)[(size_t)e * L.n_ff + (r >= L.n_ff ? r - L.n_ff : r)] = sum[t];
++                            if constexpr (Down) out[(size_t)dst[e] * nout + r] = value;
++                            else (r >= L.n_ff ? up : out)[(size_t)e * L.n_ff + (r >= L.n_ff ? r - L.n_ff : r)] = value;
+                         }
+-                    }
++                    });
+                 }
+             });
+     });
+@@ -2950,10 +2957,15 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
+                          (unsigned)gy);
++    static const int pf_i8_slab = [] {
++        const char* v = std::getenv("STRATA_PF_I8_SLAB");
++        return v && std::atoi(v) == 256 ? 256 : 32;
++    }();
+     static const bool pf_i8_gu = env_on("STRATA_PF_GU_I8_XMX");
+     if (prefill && !v1 && pf_i8_gu && L.gu_type == 16 && L.n_embd % 256 == 0 &&
+         cap_groups > 0 && cap_entries >= cap_groups * xmx_min_rows && pf_i8_supported(s->get_device())) {
+-        launch_pf_i8<false>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        if (pf_i8_slab == 256) launch_pf_i8<false, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        else launch_pf_i8<false, 32>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     } else if (use_xmx) {
+         if (xmx_grf128) launch_pf_xmx<false, 128>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         else launch_pf_xmx<false, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+@@ -3028,7 +3040,8 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     static const bool pf_i8 = env_on("STRATA_PF_DOWN_I8_XMX");
+     if (prefill && !v1 && pf_i8 && L.d_type == 42 && L.n_ff % 64 == 0 &&
+         cap_groups > 0 && cap_entries >= cap_groups * xmx_min_rows && pf_i8_supported(s->get_device())) {
+-        launch_pf_i8<true>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
++        if (pf_i8_slab == 256) launch_pf_i8<true, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
++        else launch_pf_i8<true, 32>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+     } else if (use_xmx) {
+         if (xmx_grf128) launch_pf_xmx<true, 128>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+         else launch_pf_xmx<true, 256>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+-- 
+2.43.0
+

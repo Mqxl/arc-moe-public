@@ -34,6 +34,9 @@ arc_engine_env() {   # export the defaults above; a variable already set (even e
     # Eager immutable loan copies cost extra host RAM; the engine bounds the pool and falls back.
     export STRATA_PF_PIN_LOAN="${STRATA_PF_PIN_LOAN-2}"
     export STRATA_PF_PIN_REFILL="${STRATA_PF_PIN_REFILL-1}"
+    # Prompt-only decoded-weight reuse: numeric parity, full check234748, dual/single screens pass.
+    export STRATA_PF_GU_SPLIT="${STRATA_PF_GU_SPLIT-1}"
+    export STRATA_PF_SPLIT_ROWS="${STRATA_PF_SPLIT_ROWS-4}"
 }
 
 if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'; else B='' G='' Y='' R='' D='' N=''; fi
