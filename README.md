@@ -328,11 +328,11 @@ The shipped CJK draft subset omits 18438 IDs in the Cyrillic subset. An isolated
 union improves Russian draft acceptance without changing the model's weights:
 
 ```bash
-python3 tools/prepare-draft-vocab.py --rt third_party/strata/data/mtp/rt \
-  --out third_party/strata/data/mtp/rt-multilingual --mode union \
+python3 tools/prepare-draft-vocab.py --rt data/mtp/rt \
+  --out data/mtp/rt-multilingual --mode union \
   --vocab third_party/strata/data/draft_vocab.bin \
   --vocab third_party/strata/data/draft_vocab_cyrillic.bin
-STRATA_EXTRA_ARGS="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 64 --mtp $PWD/third_party/strata/data/mtp/rt-multilingual" ./arc start
+STRATA_EXTRA_ARGS="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 64 --mtp $PWD/data/mtp/rt-multilingual" ./arc start
 ```
 
 The original MTP directory stays unchanged. This union covers English/code, CJK
