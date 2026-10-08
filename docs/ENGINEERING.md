@@ -808,3 +808,59 @@ files, so the existing runtime subset is not overwritten.
 Single-card confirmation (`profile-20261009-003400`, 16 clean cases): code
 23.65 -> 23.60, Russian 14.50 -> 21.85, English 20.10 -> 20.05, Chinese
 16.85 -> 16.80 tok/s. The same relative language-specific gain holds on one GPU.
+
+The isolated union also passes 12 live checks, two sampled/agent runs and a
+123928-token distributed retrieval/tool request (`test-logs/context-multilingual.json`).
+Its separate 256-token code probe at 124219 context tokens decodes at 24.5 tok/s;
+114688 cached tokens are not fresh prefill. The fresh capacity probe ran while
+a model download was active and is a correctness result, not a matched speed claim.
+
+Power screening on the measured host: setting 180/160 W sustained limits leaves
+10K prefill around 510 tok/s and code decode around 32 tok/s, but does not prove
+cooling. The driver averages over 28 seconds; measured mean GPU power is below
+160 W and short peaks still reach ~187 W. Warm-up explains increasing peaks
+from 81 to 85 C across the arms. Both 225 W limits were restored. Sysman reports
+voltage-offset control unsupported and fan control unavailable; no undervolt or
+fan curve has been applied. Power limits are host experiments, not repo defaults.
+
+
+### Alternative Q2_0 quantization screen
+
+The Q2_0 first shard was downloaded and SHA256-verified; its identical second
+shard was reused. Same engine, 128K/32768 resident KV, MTP union, copy settings
+and host power limits as the IQ2_XS serving configuration. Two 256-token runs
+per case (`test-logs/bench-q2.json`): 2K prefill 287.8, 10K prefill 401.9; code
+decode 26.5, Russian 23.1, English 21.95, Chinese 18.2, 10K code 24.0 tok/s.
+All 16 benchmark responses and all 12 short live checks pass. It loses to the
+measured IQ2_XS configuration on both prompt and decode throughput, so it is
+not promoted; no full Q2_0 profile or 128K stress repeat was run. These results
+are specific to this engine/hardware, not a general ranking of quant formats.
+
+Matched 128K union control (`test-logs/bench-iq2-trim.json`) confirms IQ2_XS
+10K prefill 507.7/code decode 29.9, short code 31.6, RU 29.55, EN 25.45, ZH
+23.35 tok/s. `STRATA_STAGE_TRIM=1` alone was inactive with automatic splitting:
+the engine condition requires an explicit split. Treat this run as a control,
+not evidence of trimming performance.
+
+An explicit 34/14 split (equal to the control's chosen split) activates trimming
+and is confirmed by the dense-layer loading lines. Two 256-token runs per case:
+
+| Case | Auto control decode | Explicit trim decode | Explicit trim prefill |
+|---|---:|---:|---:|
+| Short code | 31.60 | 32.90 | 47.40 |
+| Russian | 29.55 | 30.35 | 58.20 |
+| English | 25.45 | 26.10 | 54.50 |
+| Chinese | 23.35 | 24.05 | 52.80 |
+| 2K code | 29.05 | 30.30 | 357.15 |
+| 10K code | 29.90 | 31.15 | 510.00 |
+| Sampled code | 28.35 | 31.00 | 53.65 |
+| Agent | 40.00 | 43.20 | 146.20 |
+
+All 16 responses pass. Agent replies are short; their rate is not a steady-state
+43 tok/s guarantee. This split is an opt-in host result, not a common default.
+Final validation passes all 14 live checks, including both 10K rows, and the
+124209-token retrieval/tool request (`test-logs/context-final.json`): fresh
+prefill **597.0 tok/s**, zero reused input. A separate 124219-token code request
+produces 256 tokens at **25.5 tok/s**, with 114688 cached input tokens and 9531
+fresh tokens. Overflow is rejected. This establishes the tested capacity and
+correctness cases, not universal long-context quality or long-term stability.
