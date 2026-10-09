@@ -1,0 +1,323 @@
+From 497a506f6d3f659e14dac22d8fa4942a1fbd87bf Mon Sep 17 00:00:00 2001
+From: arc-moe <arc-moe@localhost>
+Date: Fri, 9 Oct 2026 02:47:37 +0500
+Subject: [PATCH] sycl: opt-in prompt expert parallelism through pinned host
+ buffers
+
+---
+ include/strata/prefill/prefill.hpp |   4 +
+ sycl/src/prefill/prefill.cpp       | 217 ++++++++++++++++++++++++++++-
+ sycl/src/program/generate.cpp      |   5 +
+ 3 files changed, 224 insertions(+), 2 deletions(-)
+
+diff --git a/include/strata/prefill/prefill.hpp b/include/strata/prefill/prefill.hpp
+index 59f7dfb..047997c 100644
+--- a/include/strata/prefill/prefill.hpp
++++ b/include/strata/prefill/prefill.hpp
+@@ -161,6 +161,10 @@ public:
+     /// run `init`.
+     bool set_stage_helper(Prefill* helper, std::string& err);
+ 
++    /// STRATA_PF_EP=1: bounded native expert share on another layer stage, via pinned host.
++    /// Decode placement stays intact; call after both prompt paths are initialized.
++    bool set_prompt_ep(Prefill* partner, std::string& err);
++
+ private:
+     // Stage-1 pipeline: intermediate stages return after handing their chunk to
+     // the direct successor. The public run() drains the chain once at prompt end.
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index f03534e..7e4f1ed 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -495,6 +495,43 @@ struct PeerPrefill {
+     }
+ };
+ 
++
++// Prompt-only expert parallelism. Decode keeps its original cache and layer split.
++// Peer weights are streamed into a bounded layer cache; no foreign USM pointer is
++// dereferenced by a kernel. All cross-device transfers pass through pinned host RAM.
++struct PromptEp {
++    static constexpr int B = 2048, G = 16;
++    int owner = -1, peer = -1;
++    double share = 0;
++    dpct::queue_ptr oq = nullptr, pq = nullptr, cq = nullptr, rq = nullptr;
++    uint8_t *hx = nullptr, *hw = nullptr, *xq = nullptr, *weights = nullptr, *table = nullptr;
++    float *hy = nullptr, *y = nullptr;
++    int32_t *map = nullptr, *ident = nullptr;
++    void* scratch = nullptr;
++    std::vector<void*> host_owned, device_owned;
++    std::vector<int32_t> rows;
++    std::vector<int32_t> count, offset;
++    std::vector<const uint8_t*> blobs;
++    std::vector<char> device_blob;
++    size_t slot_bytes = 0;
++    int64_t layers = 0, entries = 0;
++    double ms = 0;
++    ~PromptEp() {
++        if (oq) oq->wait();
++        if (pq) pq->wait();
++        if (cq) cq->wait();
++        if (rq) rq->wait();
++        if (pq) for (void* p : device_owned) sycl::free(p, *pq);
++        if (oq) for (void* p : host_owned) sycl::free(p, *oq);
++        const int prev = dpct::get_current_device_id();
++        if (pq) { dpct::select_device(peer); dpct::get_current_device().destroy_queue(pq); }
++        if (cq) { dpct::select_device(peer); dpct::get_current_device().destroy_queue(cq); }
++        if (rq) { dpct::select_device(peer); dpct::get_current_device().destroy_queue(rq); }
++        if (oq) { dpct::select_device(owner); dpct::get_current_device().destroy_queue(oq); }
++        dpct::select_device(prev);
++    }
++};
++
+ struct Prefill::Impl {
+     const core::WeightTable* wt = nullptr;
+     const core::ModelGeometry* g = nullptr;
+@@ -591,6 +628,7 @@ struct Prefill::Impl {
+     // C-4: the chunk's token ids on the device, for one batched embedding gather
+     int32_t* tok_dev = nullptr;
+     std::vector<int32_t> tok_host;
++    std::unique_ptr<PromptEp> ep;
+     std::unique_ptr<PeerPrefill> pp;         // multi-GPU: the peer GPU's expert share (set_peer)
+ };
+ 
+@@ -1156,6 +1194,77 @@ catch (sycl::exception const &exc) {
+ 
+ int64_t Prefill::chunk() const { return impl_->T; }
+ 
++
++bool Prefill::set_prompt_ep(Prefill* partner, std::string& err) {
++    Impl& m = *impl_;
++    const char* enabled = std::getenv("STRATA_PF_EP");
++    if (!enabled || std::strcmp(enabled, "1") != 0 || !partner || partner == this) return true;
++    Impl& other = *partner->impl_;
++    if (m.device == other.device || m.device < 0 || other.device < 0) return true;
++    if (!pf_grouped_env() || !strata::kernels::cpu::expert_layout().native || mmq_plan().any) {
++        err = "prompt EP requires the grouped native path (MMQ/peer mode unsupported)"; return false;
++    }
++    const core::OnDevice restore(m.device);
++    auto ep = std::make_unique<PromptEp>();
++    ep->owner = m.device; ep->peer = other.device;
++    ep->slot_bytes = (size_t) MAXBLOB();
++    try {
++        ep->oq = dpct::get_current_device().create_queue(true);
++        auto host = [&](size_t n) {
++            void* p = sycl::malloc_host(n, *ep->oq);
++            if (!p) throw std::bad_alloc();
++            ep->host_owned.push_back(p); return p;
++        };
++        ep->hx = (uint8_t*) host((size_t)m.T_max * (N/32) * 36);
++        ep->hw = (uint8_t*) host(2 * PromptEp::G * ep->slot_bytes);
++        ep->hy = (float*) host(2 * PromptEp::B * N * 4);
++        dpct::select_device(ep->peer);
++        ep->pq = dpct::get_current_device().create_queue(true);
++        ep->cq = dpct::get_current_device().create_queue(true);
++        ep->rq = dpct::get_current_device().create_queue(true);
++        auto device = [&](size_t n) {
++            void* p = sycl::malloc_device(n, *ep->pq);
++            if (!p) throw std::bad_alloc();
++            ep->device_owned.push_back(p); return p;
++        };
++        ep->xq = (uint8_t*) device((size_t)m.T_max * (N/32) * 36);
++        ep->weights = (uint8_t*) device(2 * PromptEp::G * ep->slot_bytes);
++        ep->table = (uint8_t*) device(1024);
++        ep->map = (int32_t*) device((size_t)m.T_max * K * 4);
++        ep->ident = (int32_t*) device(PromptEp::B * 4);
++        ep->scratch = device(strata::kernels::native_expert_scratch_bytes(PromptEp::B, 640));
++        ep->y = (float*) device(2 * PromptEp::B * N * 4);
++        pfg_iota(ep->ident, PromptEp::B, ep->pq);
++        ep->pq->wait();
++        // Measure the real pinned-host link. Reuse the layer cache, with a warm-up
++        // excluded; explicit --pcie-frac must not make the EP ratio a guess.
++        auto probe = [&](dpct::queue_ptr q, void* dst) {
++            const size_t bytes = std::min<size_t>(8u<<20, PromptEp::G * ep->slot_bytes);
++            std::memset(ep->hw, 0, bytes);
++            q->memcpy(dst, ep->hw, bytes).wait();
++            const auto t = Clock::now();
++            for (int i=0; i<8; ++i) q->memcpy(dst, ep->hw, bytes);
++            q->wait(); return bytes * 8.0 / (ms_since(t) * 1e6);
++        };
++        const double peer_bw = probe(ep->pq, ep->weights);
++        dpct::select_device(m.device);
++        void* tmp = sycl::malloc_device(8u<<20, *ep->oq);
++        if (!tmp) throw std::bad_alloc();
++        double owner_bw = 0;
++        try { owner_bw = probe(ep->oq, tmp); }
++        catch (...) { sycl::free(tmp, *ep->oq); throw; }
++        sycl::free(tmp, *ep->oq);
++        ep->share = std::clamp(peer_bw / (owner_bw + peer_bw), 0.1, 0.65);
++        std::fprintf(stderr, "strata prompt EP: GPU%d -> GPU%d: owner %.2f peer %.2f GB/s, peer rows %.1f%%; "
++                             "bounded double-buffered %d-expert cache, FP32 result transport; existing stage pipeline retained\n",
++                     m.device, ep->peer, owner_bw, peer_bw, 100*ep->share, PromptEp::G);
++        m.ep = std::move(ep);
++        return true;
++    } catch (const std::exception& ex) {
++        err = std::string("prompt EP allocation/probe: ") + ex.what(); return false;
++    }
++}
++
+ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                        std::string& err) {
+     Impl& m = *impl_;
+@@ -1746,7 +1855,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+     std::future<bool> next_run;
+     int hand_buf = 0;
+     const char* pipe_env = std::getenv("STRATA_PF_PIPELINE");
+-    const bool pipeline = !pipe_env || pipe_env[0] != '0';  // preserve the existing two-stage pipeline
++    const char* ep_pipe = std::getenv("STRATA_PF_EP_PIPELINE");
++    const bool pipeline = (!pipe_env || pipe_env[0] != '0') && (!m.ep || !ep_pipe || ep_pipe[0] != '0');  // preserve the existing two-stage pipeline
+ 
+     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+     double grp_wait_ms = 0, grp_cpu_ms = 0;   // the per-layer grouping: the drain wait, the host's loops
+@@ -2853,6 +2963,26 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             }
+                             rows_local = T * K - rows_peer;
+                         }
++
++                        const bool ep_layer = m.ep && T >= 1024 && !use_mmq && !stream_all && m.Xs && lay.native &&
++                            strata::kernels::native_expert_supported(lay.fmt[(size_t)l].gu_type, lay.fmt[(size_t)l].d_type, N, lay.fmt[(size_t)l].n_ff);
++                        if (ep_layer) {
++                            on_peer.assign((size_t)m.g->n_expert, 0);
++                            rows_peer = 0;
++                            const int64_t target = (int64_t)(T * K * m.ep->share);
++                            // Prefer experts already pinned on the host; otherwise a resident
++                            // owner blob is explicitly downloaded, never read via foreign USM.
++                            for (int pass=0; pass<2; ++pass)
++                                for (int32_t e=0; e<m.g->n_expert; ++e) {
++                                    const int c = m.cnt[(size_t)e];
++                                    if (!c || on_peer[(size_t)e] || rows_peer+c > target) continue;
++                                    const bool pinned = source_pinned(l,e);
++                                    if (pinned != (pass==0)) continue;
++                                    if (!pinned && (!m.cache || !m.host_res || m.host_res[(size_t)l*m.g->n_expert+e]<0)) continue;
++                                    on_peer[(size_t)e] = 1; rows_peer += c;
++                                }
++                            rows_local = T*K-rows_peer;
++                        }
+                         {
+                             int32_t r = 0;
+                             for (int32_t e = 0; e < m.g->n_expert; ++e)
+@@ -2908,7 +3038,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         // arc-moe: this layer's experts through the grouped native kernels (see pf_grouped_env); they
+                         // borrow the FP16 path's activation buffer (Xs) for their scratch, staging and q8_1 rows
+                         const bool grouped_l = pf_grouped_env() && lay.native && !use_mmq && !stream_all && m.Xs != nullptr &&
+-                                               on_peer.empty() && m.src != nullptr &&
++                                               (on_peer.empty() || ep_layer) && m.src != nullptr &&
+                                                strata::kernels::native_expert_supported(lay.fmt[(size_t) l].gu_type,
+                                                                                         lay.fmt[(size_t) l].d_type, N,
+                                                                                         lay.fmt[(size_t) l].n_ff);
+@@ -3506,6 +3636,88 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 err = std::string("prefill (grouped experts): ") + ex.what();
+                                 return false;
+                             }
++
++                            std::string ep_err;
++                            std::future<bool> ep_run;
++                            if (ep_layer && rows_peer) {
++                                PromptEp& P = *m.ep;
++                                P.rows.assign(src_h+rows_local, src_h+T*K);
++                                P.count.clear(); P.offset.clear(); P.blobs.clear(); P.device_blob.clear();
++                                for (int32_t e : order_peer) {
++                                    P.count.push_back(m.cnt[(size_t)e]);
++                                    P.offset.push_back(m.off[(size_t)e]-(int32_t)rows_local);
++                                    const bool pinned = source_pinned(l,e);
++                                    P.blobs.push_back(pinned ? source_blob(l,e) : m.cache->device_slot(m.host_res[(size_t)l*m.g->n_expert+e]));
++                                    P.device_blob.push_back(!pinned);
++                                    if (!P.blobs.back()) { err="prompt EP missing expert blob"; return false; }
++                                }
++                                const sycl::event ready = m.cs->ext_oneapi_submit_barrier();
++                                P.oq->ext_oneapi_submit_barrier({ready});
++                                auto input_ready = P.oq->memcpy(P.hx, xq, (size_t)T*(N/32)*36);
++                                ep_run = std::async(std::launch::async, [&, input_ready, NL, l, T, rows_local, blob]() mutable {
++                                    const core::OnDevice on(P.peer);
++                                    const auto start = Clock::now();
++                                    try {
++                                        input_ready.wait_and_throw();
++
++                                        P.cq->memcpy(P.xq, P.hx, (size_t)T*(N/32)*36);
++                                        auto maps_ready=P.cq->memcpy(P.map, P.rows.data(), P.rows.size()*4);
++                                        P.pq->ext_oneapi_submit_barrier({maps_ready});
++                                        size_t ei=0; int within=0; int32_t done=0, batch=0;
++                                        // Keep metadata addresses alive until the corresponding DMA completes.
++                                        std::vector<std::vector<uint8_t>> tables;
++                                        std::future<void> returned[2];
++                                        while (ei<P.count.size()) {
++                                            const int bank=batch++&1;
++                                            if (returned[bank].valid()) returned[bank].get();
++                                            tables.emplace_back(512,0);
++                                            uint8_t* ht=tables.back().data();
++                                            auto* hn=(int32_t*)ht; auto* hs=hn+4;
++                                            auto* hp=(unsigned long long*)(ht+256);
++                                            auto* weights=P.weights+(size_t)bank*PromptEp::G*P.slot_bytes;
++                                            auto* host_weights=P.hw+(size_t)bank*PromptEp::G*P.slot_bytes;
++                                            auto* table=P.table+bank*512;
++                                            auto* output=P.y+(size_t)bank*PromptEp::B*N;
++                                            auto* host_output=P.hy+(size_t)bank*PromptEp::B*N;
++                                            int nr=0, ng=0;
++                                            while (ei<P.count.size() && ng<PromptEp::G && nr<PromptEp::B) {
++                                                const int take=std::min(P.count[ei]-within, PromptEp::B-nr);
++                                                const uint8_t* host=P.blobs[ei];
++                                                if (P.device_blob[ei]) {
++                                                    auto* slot=host_weights+(size_t)ng*P.slot_bytes;
++                                                    P.oq->memcpy(slot, host, blob).wait_and_throw(); host=slot;
++                                                }
++                                                auto* dst=weights+(size_t)ng*P.slot_bytes;
++                                                P.cq->memcpy(dst, host, blob);
++                                                hs[ng]=nr; hp[ng]=(unsigned long long)dst;
++                                                nr+=take; ++ng; within+=take;
++                                                if (within==P.count[ei]) { ++ei; within=0; }
++                                            }
++                                            hn[0]=ng; hs[ng]=nr;
++                                            auto uploaded=P.cq->memcpy(table, ht, 512);
++                                            P.pq->ext_oneapi_submit_barrier({uploaded});
++                                            const int32_t* dn=(const int32_t*)table;
++                                            strata::kernels::native_prefill_expert_grouped(NL,
++                                                (const unsigned long long*)(table+256), dn+4, dn,
++                                                P.ident, P.map+done, ng, nr, P.xq, P.scratch, output, P.pq);
++                                            auto computed=P.pq->ext_oneapi_submit_barrier();
++                                            P.rq->ext_oneapi_submit_barrier({computed});
++                                            auto downloaded=P.rq->memcpy(host_output, output, (size_t)nr*N*4);
++                                            float* dst=m.Dm+(size_t)(rows_local+done)*N;
++                                            returned[bank]=std::async(std::launch::async, [&, downloaded, host_output, dst, nr]() mutable {
++                                                downloaded.wait_and_throw();
++                                                P.oq->memcpy(dst, host_output, (size_t)nr*N*4).wait_and_throw();
++                                            });
++                                            done+=nr;
++                                        }
++                                        for (auto& r : returned) if (r.valid()) r.get();
++                                        ++P.layers; P.entries+=done; P.ms+=ms_since(start);
++                                        return true;
++                                    } catch (const std::exception& ex) {
++                                        ep_err=std::string("prompt EP layer ")+std::to_string(l)+": "+ex.what(); return false;
++                                    }
++                                });
++                            }
+                             pfg_iota(iota, T, m.cs);
+                             if (m.pfg_host.size() < ((size_t) m.g->n_expert + 1) * al(gt_b))
+                                 m.pfg_host.assign(((size_t) m.g->n_expert + 1) * al(gt_b), 0);
+@@ -3598,6 +3810,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                 }
+                                 host_off += al(gt_b);
+                             }
++                            if (ep_run.valid() && !ep_run.get()) { err=ep_err; return false; }
+                         } else if (!stream_all) {
+                             size_t staged = 0;
+                             const size_t lookahead = STAGE - 1;
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 686eded..97bd191 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -5433,6 +5433,11 @@ int main(int argc, char **argv) try {
+                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
+             return 1;
+         }
++        if (stages.size() == 1) {
++            if (!sp.set_prompt_ep(&stages[0]->sp, err) || !stages[0]->sp.set_prompt_ep(&sp, err)) {
++                std::fprintf(stderr, "strata serve: %s\n", err.c_str()); return 1;
++            }
++        }
+         if (peer.valid() && o.peer_prefill_rows != 0) {
+             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
+             if (!sp.set_peer(&peer, rows, err)) {
+-- 
+2.43.0
+

@@ -1,0 +1,38 @@
+From 78616758262fcdf83ac1757221c9126a8243bf68 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 12:42:58 +0500
+Subject: [PATCH] diagnostics: check actual native staging bytes before and
+ after upload
+
+---
+ sycl/src/core/native_dense.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/sycl/src/core/native_dense.cpp b/sycl/src/core/native_dense.cpp
+index dd41cb2..ad708f9 100644
+--- a/sycl/src/core/native_dense.cpp
++++ b/sycl/src/core/native_dense.cpp
+@@ -198,8 +198,20 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                     for (size_t at = 0; at < bytes && status == 0; at += upload_chunk) {
+                         const size_t nb = std::min(upload_chunk, (size_t) bytes - at);
+                         std::memcpy(upload_stage.get(), source + at, nb);
++                        const char* debug = std::getenv("STRATA_DBG_WEIGHT_COPY");
++                        const bool check = debug && debug[0] == '1';
++                        auto stage_check = [&](const char* phase) {
++                            if (!check || std::memcmp(upload_stage.get(), source + at, nb) == 0) return true;
++                            const auto* stage = (const uint8_t*) upload_stage.get();
++                            size_t i = 0; while (i < nb && stage[i] == source[at+i]) ++i;
++                            err = "native dense " + tensor.name + ": CPU staging mismatch " + phase + " at tensor byte " + std::to_string(at+i);
++                            std::fprintf(stderr, "strata weight check: %s expected %u got %u\n", err.c_str(), source[at+i], stage[i]);
++                            return false;
++                        };
++                        if (!stage_check("before upload")) return false;
+                         status = DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+                             (uint8_t*) data.get() + at, upload_stage.get(), nb).wait());
++                        if (!stage_check("after upload")) return false;
+                     }
+                 } else if (status == 0)
+                     status = DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+-- 
+2.43.0
+

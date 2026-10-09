@@ -1,0 +1,98 @@
+From 5f3610c1e300347384da3501eb617ee9971fc269 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 12:59:15 +0500
+Subject: [PATCH] dense uploads: opt-in host-USM copy kernel to isolate DMA
+ corruption
+
+---
+ sycl/include/strata/sycl_dense_upload.hpp | 21 +++++++++++++++++++++
+ sycl/src/core/native_dense.cpp            |  7 ++++---
+ sycl/src/core/weights.cpp                 |  5 +++--
+ 3 files changed, 28 insertions(+), 5 deletions(-)
+ create mode 100644 sycl/include/strata/sycl_dense_upload.hpp
+
+diff --git a/sycl/include/strata/sycl_dense_upload.hpp b/sycl/include/strata/sycl_dense_upload.hpp
+new file mode 100644
+index 0000000..f1f51c3
+--- /dev/null
++++ b/sycl/include/strata/sycl_dense_upload.hpp
+@@ -0,0 +1,21 @@
++#pragma once
++#include <sycl/sycl.hpp>
++#include <cstdint>
++#include <cstdlib>
++namespace strata {
++// Startup-only diagnostic alternative to the runtime memcpy. The source must
++// be host USM. Zero retains the previous DMA path; no inference kernels change.
++inline bool dense_upload_kernel_enabled() {
++    const char* e = std::getenv("STRATA_DENSE_UPLOAD_KERNEL"); return e && e[0] == '1';
++}
++inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t bytes) {
++    if (!dense_upload_kernel_enabled() || sycl::get_pointer_type(input, q.get_context()) != sycl::usm::alloc::host) {
++        q.memcpy(target, input, bytes).wait(); return;
++    }
++    auto* dst = (uint8_t*) target; const auto* src = (const uint8_t*) input;
++    q.parallel_for<class DensePinnedUploadKernel>(sycl::range<1>((bytes+15)/16), [=](sycl::id<1> id) {
++        const size_t at = id[0]*16;
++        for(size_t j=0;j<16 && at+j<bytes;++j) dst[at+j] = src[at+j];
++    }).wait();
++}
++}
+diff --git a/sycl/src/core/native_dense.cpp b/sycl/src/core/native_dense.cpp
+index ad708f9..6a1c450 100644
+--- a/sycl/src/core/native_dense.cpp
++++ b/sycl/src/core/native_dense.cpp
+@@ -1,6 +1,7 @@
+ #define DPCT_PROFILING_ENABLED
+ #include <cstring>
+ #include <sycl/sycl.hpp>
++#include "strata/sycl_dense_upload.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/core/native_dense.hpp"
+ #include "strata/core/weights.hpp"
+@@ -97,7 +98,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+     try {
+         const char* pe = std::getenv("STRATA_NATIVE_UPLOAD_PINNED");
+-        const bool pin_upload = pe && pe[0] == '1';
++        const bool pin_upload = (pe && pe[0] == '1') || strata::dense_upload_kernel_enabled();
+         constexpr size_t upload_chunk = 8u << 20;
+         DevicePtr upload_stage(pin_upload ? sycl::malloc_host(upload_chunk, dpct::get_in_order_queue()) : nullptr);
+         if (pin_upload && !upload_stage) { err = "native dense: no pinned upload buffer"; return false; }
+@@ -209,8 +210,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                             return false;
+                         };
+                         if (!stage_check("before upload")) return false;
+-                        status = DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+-                            (uint8_t*) data.get() + at, upload_stage.get(), nb).wait());
++                        status = DPCT_CHECK_ERROR(strata::dense_upload(dpct::get_in_order_queue(),
++                            (uint8_t*) data.get() + at, upload_stage.get(), nb));
+                         if (!stage_check("after upload")) return false;
+                     }
+                 } else if (status == 0)
+diff --git a/sycl/src/core/weights.cpp b/sycl/src/core/weights.cpp
+index 74c6164..4e4e349 100644
+--- a/sycl/src/core/weights.cpp
++++ b/sycl/src/core/weights.cpp
+@@ -1,6 +1,7 @@
+ // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/sycl_dense_upload.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/core/weights.hpp"
+ 
+@@ -459,8 +460,8 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
+                 pageable memory. If the memory is not pageable, call wait() on
+                 event return by memcpy API to ensure synchronization behavior.
+                 */
+-                if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
+-                        dst_base + r.dst_off + out_at, host_src, out_bytes).wait()) !=
++                if (DPCT_CHECK_ERROR(strata::dense_upload(dpct::get_in_order_queue(),
++                        dst_base + r.dst_off + out_at, host_src, out_bytes)) !=
+                     0) {
+                     err = "cudaMemcpy failed for " + r.name;
+                     sycl::free(stage_in, dpct::get_in_order_queue());
+-- 
+2.43.0
+

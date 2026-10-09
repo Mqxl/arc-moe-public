@@ -1,0 +1,33 @@
+From cb3c72f4662d3db23ab22c9bfd195de222ed931c Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 12:31:56 +0500
+Subject: [PATCH] diagnostics: distinguish pageable and pinned dense readback
+
+---
+ sycl/src/core/weights.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/sycl/src/core/weights.cpp b/sycl/src/core/weights.cpp
+index 06436de..74c6164 100644
+--- a/sycl/src/core/weights.cpp
++++ b/sycl/src/core/weights.cpp
+@@ -473,6 +473,16 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
+                     if (std::memcmp(back.data(), host_src, (size_t) out_bytes)) {
+                         size_t i = 0; const auto* expected = (const uint8_t*) host_src;
+                         while (i < out_bytes && back[i] == expected[i]) ++i;
++                        const size_t at = i & ~(size_t) 63, nb = std::min<size_t>(64, out_bytes - at);
++                        auto* read_pin = (uint8_t*) sycl::malloc_host(nb, dpct::get_in_order_queue());
++                        if (read_pin) {
++                            for (int pass = 0; pass < 2; ++pass) {
++                                dpct::get_in_order_queue().memcpy(read_pin, dst_base + r.dst_off + out_at + at, nb).wait();
++                                std::fprintf(stderr, "strata weight check: pinned dense reread %d tensor byte %llu expected %u got %u window match %d\n",
++                                    pass+1, (unsigned long long) (out_at+i), expected[i], read_pin[i-at], (int) (std::memcmp(read_pin, expected+at, nb)==0));
++                            }
++                            sycl::free(read_pin, dpct::get_in_order_queue());
++                        }
+                         err = r.name + ": dense upload readback mismatch at tensor byte " + std::to_string(out_at + i);
+                         std::fprintf(stderr, "strata weight check: %s expected %u got %u\n", err.c_str(), expected[i], back[i]);
+                         sycl::free(stage_in, dpct::get_in_order_queue()); sycl::free(stage_out, dpct::get_in_order_queue());
+-- 
+2.43.0
+

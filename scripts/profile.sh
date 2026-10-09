@@ -5,6 +5,7 @@
 #
 #   N     the defaults (./arc start's: lib.sh arc_engine_env), nothing traced: the real speeds on short prompts, on
 #         2K / 10K prompts and on a sampled request and an agent harness's (tools, streaming); every reply checked
+#   ARC_PROFILE_EP_SWEEP=1: prompt expert parallelism, greedy/top-20 parity, both card modes
 #   PS1   STRATA_PLAN_STAGE=1: the device plan stages mirrored experts in VRAM (patch 21; off by default since round 9)
 #   PG0   STRATA_PF_GROUPED=0: the prompt path's experts dequantized to FP16 + oneMKL (before patch 30)
 #   SR768 --short-read 768: old threshold against the current 64-token default
@@ -67,10 +68,27 @@ stop_server() {   # SIGTERM to Python only sends the engine QUIT; background job
 trap stop_server EXIT
 
 keep='PCIe probe|prefill copy|prefill timing|prompt chunk|prompt path|borrow|serve: prompt|verify stages|window: since|split|mirror|expert cache'
-keep+='|gate/up split weight reuse|integer XMX|pin loan|early expert pool|prompt attention|strata decode timing|strata decode GPU|strata dbg|head sampling|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
+keep+='|prompt EP|mtp chain|mtp lookahead|gate/up split weight reuse|integer XMX|pin loan|early expert pool|prompt attention|strata decode timing|strata decode GPU|strata dbg|head sampling|draft kv|VRAM free|NO_HOST|GPU HANG|rror|xception|terminate|what\(\)|abort|egmentation|DEVICE_LOST|extra engine|engine under'
 
 run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model, bench, stop, keep the engine's lines
     local name=$1 cases=$2 maxt=$3; shift 3
+    # Resume only completed, matching decode arms from an explicitly supplied
+    # prior profile. Interrupted arms are rerun and provenance stays in the report.
+    case "$name" in dual-DC|dual-D0|dual-DQ|dual-DL)
+        if [ -n "${ARC_PROFILE_DECODE_RESUME:-}" ] && [ -f "$ARC_PROFILE_DECODE_RESUME.$name.json" ]; then
+            if { [ "$name" = dual-DC ] || [ -f "$ARC_PROFILE_DECODE_RESUME.$name.parity.json" ]; } && python3 - "$ARC_PROFILE_DECODE_RESUME.$name.json" <<'PY_CHECK'
+import json,sys
+rows=json.load(open(sys.argv[1]))
+assert len(rows)==6 and all(not r.get('error') and r.get('tokens',0)>0 and r.get('prompt_tps') and r.get('decode_tps') for r in rows)
+PY_CHECK
+            then
+                cp "$ARC_PROFILE_DECODE_RESUME.$name.json" "$out.$name.json"
+                [ ! -f "$ARC_PROFILE_DECODE_RESUME.$name.parity.json" ] || cp "$ARC_PROFILE_DECODE_RESUME.$name.parity.json" "$out.$name.parity.json"
+                echo "================ $name: reused completed arm from $ARC_PROFILE_DECODE_RESUME; interrupted arms are rerun" >>"$out"
+                return
+            fi
+        fi ;;
+    esac
     # Screening keeps both cold/warm prompts; decoding speed is validated separately.
     if [ "${ARC_PROFILE_SCREEN:-0}" = 1 ]; then
         case "$name" in
@@ -103,9 +121,13 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     echo "================ $name: $*; cases=$cases max_tokens=$maxt runs=${ARC_PROFILE_RUNS:-2}" >>"$out"
     # First request after loading: prior decode requests can adapt expert placement.
     # Keep the prompt-path parity comparison independent of that changing state.
-    case "$name" in PIPE0|PIPE1|G1-PIPE0|G1-PIPE1)
+    case "$name" in PIPE0|PIPE1|G1-PIPE0|G1-PIPE1|EP0|EP1|dual-D0|dual-DQ|dual-DN|single-D0|single-DQ|single-DN|dual-DL|single-DL)
         if ! python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/prefill-response-parity.py" --url "$url" --output "$out.$name.parity.json" >>"$out" 2>&1; then
             failures=$((failures + 1))
+            echo "---- arm stopped after failed 10K correctness request" >>"$out"
+            stop_server
+            [ ! -f "$log" ] || { tail -c +$((since + 1)) "$log" | grep -E "$keep" | cut -c1-2000 >>"$out" || true; }
+            return
         fi ;;
     esac
     case "$name" in RP*|RG*)
@@ -146,7 +168,7 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
     echo "arc-moe profile, $(date), $(git -C "$ROOT" rev-parse --short HEAD), model $want"
     echo "screen=${ARC_PROFILE_SCREEN:-0}; runs=${ARC_PROFILE_RUNS:-2}; screen decode rates are not final speed measurements"
     echo "engine source: $(git -C "$STRATA" rev-parse --short HEAD); patch fingerprint: $(git -C "$STRATA" config --get arcmoe.applied)"
-    for knob in STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_COPY_TIMING STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT STRATA_PF_GU_I8_XMX STRATA_PF_DOWN_I8_XMX STRATA_PF_I8_SLAB STRATA_PF_I8_PAD STRATA_PF_I8_GROUP_MIN STRATA_PF_GU_SPLIT STRATA_PF_GU_SPLIT_LANES; do
+    for knob in STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_COPY_TIMING STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT STRATA_PF_GU_I8_XMX STRATA_PF_DOWN_I8_XMX STRATA_PF_I8_SLAB STRATA_PF_I8_PAD STRATA_PF_I8_GROUP_MIN STRATA_PF_GU_SPLIT STRATA_PF_GU_SPLIT_LANES STRATA_PF_EP STRATA_VERIFY_COMMIT_OVERLAP STRATA_MTP_CHAIN_SUBMIT STRATA_VERIFY_SKIP_EMPTY STRATA_VERIFY_NATIVE_GRAPH STRATA_MTP_LOOKAHEAD STRATA_NATIVE_UPLOAD_PINNED STRATA_DENSE_UPLOAD_KERNEL STRATA_DBG_PF_PHASES STRATA_DBG_WEIGHT_COPY; do
         [ -z "${!knob-}" ] || echo "$knob=${!knob}"
     done
     for b in $(arc_bdfs); do
@@ -161,7 +183,48 @@ run() {   # run <name> <cases> <max-tokens> <env...>: start, wait for the model,
 } >"$out"
 
 # A focused sweep uses the same loader, reply checks and final report as the full profile.
-if [ "${ARC_PROFILE_FINAL_FAST:-0}" = 1 ]; then
+if [ "${ARC_PROFILE_DECODE_TRACE_ONLY:-0}" = 1 ]; then
+    [ -n "$unitrace" ] || die "decode trace needs ARC_PROFILE_TRACE=1 and unitrace"
+    run DT short,prose-ru-long,10k 128 STRATA_PF_EP=0 STRATA_DECODE_TIMING=1 STRATA_SPLIT_TIMING=1
+    run D short,prose-ru-long 64 STRATA_PF_EP=0 STRATA_DECODE_TIMING=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d -s --chrome-kernel-logging --teardown-on-signal 10 -o $out.D.unitrace"
+    run D-eager short,prose-ru-long 64 STRATA_PF_EP=0 STRATA_DECODE_TIMING=1 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d -s --chrome-kernel-logging --teardown-on-signal 10 -o $out.D-eager.unitrace"
+    for f in "$out".D*.unitrace*; do
+        [ -f "$f" ] || continue
+        { echo "================ $(basename "$f")"; head -c 60000 "$f"; echo; } >>"$out"
+        trace_pid="${f%.unitrace}"; trace_pid="${trace_pid##*.}"
+        case "$trace_pid" in ""|*[!0-9]*) continue ;; esac
+        timeline="$STRATA/strata.$trace_pid.json"
+        if [ -f "$timeline" ]; then
+            python3 "$ROOT/tools/analyze-decode-trace.py" "$timeline" >>"$out" 2>&1 || warn "GPU interval analysis unavailable: $timeline"
+        fi
+    done
+elif [ "${ARC_PROFILE_DECODE_SWEEP:-0}" = 1 ]; then
+    # Matched wall-clock API runs, with observers off. Positive min_p keeps the original MTP path.
+    for gpu in dual single; do
+        card=(); [ "$gpu" = single ] && card=(ARC_GPUS=0)
+        run "$gpu-DC" short,prose-ru-long,10k 128 "${card[@]}" "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --spec-min-p 0.5" STRATA_PF_EP=0 STRATA_VERIFY_NATIVE_GRAPH=0 STRATA_VERIFY_COMMIT_OVERLAP=0 STRATA_MTP_CHAIN_SUBMIT=0 STRATA_VERIFY_SKIP_EMPTY=0 STRATA_MTP_LOOKAHEAD=0
+        run "$gpu-D0" short,prose-ru-long,10k 128 "${card[@]}" "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --spec-min-p 0" STRATA_PF_EP=0 STRATA_VERIFY_NATIVE_GRAPH=0 STRATA_VERIFY_COMMIT_OVERLAP=0 STRATA_MTP_CHAIN_SUBMIT=0 STRATA_VERIFY_SKIP_EMPTY=0 STRATA_MTP_LOOKAHEAD=0
+        run "$gpu-DQ" short,prose-ru-long,10k 128 "${card[@]}" "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --spec-min-p 0" STRATA_PF_EP=0 STRATA_VERIFY_NATIVE_GRAPH=0 STRATA_VERIFY_COMMIT_OVERLAP=1 STRATA_MTP_CHAIN_SUBMIT=1 STRATA_VERIFY_SKIP_EMPTY=1 STRATA_MTP_LOOKAHEAD=0
+        run "$gpu-DL" short,prose-ru-long,10k 128 "${card[@]}" "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --spec-min-p 0" STRATA_PF_EP=0 STRATA_VERIFY_NATIVE_GRAPH=0 STRATA_VERIFY_COMMIT_OVERLAP=1 STRATA_MTP_CHAIN_SUBMIT=1 STRATA_VERIFY_SKIP_EMPTY=1 STRATA_MTP_LOOKAHEAD=1
+        if [ "${ARC_PROFILE_NATIVE_GRAPH:-0}" = 1 ]; then
+        run "$gpu-DN" short,prose-ru-long,10k 128 "${card[@]}" "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --spec-min-p 0" STRATA_PF_EP=0 STRATA_VERIFY_NATIVE_GRAPH=1 STRATA_VERIFY_COMMIT_OVERLAP=1 STRATA_MTP_CHAIN_SUBMIT=1 STRATA_VERIFY_SKIP_EMPTY=1 STRATA_MTP_LOOKAHEAD=0
+            if ! python3 "$ROOT/tools/compare-prefill-response.py" "$out.$gpu-D0.parity.json" "$out.$gpu-DN.parity.json" >>"$out" 2>&1; then failures=$((failures + 1)); fi
+        else
+            echo "================ $gpu-DN: skipped; native recording requires ARC_PROFILE_NATIVE_GRAPH=1" >>"$out"
+        fi
+        for candidate in DQ DL; do
+            if ! python3 "$ROOT/tools/compare-prefill-response.py" "$out.$gpu-D0.parity.json" "$out.$gpu-$candidate.parity.json" >>"$out" 2>&1; then failures=$((failures + 1)); fi
+        done
+    done
+    run A-DQ short,prose-ru-long,10k 128 "STRATA_EXTRA_ARGS=$ARC_ENGINE_ARGS_DEFAULT --spec-min-p 0" STRATA_PF_EP=0 STRATA_VERIFY_NATIVE_GRAPH=0 STRATA_VERIFY_COMMIT_OVERLAP=1 STRATA_MTP_CHAIN_SUBMIT=1 STRATA_VERIFY_SKIP_EMPTY=1 STRATA_DECODE_TIMING=1 STRATA_SPLIT_TIMING=1 STRATA_VERIFY_WINDOW_TIMING=1
+elif [ "${ARC_PROFILE_EP_SWEEP:-0}" = 1 ]; then
+    run EP0 2k,10k 128 STRATA_PF_EP=0
+    run EP1 2k,10k 128 STRATA_PF_EP=1
+    if ! python3 "$ROOT/tools/compare-prefill-response.py" "$out.EP0.parity.json" "$out.EP1.parity.json" >>"$out" 2>&1; then failures=$((failures + 1)); fi
+    run G1-EP0 2k,10k 128 ARC_GPUS=0 STRATA_PF_EP=0
+    run G1-EP1 2k,10k 128 ARC_GPUS=0 STRATA_PF_EP=1
+    run A-EP1 10k 128 STRATA_PF_EP=1 STRATA_PREFILL_TIMING=1
+elif [ "${ARC_PROFILE_FINAL_FAST:-0}" = 1 ]; then
     # Normal-length final validation; alternatives and observers were screened separately.
     if [ "${ARC_PROFILE_FINAL_CONTROL:-0}" = 1 ]; then run BASE32 agent,1k,2k,10k 128 STRATA_PF_PIN_LOAN=0 STRATA_PF_PIN_REFILL=0 STRATA_PF_PREFETCH_SLOTS=0 STRATA_PF_PIPELINE=1 STRATA_PROMPT_ATTN_XMX=0 STRATA_PF_SPLIT_ROWS=4 STRATA_PF_FUSE_EXPERT=0 "STRATA_EXTRA_ARGS=--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 64"; fi
     run N short,prose,1k,2k,10k,sampled,agent 128
@@ -270,19 +333,6 @@ elif [ "${ARC_PROFILE_PARITY_REPEAT:-0}" != 0 ]; then
     fi
     run RG1a short 1 ARC_GPUS=0 STRATA_PF_PIPELINE=1
     run RG1b short 1 ARC_GPUS=0 STRATA_PF_PIPELINE=1
-elif [ "${ARC_PROFILE_DECODE_SWEEP:-0}" = 1 ]; then
-    for gpu in dual single; do
-        card=(); [ "$gpu" = single ] && card=(ARC_GPUS=0)
-        run "$gpu-DT" short,prose 128 "${card[@]}" STRATA_DECODE_TIMING=1
-        if [ -n "$unitrace" ]; then
-            run "$gpu-Dgraph" short 64 "${card[@]}" STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.$gpu-Dgraph.unitrace"
-            run "$gpu-Deager" short 64 "${card[@]}" STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.$gpu-Deager.unitrace"
-        fi
-    done
-    for f in "$out".*.unitrace*; do
-        [ -f "$f" ] || continue
-        { echo "================ $(basename "$f")"; head -c 120000 "$f"; echo; } >>"$out"
-    done
 elif [ "${ARC_PROFILE_SINGLE_COPY_SWEEP:-0}" = 1 ]; then
     run G1-CP2 2k,10k 128 ARC_GPUS=0 STRATA_PF_STAGE_BANKS=2
     run G1-CP3 2k,10k 128 ARC_GPUS=0 STRATA_PF_STAGE_BANKS=3
@@ -457,9 +507,15 @@ if [ "$(arc_bdfs | wc -l)" -ge 2 ]; then run G1-A 10k 128 ARC_GPUS=0 STRATA_PREF
 if [ -n "$unitrace" ] && [ "${ARC_PROFILE_TRACE:-0}" = 1 ]; then
     run D short,prose 128 STRATA_VERIFY_EAGER=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.D.unitrace"
     run E 10k 1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d --teardown-on-signal 10 -o $out.E.unitrace"
-    for f in "$out".D.unitrace* "$out".E.unitrace*; do
+    for f in "$out".D*.unitrace* "$out".E*.unitrace*; do
         [ -f "$f" ] || continue
         { echo "================ $(basename "$f")"; head -c 60000 "$f"; echo; } >>"$out"
+        trace_pid="${f%.unitrace}"; trace_pid="${trace_pid##*.}"
+        case "$trace_pid" in ""|*[!0-9]*) continue ;; esac
+        timeline="$STRATA/strata.$trace_pid.json"
+        if [ -f "$timeline" ]; then
+            python3 "$ROOT/tools/analyze-decode-trace.py" "$timeline" >>"$out" 2>&1 || warn "GPU interval analysis unavailable: $timeline"
+        fi
     done
 fi
 fi

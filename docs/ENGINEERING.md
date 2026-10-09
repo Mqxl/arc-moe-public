@@ -864,3 +864,175 @@ prefill **597.0 tok/s**, zero reused input. A separate 124219-token code request
 produces 256 tokens at **25.5 tok/s**, with 114688 cached input tokens and 9531
 fresh tokens. Overflow is rejected. This establishes the tested capacity and
 correctness cases, not universal long-context quality or long-term stability.
+
+
+### Prompt expert parallelism (patch 51, experimental and off)
+
+`STRATA_PF_EP=1` keeps attention/GDN/router/shared experts on the layer owner,
+then runs disjoint routed experts on both cards with the existing grouped
+kernels. Decode placement is unchanged. The peer owns a bounded double-buffered
+16-expert cache; this does not assume that decode's cache holds every layer on
+both devices. Activation and result transport use pinned host memory, not P2P.
+Results remain FP32 to retain arithmetic parity. An actual pinned PCIe probe
+sets the peer row share: approximately 28.5% from x16 to x4 and 65% from x4 to
+x16 on the measured A770 host. Single-card mode never activates this path.
+
+The first version serialized peer upload/compute/download and disabled the
+existing stage pipeline: 10K prefill fell from 512.25 to 354.0 tok/s. The revised
+version overlaps two weight/result banks and retains the stage pipeline
+(`STRATA_PF_EP_PIPELINE=0` is the serialized diagnostic fallback). It improves
+that experiment, but still loses to the original prompt path:
+
+| Cards/case | EP off | EP on | Unit |
+|---|---:|---:|---|
+| Two, 2K code | 370.25 | 304.10 | fresh prefill tok/s |
+| Two, 10K code | 512.35 | 423.00 | fresh prefill tok/s |
+| One, 2K code | 335.45 | 335.00 | fresh prefill tok/s |
+| One, 10K code | 421.70 | 421.25 | fresh prefill tok/s |
+
+`profile-20261009-032344.txt`: two normal 128-output-token runs per case,
+128K context with 32K resident INT8 KV, multilingual MTP union, explicit 34/14
+split on two cards; the paired runs differ only in EP. The EP-on phase observer
+is separate from the speed comparison. Its 10K owner timeline has 56.4% expert
+compute, 11.5% attention and 4.7% wait-copy; it excludes peer work that overlaps
+the owner, so those percentages do not explain total wall time by themselves.
+
+`check-20261009-031417.txt` passes all 42 requests (base, own buffers, one card;
+14 each including both 10K requests). The first 32 greedy tokens and all top-20
+normalized logprobs match exactly (maximum delta 0). Temperature telemetry peaks
+at 83 C / 62 C with stock settings. These tests establish the measured correctness
+cases, not an EP throughput win. `STRATA_PF_EP` remains **0** by default; the
+800/450 tok/s targets are not met by this change.
+
+
+### Decode trace and sequencing controls (patches 52–53)
+
+The existing verifier already captures one graph per window size per card.
+`NO_HOST=auto` resolves to on for this cache/mirror coverage. Untraced DT in
+`profile-20261009-033357.txt` measures short code at 138.92 ms/window:
+125.90 verify, 2.59 commit/emit and 10.42 MTP; 4.74 output tokens/window.
+Per-layer host waiting and planning are zero. Long Russian prose is 80.18
+ms/window and post-10K code 112.83 ms/window, with different window sizes and
+acceptance rates. The placement log's CUDA-calibrated "predicted ... per decode
+window" is a heuristic for choosing the split, not a measurement to subtract
+from real window time.
+
+Unitrace's 48-layer intervals run from the first resident-plan kernel through
+the main head sampler (prefix work excluded). Seventeen T=6 graph windows
+average 133.35 ms of span, 115.45 ms summed/union kernel time and 116.04 ms
+including copy/reset/barrier operations. Eager's corresponding intervals are
+336.29/135.19 ms. These traced intervals include observer overhead; DT supplies
+normal throughput. There is an approximately 18-ms internal gap in this graph
+sample, not evidence of 100 ms spent waiting on the host.
+`tools/analyze-decode-trace.py` streams the Chrome timeline without loading the
+full 200+ MiB trace into a JSON object. Unittrace inserts a PID before its output
+extension; profile.sh now collects those filenames and their interval analysis.
+
+Both A770 devices report `usm_atomic_host_allocations=false` and
+`usm_atomic_shared_allocations=false` in the installed oneAPI runtime. A system
+atomic flag shared by the two GPU contexts is therefore not a supported SYCL
+handoff primitive here. No unbounded device spin or unsupported system atomic
+handoff was introduced. The existing explicit host-buffer transfer remains.
+
+Patch 52 adds opt-in `STRATA_VERIFY_COMMIT_OVERLAP=1` (independent stage commits
+and MTP overlap, drained before another window/checkpoint),
+`STRATA_MTP_CHAIN_SUBMIT=1` (fixed min_p=0 chain queued with one final host wait),
+`STRATA_VERIFY_SKIP_EMPTY=1` (remove the unused post-launch queue-empty query),
+and `STRATA_VERIFY_NATIVE_GRAPH=1` (configure native recording before SYCL starts;
+0 restores the previous recorder). Positive min_p retains the existing early
+stop. The original graph path remains the default pending the speed gates.
+
+Patch 53 adds `STRATA_MTP_LOOKAHEAD=1`: a separate MTP queue/thread on the last
+GPU continues the previous approximate draft residual while GPU0 verifies.
+Its proposals can be used only after full target acceptance and an exact
+next-head-token match. Accepted MTP KV is recomputed from actual verifier
+residuals/tokens before continuing. Another lookahead is suppressed until a
+normal MTP round rebases the chain. Target state and sampled output are never
+replaced by an approximate residual. Single-card, sampled, penalized, confidence
+threshold and suffix-lookup requests retain the original path. The MTP ring's
+existing extra 4*max_t+64 cells preserve the causal rollback window. Eligibility
+checks neutral penalty parameters, not whether a history buffer exists (the
+server keeps history even without active penalties). Launch/reuse counters
+establish whether the path was actually exercised.
+
+All new controls remain zero until correctness and normal dual/single speed
+comparisons complete; results below will record the measured outcome.
+
+### Decode experiment results before the next boot
+
+`profile-20261009-041626.txt` was interrupted at the user's pause request.
+Its completed dual-card arms use two normal 128-token runs, with observers off:
+
+| arm | code decode tok/s | Russian prose | after 10K |
+|---|---:|---:|---:|
+| DC: original min_p=0.5 | 34.65 | 31.05 | 30.80 |
+| D0: matched min_p=0 | 34.25 | 25.00 | 29.65 |
+| DQ: commit + chain + skip | 34.85 | 25.35 | 30.15 |
+| DL: DQ + lookahead | 33.10 | 25.10 | 29.75 |
+
+Lookahead was actually exercised: code launched 20 and reused 8 rounds;
+Russian prose launched 43–49 and reused one. It did not improve throughput.
+All new defaults remain zero. These are completed arms of a partial profile,
+not a completed dual/single validation. The later native-recording arm failed;
+`ARC_PROFILE_NATIVE_GRAPH=1` is now an explicit opt-in rather than automatically
+repeating that failed mode in every decode sweep. Resume checks reject rows
+with errors/null metrics. A failed 10K parity request stops its arm before the
+remaining speed requests. The check's own-buffer arm preserves the caller's
+extra flags so min_p=0 experiments exercise the intended path there too.
+
+### Data-integrity diagnostics after a reboot
+
+A subsequent boot broke even the saved pre-51 executable with all new controls
+off: 10K prefill produced NaN. Checksums of both complete GGUF shards matched
+the stored download manifest; the prepared dense pack matched its original
+copy. The first NaN was at QSA layer 3's output projection, preceded by finite
+but huge residual/projection values (~1e18–1e20). This is not a usable speed
+baseline and those failed/partial profile metrics must not be promoted.
+
+Patches 54–60 add opt-in diagnostics and startup-only transfer alternatives:
+`STRATA_DBG_PF_PHASES=1` synchronizes/reads intermediate values in layers 0–3;
+`STRATA_DBG_WEIGHT_COPY=1` checks dense/native upload bytes, refuses a mismatch,
+and repeats its failing window through pinned readback. It never reads unused
+MoE dequant scratch as evidence about grouped expert weights.
+`STRATA_NATIVE_UPLOAD_PINNED=1` stages native GGUF payloads through one bounded
+8-MiB host-USM buffer. `STRATA_DENSE_UPLOAD_KERNEL=1` replaces dense uploads
+with a byte-copy kernel reading host USM, automatically staging native payloads.
+Both default to zero. Diagnostics are not performance measurements.
+
+On the upper A770, actual weight readback repeatedly differed by bit 0x20
+(e.g. source 76/readback108, 8/40, 70/102, 196/228). Pinned repeats confirmed the
+same byte; native CPU staging matched the file before and after upload. Forcing
+the v1 adapter, disabling its USM pool and a copy kernel did not remove the
+failure. No RAM test or timing change was performed. Independent immediate
+copy/readback tests passed 12 GiB on both cards, and smaller allocation tests
+passed on the upper card, so these results do not establish a failed VRAM chip.
+The GPU-side probe then reported eight identical source/destination pairs
+64/96 after the copy kernel: the GPU itself reads the correct host-USM byte
+and the changed device byte. Thus the mismatch precedes CPU readback and
+attention calculations. This localizes a device write/storage fault; it does
+not by itself distinguish faulty hardware from driver/addressing issues.
+The upper-card baseline is excluded from speed comparisons until corrected.
+
+The lower A770 passed dense/native upload verification, a fixed 10K greedy
+continuation with requested top-20 logprobs, and sampled/agent streaming cases
+(two runs each). It is a temporary one-card recovery, not validation of the
+original two-card throughput or a completed 128K stability run. Work 3 and the
+remaining full dual/single gates are pending a correct upper-card baseline.
+
+Recovery verification with the patch-60 build (`test-logs/recovery60-check.txt`):
+fixed 10K greedy/top-20 response passes; sampled code and streaming agent pass
+both runs. The sampled-code rate is 10.0–10.7 tok/s and agent 15.7–16.9 tok/s on
+physical GPU1; these short sampled cases are not matched to the old dual-card
+34.65 tok/s greedy profile. During this verification the lower card reaches
+60 C / 1307 rpm, with no thermal flags or new kernel errors; the upper card is
+idle (44 C). OpenCode CLI returns the correct color, "Красный", for a supplied
+red image using the same authenticated endpoint. Its 131072 context setting is
+advertised by health, but no new full-capacity stability claim is made here.
+
+The running transient unit is `arc-moe-gpu1-recovery.service` on 8798. It selects
+physical GPU1 and enables serial initial cache fill, pinned native startup
+upload and byte verification; the new throughput experiments remain off.
+The deliberate i915 reset at 11:50:32 is recorded as a GPU HANG in the journal;
+that entry is from the controlled reset, not evidence of a spontaneous hang.
+No old server on 8790 was started. Further dual-card measurements and default
+promotion require resolving the reproducible upper-card upload fault first.

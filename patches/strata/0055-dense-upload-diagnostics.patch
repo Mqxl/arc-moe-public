@@ -1,0 +1,102 @@
+From 2113ee3b1a46225641708bcf20863990c9b620f3 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 12:15:00 +0500
+Subject: [PATCH] diagnostics: verify dense upload bytes and first prompt
+ layers
+
+---
+ sycl/src/core/native_dense.cpp | 12 ++++++++++++
+ sycl/src/core/weights.cpp      | 13 +++++++++++++
+ sycl/src/prefill/prefill.cpp   |  9 ++++++---
+ 3 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/sycl/src/core/native_dense.cpp b/sycl/src/core/native_dense.cpp
+index af95caa..a0aaf25 100644
+--- a/sycl/src/core/native_dense.cpp
++++ b/sycl/src/core/native_dense.cpp
+@@ -1,4 +1,5 @@
+ #define DPCT_PROFILING_ENABLED
++#include <cstring>
+ #include <sycl/sycl.hpp>
+ #include <dpct/dpct.hpp>
+ #include "strata/core/native_dense.hpp"
+@@ -191,6 +192,17 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                         dpct::get_in_order_queue()
+                             .memcpy(data.get(), gguf.tensor_data(tensor), bytes)
+                             .wait());
++                if (const char* dbg = std::getenv("STRATA_DBG_WEIGHT_COPY"); status == 0 && dbg && dbg[0] == '1') {
++                    std::vector<uint8_t> back((size_t) bytes);
++                    dpct::get_in_order_queue().memcpy(back.data(), data.get(), bytes).wait();
++                    const auto* expected = (const uint8_t*) gguf.tensor_data(tensor);
++                    if (std::memcmp(back.data(), expected, (size_t) bytes)) {
++                        size_t i = 0; while (i < bytes && back[i] == expected[i]) ++i;
++                        err = "native dense " + tensor.name + ": upload readback mismatch at tensor byte " + std::to_string(i);
++                        std::fprintf(stderr, "strata weight check: %s expected %u got %u\n", err.c_str(), expected[i], back[i]);
++                        return false;
++                    }
++                }
+                 /*
+                 DPCT1000: Error handling if-stmt was detected but could not
+                 be rewritten.
+diff --git a/sycl/src/core/weights.cpp b/sycl/src/core/weights.cpp
+index 7a7ed12..06436de 100644
+--- a/sycl/src/core/weights.cpp
++++ b/sycl/src/core/weights.cpp
+@@ -467,6 +467,19 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
+                         sycl::free(stage_out, dpct::get_in_order_queue());
+                     return false;
+                 }
++                if (const char* dbg = std::getenv("STRATA_DBG_WEIGHT_COPY"); dbg && dbg[0] == '1') {
++                    std::vector<uint8_t> back((size_t) out_bytes);
++                    dpct::get_in_order_queue().memcpy(back.data(), dst_base + r.dst_off + out_at, out_bytes).wait();
++                    if (std::memcmp(back.data(), host_src, (size_t) out_bytes)) {
++                        size_t i = 0; const auto* expected = (const uint8_t*) host_src;
++                        while (i < out_bytes && back[i] == expected[i]) ++i;
++                        err = r.name + ": dense upload readback mismatch at tensor byte " + std::to_string(out_at + i);
++                        std::fprintf(stderr, "strata weight check: %s expected %u got %u\n", err.c_str(), expected[i], back[i]);
++                        sycl::free(stage_in, dpct::get_in_order_queue()); sycl::free(stage_out, dpct::get_in_order_queue());
++                        if (cur) std::fclose(cur);
++                        return false;
++                    }
++                }
+                 upload_ms += now_ms() - u0;
+                 done += n;
+             }
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 74fee25..f7d2522 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -2483,10 +2483,10 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+             }
+             // Opt-in first-QSA phase diagnostics; never reads unused scratch buffers.
+             // Synchronizes only under STRATA_DBG_PF_PHASES=1, so do not use for timing.
+-            auto phase = [&](const char* tag, const float* ptr, int64_t cols) {
++            auto phase = [&](const char* tag, const float* ptr, int64_t cols, int64_t rows = 0) {
+                 static const bool on = [] { const char* e = std::getenv("STRATA_DBG_PF_PHASES"); return e && e[0] == '1'; }();
+-                if (!on || l != 3) return;
+-                std::vector<float> h((size_t) T * cols);
++                if (!on || l > 3) return;
++                std::vector<float> h((size_t) (rows ? rows : T) * cols);
+                 m.cs->memcpy(h.data(), ptr, h.size() * sizeof(float)).wait();
+                 int64_t bad = 0, first = -1; double mx = 0;
+                 for (size_t i = 0; i < h.size(); ++i) {
+@@ -2559,6 +2559,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
++                    phase("K-norm-weight", (const float*) wkn->data, 256, 1);
++                    phase("Q-norm-weight", (const float*) wqn->data, 256, 1);
+                     phase("K-projection", m.Kc, 512);
+                     phase("V-projection", m.Vc, 512);
+                     phase("Q-gate-projection", m.Qf, 12288);
+@@ -3967,6 +3969,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         }
+                     }
+                 }
++                phase(half == 0 ? "branch-attn" : "branch-ffn", m.bo, N);
+                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
+                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
+                 // control vector)
+-- 
+2.43.0
+

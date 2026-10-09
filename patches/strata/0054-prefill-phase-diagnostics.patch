@@ -1,0 +1,89 @@
+From d7dab8a28e6261f88c80607705a01758367a5ec0 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 12:09:02 +0500
+Subject: [PATCH] prefill: add opt-in first-QSA phase diagnostics
+
+---
+ sycl/src/prefill/prefill.cpp | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 7e4f1ed..74fee25 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -2481,6 +2481,23 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                 }
+                 stats_.ms_ple += ms_since(tp);
+             }
++            // Opt-in first-QSA phase diagnostics; never reads unused scratch buffers.
++            // Synchronizes only under STRATA_DBG_PF_PHASES=1, so do not use for timing.
++            auto phase = [&](const char* tag, const float* ptr, int64_t cols) {
++                static const bool on = [] { const char* e = std::getenv("STRATA_DBG_PF_PHASES"); return e && e[0] == '1'; }();
++                if (!on || l != 3) return;
++                std::vector<float> h((size_t) T * cols);
++                m.cs->memcpy(h.data(), ptr, h.size() * sizeof(float)).wait();
++                int64_t bad = 0, first = -1; double mx = 0;
++                for (size_t i = 0; i < h.size(); ++i) {
++                    if (!std::isfinite(h[i])) { ++bad; if (first < 0) first = (int64_t) i; }
++                    else mx = std::max(mx, (double) std::abs(h[i]));
++                }
++                std::fprintf(stderr, "strata phase: layer %lld pos %lld T %lld %s: bad %lld first row %lld col %lld max %.9g\n",
++                             (long long) l, (long long) p0, (long long) T, tag, (long long) bad,
++                             (long long) (first < 0 ? -1 : first / cols), (long long) (first < 0 ? -1 : first % cols), mx);
++            };
++            phase("residual-in", m.R, D);
+             for (int half = 0; half < 2; ++half) {
+                 // ---- the hyper-connection read of this half
+                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
+@@ -2501,6 +2518,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                               m.mixed_bf_lo);
+ 
++                phase(half == 0 ? "mixed-attn" : "mixed-ffn", m.mixed, N);
+                 if (half == 0 && !core::is_qsa_layer(g, l)) {
+                     // ======================= GDN =======================
+                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
+@@ -2541,6 +2559,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
++                    phase("K-projection", m.Kc, 512);
++                    phase("V-projection", m.Vc, 512);
++                    phase("Q-gate-projection", m.Qf, 12288);
+                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
+                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
+@@ -2757,6 +2778,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                             }
+                         }
+                     }
++                    phase("K-normalized", m.Kc, 512);
++                    phase("Q-normalized", m.q, ZV);
+                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                                        : core::qsa_attn_pools(st);
+                     pt.mark(kPfQsaAttn, cs);
+@@ -2792,10 +2815,12 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                         }
++                    phase("attention", m.attn, ZV);
+                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                     pt.mark(kPfQsa, cs);
+                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
++                    phase("attention-output", m.bo, N);
+                     ++qsa_index;
+                 } else {
+                     // ======================= MoE =======================
+@@ -3927,7 +3952,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
+                         };
+                         double mxs = 0, mxq = 0;
+                         const int64_t bxs = (!use_mmq && m.Xs && !pf_grouped_env()) ? bad16(m.Xs, T * K * N, mxs) : -1;
+-                        const int64_t bdq = (!use_mmq && m.dq_gu[0]) ? bad16(m.dq_gu[0], (int64_t) 1280 * N, mxq) : -1;
++                        const int64_t bdq = (!use_mmq && !pf_grouped_env() && m.dq_gu[0]) ? bad16(m.dq_gu[0], (int64_t) 1280 * N, mxq) : -1;
+                         static int64_t reported = -1;
+                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks)
+                             std::fprintf(stderr, "strata dbg: layer %lld fp16 inputs: activations %lld non-finite (max %.3g), "
+-- 
+2.43.0
+

@@ -30,6 +30,17 @@ arc_engine_env() {   # export the defaults above; a variable already set (even e
     export STRATA_GU_LANES="${STRATA_GU_LANES-32}"
     # Profiles 20261008-022225 (dual) and 160840 (single): 10K +17% / +18.3% versus DP4A; full checks pass.
     export STRATA_PF_EXPERT_KERNEL="${STRATA_PF_EXPERT_KERNEL-tile16}"
+    # Expert parallelism is experimental; no dual/single speed gate has passed.
+    export STRATA_PF_EP="${STRATA_PF_EP-0}"
+    # Decode experiments remain opt-in until normal dual/single profiles pass.
+    export STRATA_VERIFY_COMMIT_OVERLAP="${STRATA_VERIFY_COMMIT_OVERLAP-0}"
+    export STRATA_MTP_CHAIN_SUBMIT="${STRATA_MTP_CHAIN_SUBMIT-0}"
+    export STRATA_MTP_LOOKAHEAD="${STRATA_MTP_LOOKAHEAD-0}"
+    export STRATA_VERIFY_SKIP_EMPTY="${STRATA_VERIFY_SKIP_EMPTY-0}"
+    export STRATA_VERIFY_NATIVE_GRAPH="${STRATA_VERIFY_NATIVE_GRAPH-0}"
+    # Startup diagnostics only; no measured throughput gain/default promotion.
+    export STRATA_NATIVE_UPLOAD_PINNED="${STRATA_NATIVE_UPLOAD_PINNED-0}"
+    export STRATA_DENSE_UPLOAD_KERNEL="${STRATA_DENSE_UPLOAD_KERNEL-0}"
     # Full check213531:42/42; normal profile214426 confirms both card modes.
     # Eager immutable loan copies cost extra host RAM; the engine bounds the pool and falls back.
     export STRATA_PF_PIN_LOAN="${STRATA_PF_PIN_LOAN-2}"

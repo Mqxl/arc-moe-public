@@ -1,0 +1,59 @@
+From 30eee7c48ad6784717c949edfa0e0f32d4f373bf Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 13:05:24 +0500
+Subject: [PATCH] diagnostics: compare source and destination as seen by the
+ GPU
+
+---
+ sycl/include/strata/sycl_dense_upload.hpp | 16 ++++++++++++++++
+ sycl/src/core/weights.cpp                 |  1 +
+ 2 files changed, 17 insertions(+)
+
+diff --git a/sycl/include/strata/sycl_dense_upload.hpp b/sycl/include/strata/sycl_dense_upload.hpp
+index f1f51c3..a071c43 100644
+--- a/sycl/include/strata/sycl_dense_upload.hpp
++++ b/sycl/include/strata/sycl_dense_upload.hpp
+@@ -2,12 +2,28 @@
+ #include <sycl/sycl.hpp>
+ #include <cstdint>
+ #include <cstdlib>
++#include <cstdio>
+ namespace strata {
+ // Startup-only diagnostic alternative to the runtime memcpy. The source must
+ // be host USM. Zero retains the previous DMA path; no inference kernels change.
+ inline bool dense_upload_kernel_enabled() {
+     const char* e = std::getenv("STRATA_DENSE_UPLOAD_KERNEL"); return e && e[0] == '1';
+ }
++inline void dense_mismatch_probe(sycl::queue& q, const void* target, const void* input, size_t offset) {
++    if (sycl::get_pointer_type(input, q.get_context()) != sycl::usm::alloc::host) return;
++    auto* d = sycl::malloc_device<uint8_t>(16, q);
++    auto* h = sycl::malloc_host<uint8_t>(16, q);
++    if (!d || !h) { if(d) sycl::free(d,q); if(h) sycl::free(h,q); return; }
++    const auto* src=(const uint8_t*)input; const auto* dst=(const uint8_t*)target;
++    q.single_task<class DenseUploadMismatchProbe>([=] {
++        for(int j=0;j<16;j+=2) { d[j]=src[offset]; d[j+1]=dst[offset]; }
++    }).wait();
++    q.memcpy(h,d,16).wait();
++    std::fprintf(stderr,"strata weight check: GPU-side (host-USM source/device destination) byte pairs:");
++    for(int j=0;j<16;j+=2) std::fprintf(stderr," %u/%u",h[j],h[j+1]);
++    std::fprintf(stderr,"\n");
++    sycl::free(d,q); sycl::free(h,q);
++}
+ inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t bytes) {
+     if (!dense_upload_kernel_enabled() || sycl::get_pointer_type(input, q.get_context()) != sycl::usm::alloc::host) {
+         q.memcpy(target, input, bytes).wait(); return;
+diff --git a/sycl/src/core/weights.cpp b/sycl/src/core/weights.cpp
+index 4e4e349..3ae81d3 100644
+--- a/sycl/src/core/weights.cpp
++++ b/sycl/src/core/weights.cpp
+@@ -474,6 +474,7 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
+                     if (std::memcmp(back.data(), host_src, (size_t) out_bytes)) {
+                         size_t i = 0; const auto* expected = (const uint8_t*) host_src;
+                         while (i < out_bytes && back[i] == expected[i]) ++i;
++                        strata::dense_mismatch_probe(dpct::get_in_order_queue(), dst_base + r.dst_off + out_at, host_src, i);
+                         const size_t at = i & ~(size_t) 63, nb = std::min<size_t>(64, out_bytes - at);
+                         auto* read_pin = (uint8_t*) sycl::malloc_host(nb, dpct::get_in_order_queue());
+                         if (read_pin) {
+-- 
+2.43.0
+

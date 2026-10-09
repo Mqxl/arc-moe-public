@@ -1,0 +1,134 @@
+From 072c69e5ae3858d7e79809e32cd203f2e5a3191b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 03:40:34 +0500
+Subject: [PATCH] sycl: overlap commits and submit fixed MTP chains
+
+---
+ sycl/serve/strata-sycl-native.sh |  6 ++++++
+ sycl/src/core/mtp.cpp            | 28 ++++++++++++++++++++++++++++
+ sycl/src/core/verify.cpp         | 14 ++++++++++----
+ sycl/src/program/generate.cpp    |  4 +++-
+ 4 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/sycl/serve/strata-sycl-native.sh b/sycl/serve/strata-sycl-native.sh
+index 2f4edd5..17598f1 100755
+--- a/sycl/serve/strata-sycl-native.sh
++++ b/sycl/serve/strata-sycl-native.sh
+@@ -35,6 +35,12 @@ if [ "${ONEAPI_DEVICE_SELECTOR:-}" = arc ]; then
+ fi
+ : "${SYCL_CACHE_PERSISTENT:=0}" "${ZES_ENABLE_SYSMAN:=1}" "${UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS:=1}"
+ export SYCL_CACHE_PERSISTENT ZES_ENABLE_SYSMAN UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS
++# Opt-in native Level Zero recording: configured before SYCL reads its environment.
++# Explicit 0 restores the previous SYCL graph recorder without rebuilding.
++case "${STRATA_VERIFY_NATIVE_GRAPH:-}" in
++    1) export SYCL_GRAPH_FORCE_NATIVE_RECORDING=1 ;;
++    0) export SYCL_GRAPH_FORCE_NATIVE_RECORDING=0 ;;
++esac
+ [ -x "$bin" ] || { echo "strata-sycl-native: no engine at $bin (scripts/build.sh)" >&2; exit 127; }
+ # arc-moe: one visible card (ARC_GPUS=0 on a two-card config) runs without a layer split
+ n_visible=2
+diff --git a/sycl/src/core/mtp.cpp b/sycl/src/core/mtp.cpp
+index 905c853..cd4ee97 100644
+--- a/sycl/src/core/mtp.cpp
++++ b/sycl/src/core/mtp.cpp
+@@ -1102,6 +1102,34 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t*
+     put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+     h_row_[0] = a;
+     h_row_[1] = 0;
++    // With min_p=0 the old path always executes the complete chain. Stage every
++    // cell before launch, submit dependent graphs on the in-order queue and read
++    // mapped outputs only once. Positive min_p retains the early-stop path.
++    const char* chain_v = std::getenv("STRATA_MTP_CHAIN_SUBMIT");
++    const bool chain = chain_v && std::strcmp(chain_v, "1") == 0 && min_p <= 0.0f;
++    const int chain_n = std::max(1, std::min(max_t_ - 1, max_drafts_));
++    if (chain) try {
++        for (int j = 1; j < chain_n; ++j) {
++            if (!capture_step(j, cp, err)) return false;
++            put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
++        }
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        cs_->ext_oneapi_graph(*(cp ? round_exec_c_[T] : round_exec_[T]));
++        for (int j = 1; j < chain_n; ++j)
++            cs_->ext_oneapi_graph(*(cp ? step_exec_c_[j] : step_exec_[j]));
++        cs_->wait_and_throw();
++        for (int j = 0; j < chain_n; ++j) {
++            drafts[j] = ((volatile int32_t*) h_out_)[j];
++            if (probs) probs[j] = ((volatile float*) h_prob_)[j];
++        }
++        for (int j = chain_n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
++        if (n_drafts) *n_drafts = chain_n;
++        ms_draft += ms_since(t0);
++        ++rounds;
++        return true;
++    } catch (const sycl::exception& e) {
++        err = std::string("mtp chain submit: ") + e.what(); return false;
++    }
+     std::atomic_thread_fence(std::memory_order_seq_cst);
+     if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*(cp ? round_exec_c_[T] : round_exec_[T]))) != 0 ||
+         DPCT_CHECK_ERROR(cs_->wait()) != 0) {
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 601497f..63b88ba 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -1354,6 +1354,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+     SessionState& ss = *ss_;
+     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
++    // An opt-in deferred API commit may overlap the preceding MTP round.
++    if (!wait_commit(err)) return false;
+     if (!capture(T, err) || !capture_commit(err)) return false;
+     VDBG("captured; staging\n");
+     const Clock::time_point t0 = Clock::now();
+@@ -1411,7 +1413,9 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+             std::string("verify: launch: ") + dpct::get_error_string_dummy(le);
+         return false;
+     }
+-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
++    const char* skip_empty = std::getenv("STRATA_VERIFY_SKIP_EMPTY");
++    if (!skip_empty || std::strcmp(skip_empty, "1") != 0)
++        (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+     VDBG("launched\n");
+     volatile uint32_t* const seq = h_seq_;
+     volatile uint32_t* const flag = h_flag_;
+@@ -1515,7 +1519,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+     trace_ev("SYNC", -1, -1, 0);
+     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
+     trace_ev("SYNCED", -1, -1, (int64_t) se);
+-    if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
++    if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr || std::getenv("STRATA_VERIFY_WINDOW_TIMING") != nullptr) {
+         const Clock::time_point t_done = Clock::now();
+         std::fprintf(stderr, "verify dbg: T=%d window: since previous window %.1f ms, staging %.1f ms, gpu %.1f ms\n", T,
+                      t_prev_end.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - t_prev_end).count() : 0.0,
+@@ -1858,10 +1862,12 @@ bool Verifier::commit(int n_keep, std::string &err, bool wait) try {
+               dpct::get_error_string_dummy(le);
+         return false;
+     }
+-    if (!wait && next_ == nullptr) {   // left running: commit_finish() collects it (the drafter overlaps it)
++    const char* overlap = std::getenv("STRATA_VERIFY_COMMIT_OVERLAP");
++    const bool split_overlap = overlap && std::strcmp(overlap, "1") == 0;
++    if (!wait && (next_ == nullptr || split_overlap)) {   // independent stage commits and the drafter overlap
+         pending_commit_ = n_keep;
+         pending_commit_t0_ = t0;
+-        return true;
++        return next_ == nullptr || next_->commit(n_keep, err, false);
+     }
+     pending_commit_ = n_keep;
+     pending_commit_t0_ = t0;
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 97bd191..e329d79 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -7179,7 +7179,9 @@ int main(int argc, char **argv) try {
+                 bool adapt_ok = true;
+                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+-                if (!ver.commit(a + 1, err)) {
++                const char* co = std::getenv("STRATA_VERIFY_COMMIT_OVERLAP");
++                const bool overlap_commit = co && std::strcmp(co, "1") == 0;
++                if (!ver.commit(a + 1, err, !overlap_commit)) {
+                     if (adapt_thr.joinable()) adapt_thr.join();
+                     std::printf("ERR %s\n", err.c_str());
+                     return 1;
+-- 
+2.43.0
+
