@@ -41,6 +41,8 @@ arc_engine_env() {   # export the defaults above; a variable already set (even e
     # Startup diagnostics only; no measured throughput gain/default promotion.
     export STRATA_NATIVE_UPLOAD_PINNED="${STRATA_NATIVE_UPLOAD_PINNED-0}"
     export STRATA_DENSE_UPLOAD_KERNEL="${STRATA_DENSE_UPLOAD_KERNEL-0}"
+    export STRATA_UPLOAD_VERIFY="${STRATA_UPLOAD_VERIFY-0}"
+    export STRATA_UPLOAD_RELOCATE="${STRATA_UPLOAD_RELOCATE-0}"
     # Full check213531:42/42; normal profile214426 confirms both card modes.
     # Eager immutable loan copies cost extra host RAM; the engine bounds the pool and falls back.
     export STRATA_PF_PIN_LOAN="${STRATA_PF_PIN_LOAN-2}"

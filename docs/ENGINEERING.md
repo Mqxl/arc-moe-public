@@ -1036,3 +1036,72 @@ The deliberate i915 reset at 11:50:32 is recorded as a GPU HANG in the journal;
 that entry is from the controlled reset, not evidence of a spontaneous hang.
 No old server on 8790 was started. Further dual-card measurements and default
 promotion require resolving the reproducible upper-card upload fault first.
+
+### Bounded upload verification, patches 61–63 (2026-10-09; unresolved)
+
+These patches are diagnostic containment, not a validated performance fix.
+`STRATA_UPLOAD_VERIFY=0` and `STRATA_UPLOAD_RELOCATE=0` remain the shared defaults.
+No new performance default was promoted, and no new full profile was run.
+All three patched builds compiled successfully on the server.
+
+Patch 61 verifies dense/native uploads against the original CPU bytes using a
+bounded 8-MiB host-USM readback buffer. Each failing chunk has at most two extra
+copies (three attempts total); an unresolved mismatch throws before publishing
+that tensor. Patch 62 optionally quarantines failed native allocations and
+tries at most two replacements, with a 128-MiB quarantine limit. Only verified
+replacements are published. It is not a working workaround: the engine loaded
+once but still returned NaN on a 10K request. Both controls are startup costs,
+not speed improvements. With verification disabled the original upload path
+remains available without rebuilding.
+
+Patch 63 applies the same verification/retry to blocking expert-cache uploads
+and verifies a final snapshot of every native matrix against the original GGUF
+mapping before publishing those native tensors. Serial initial cache fill
+(`STRATA_FILL_SERIAL=1`) is necessary to cover every initial cache upload with
+this blocking path. Queued/pipelined cache updates are not covered by this
+change, and the native snapshot is taken before the later cache fill.
+
+Targeted upper-card results, physical GPU0 / PCI 03:00.0:
+
+| Attempt | Result |
+| --- | --- |
+| Disable USM/buffer compression; regular command lists | Native upload still differs: expected 57, read 25 at byte 1986329 of blk24.ssm_out.weight. |
+| Isolated Compute Runtime 26.35.39758.10 (L0 reports 1.17.39758+10) | Native upload still differs: expected 72, read 104 in blk10.ssm_out.weight. No system driver package was changed. |
+| Patch 61 readback + two retries | blk11.attn_q.weight byte 7639379 remains 76 -> 108 after all three attempts. |
+| Patch 62 bounded allocation quarantine | Three chunks repaired; one 12,902,400-byte allocation replaced. Engine loads, but 10K request fails: last row has 10240/10240 nonfinite values. Short 7*9 request also fails semantically. |
+| Full PCI function reset (14:31:39 +05:00) | Subsequent startup repairs 18 chunks, but the 10K request still fails with NaN. |
+| Upper GPU core capped at 1800 MHz | Upload retries allow startup; 10K still fails with NaN. Both cards restored to 2400 MHz maximum afterward. |
+| Patch 63 native snapshot + serial cache verification | All 300 native tensors pass final snapshot. Startup then fails during expert-cache profile fill at pair 6868: byte 317779 remains 0 -> 32 after three attempts. |
+
+The final patch-63 log records 87 mismatch events and 74 repaired chunks over
+native/cache initialization. Events include retries; this is not a count of 87
+independently damaged allocations. The terminal error is:
+`ExpertCache::fill_slot_blocking: upload readback mismatch remains after bounded retries`.
+See uncommitted `test-logs/strata-verified63-gpu0.log` for exact sequence.
+
+Two independent 12-GiB VRAM retention probes passed on the upper card: uniform
+0x40/0xdf fills, and distinct pseudorandom data per chunk with all writes
+completed before a delayed full readback. Earlier immediate copy checks also
+passed. These do not reproduce the model's allocation/command pattern and do
+not certify the hardware as healthy. Conversely, a reproducible wrong device
+byte is not sufficient to diagnose a physically defective VRAM chip. The fault
+could still involve device addressing/storage, driver residency or hardware;
+its root cause remains unresolved. Earlier GPU-side comparison confirmed the
+changed device byte while the host-USM source byte remained correct, so this
+is not merely an OpenCode rendering problem or CPU readback artifact.
+
+No RAM test/timing adjustment, BIOS change, undervolt, system driver installation,
+full performance profile, or old 8790 service was performed in this continuation.
+A related upstream runtime residency bug was considered, but the newer runtime
+and regular command lists still reproduced this fault; it is not established
+as that issue. No further optimization or tests were started after the user's
+stop instruction.
+
+Final service state: transient `arc-moe-gpu1-recovery.service` on 8798, physical
+GPU1 (lower card / PCI 0b:00.0), now using the patch-63 build with verification
+and quarantine controls off. Health reports loaded=true, authenticated API,
+images=true and max_context=131072. This is a health check, not a new patch-63
+sampled/agent or full-128K stability test. Functional recovery tests quoted
+above were run on patch 60. The transient unit is not a reboot-persistent setup.
+The upper card is excluded from inference; new dual-card correctness/speed
+claims are blocked by its unresolved upload fault. Optimization is stopped.

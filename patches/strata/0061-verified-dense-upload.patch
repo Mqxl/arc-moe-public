@@ -1,0 +1,88 @@
+From a79b4ee7668a173e910e94062a99076be63401fe Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 14:14:48 +0500
+Subject: [PATCH] dense uploads: opt-in full readback verification and bounded
+ retry
+
+---
+ sycl/include/strata/sycl_dense_upload.hpp | 36 ++++++++++++++++++++++-
+ sycl/src/core/native_dense.cpp            |  4 +--
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/sycl/include/strata/sycl_dense_upload.hpp b/sycl/include/strata/sycl_dense_upload.hpp
+index a071c43..1070299 100644
+--- a/sycl/include/strata/sycl_dense_upload.hpp
++++ b/sycl/include/strata/sycl_dense_upload.hpp
+@@ -3,6 +3,9 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstdio>
++#include <algorithm>
++#include <cstring>
++#include <stdexcept>
+ namespace strata {
+ // Startup-only diagnostic alternative to the runtime memcpy. The source must
+ // be host USM. Zero retains the previous DMA path; no inference kernels change.
+@@ -24,7 +27,7 @@ inline void dense_mismatch_probe(sycl::queue& q, const void* target, const void*
+     std::fprintf(stderr,"\n");
+     sycl::free(d,q); sycl::free(h,q);
+ }
+-inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t bytes) {
++inline void dense_upload_raw(sycl::queue& q, void* target, const void* input, size_t bytes) {
+     if (!dense_upload_kernel_enabled() || sycl::get_pointer_type(input, q.get_context()) != sycl::usm::alloc::host) {
+         q.memcpy(target, input, bytes).wait(); return;
+     }
+@@ -34,4 +37,35 @@ inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t
+         for(size_t j=0;j<16 && at+j<bytes;++j) dst[at+j] = src[at+j];
+     }).wait();
+ }
++
++// Opt-in startup verification: never consume a failed upload. A bounded retry
++// distinguishes a transient write failure from an unrecoverable allocation.
++// There is no host readback, extra allocation or inference work when disabled.
++inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t bytes) {
++    dense_upload_raw(q, target, input, bytes);
++    const char* enabled = std::getenv("STRATA_UPLOAD_VERIFY");
++    if (!bytes || !enabled || enabled[0] != '1') return;
++    constexpr size_t chunk = 8ull << 20;
++    auto* back = sycl::malloc_host<uint8_t>(std::min(bytes, chunk), q);
++    if (!back) throw std::runtime_error("dense upload verification: host staging allocation failed");
++    try {
++        for (size_t at = 0; at < bytes; at += chunk) {
++            const size_t n = std::min(chunk, bytes-at);
++            auto* dst = static_cast<uint8_t*>(target) + at;
++            const auto* src = static_cast<const uint8_t*>(input) + at;
++            for (int attempt=0; ; ++attempt) {
++                q.memcpy(back, dst, n).wait_and_throw();
++                if (!std::memcmp(back, src, n)) {
++                    if (attempt) std::fprintf(stderr, "strata upload verification: corrected and fully verified %zu-byte chunk after %d retry(s)\n", n, attempt);
++                    break;
++                }
++                size_t first=0; while (first<n && back[first]==src[first]) ++first;
++                std::fprintf(stderr, "strata upload verification: mismatch offset %zu expected %u got %u, attempt %d/2\n", at+first, src[first], back[first], attempt);
++                if (attempt==2) throw std::runtime_error("dense upload verification: mismatch remains after bounded retries");
++                dense_upload_raw(q, dst, src, n);
++            }
++        }
++    } catch (...) { sycl::free(back,q); throw; }
++    sycl::free(back,q);
++}
+ }
+diff --git a/sycl/src/core/native_dense.cpp b/sycl/src/core/native_dense.cpp
+index 6a1c450..c08c31f 100644
+--- a/sycl/src/core/native_dense.cpp
++++ b/sycl/src/core/native_dense.cpp
+@@ -215,8 +215,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                         if (!stage_check("after upload")) return false;
+                     }
+                 } else if (status == 0)
+-                    status = DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+-                        .memcpy(data.get(), gguf.tensor_data(tensor), bytes).wait());
++                    status = DPCT_CHECK_ERROR(strata::dense_upload(dpct::get_in_order_queue(),
++                        data.get(), gguf.tensor_data(tensor), bytes));
+                 if (const char* dbg = std::getenv("STRATA_DBG_WEIGHT_COPY"); status == 0 && dbg && dbg[0] == '1') {
+                     std::vector<uint8_t> back((size_t) bytes);
+                     dpct::get_in_order_queue().memcpy(back.data(), data.get(), bytes).wait();
+-- 
+2.43.0
+

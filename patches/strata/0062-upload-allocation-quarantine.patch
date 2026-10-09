@@ -1,0 +1,124 @@
+From 563cedca3210c51367c5e8238f6957f14b594e3c Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 14:22:20 +0500
+Subject: [PATCH] native dense: opt-in bounded quarantine of failed upload
+ allocations
+
+---
+ sycl/include/strata/sycl_dense_upload.hpp |  4 ++-
+ sycl/src/core/native_dense.cpp            | 32 +++++++++++++++++++----
+ 2 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/sycl/include/strata/sycl_dense_upload.hpp b/sycl/include/strata/sycl_dense_upload.hpp
+index 1070299..e0abf8e 100644
+--- a/sycl/include/strata/sycl_dense_upload.hpp
++++ b/sycl/include/strata/sycl_dense_upload.hpp
+@@ -41,7 +41,9 @@ inline void dense_upload_raw(sycl::queue& q, void* target, const void* input, si
+ // Opt-in startup verification: never consume a failed upload. A bounded retry
+ // distinguishes a transient write failure from an unrecoverable allocation.
+ // There is no host readback, extra allocation or inference work when disabled.
++inline thread_local bool dense_upload_bad_bytes = false;
+ inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t bytes) {
++    dense_upload_bad_bytes = false;
+     dense_upload_raw(q, target, input, bytes);
+     const char* enabled = std::getenv("STRATA_UPLOAD_VERIFY");
+     if (!bytes || !enabled || enabled[0] != '1') return;
+@@ -61,7 +63,7 @@ inline void dense_upload(sycl::queue& q, void* target, const void* input, size_t
+                 }
+                 size_t first=0; while (first<n && back[first]==src[first]) ++first;
+                 std::fprintf(stderr, "strata upload verification: mismatch offset %zu expected %u got %u, attempt %d/2\n", at+first, src[first], back[first], attempt);
+-                if (attempt==2) throw std::runtime_error("dense upload verification: mismatch remains after bounded retries");
++                if (attempt==2) { dense_upload_bad_bytes = true; throw std::runtime_error("dense upload verification: mismatch remains after bounded retries"); }
+                 dense_upload_raw(q, dst, src, n);
+             }
+         }
+diff --git a/sycl/src/core/native_dense.cpp b/sycl/src/core/native_dense.cpp
+index c08c31f..b178c48 100644
+--- a/sycl/src/core/native_dense.cpp
++++ b/sycl/src/core/native_dense.cpp
+@@ -103,6 +103,12 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+         DevicePtr upload_stage(pin_upload ? sycl::malloc_host(upload_chunk, dpct::get_in_order_queue()) : nullptr);
+         if (pin_upload && !upload_stage) { err = "native dense: no pinned upload buffer"; return false; }
+         if (pin_upload) std::fprintf(stderr, "strata native dense: bounded pinned upload, 8 MiB staging\n");
++        const char* relocate_env = std::getenv("STRATA_UPLOAD_RELOCATE");
++        const char* verify_env = std::getenv("STRATA_UPLOAD_VERIFY");
++        const bool relocate = relocate_env && relocate_env[0]=='1' && verify_env && verify_env[0]=='1';
++        std::vector<DevicePtr> quarantined;
++        uint64_t quarantine_bytes = 0;
++        constexpr uint64_t quarantine_limit = 128ull << 20;
+         std::vector<Pending> pending;
+         std::set<std::string> seen;
+         int max_in = 0;
+@@ -189,11 +195,15 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                 }
+                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
+                     tensor.type, (int) ref.ne0, (int) ref.ne1);
++                DevicePtr data;
++                int status=0;
++                for (int relocation=0; ; ++relocation) {
+                 void* allocation = nullptr;
+-                auto status =
++                status =
+                     DPCT_CHECK_ERROR(allocation = (void *)sycl::malloc_device(
+                                          bytes, dpct::get_in_order_queue()));
+-                DevicePtr data(allocation);
++                data.reset(allocation);
++                if (!allocation) status = 1;
+                 if (status == 0 && pin_upload) {
+                     const auto* source = (const uint8_t*) gguf.tensor_data(tensor);
+                     for (size_t at = 0; at < bytes && status == 0; at += upload_chunk) {
+@@ -233,13 +243,21 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                         }
+                         err = "native dense " + tensor.name + ": upload readback mismatch at tensor byte " + std::to_string(i);
+                         std::fprintf(stderr, "strata weight check: %s expected %u got %u\n", err.c_str(), expected[i], back[i]);
+-                        return false;
++                        if (!relocate) return false;
++                        strata::dense_upload_bad_bytes = true;
++                        status = 1;
+                     }
+                 }
+                 /*
+                 DPCT1000: Error handling if-stmt was detected but could not
+                 be rewritten.
+                 */
++                if (status != 0 && relocate && strata::dense_upload_bad_bytes && data && relocation<2 && bytes<=quarantine_limit-quarantine_bytes) {
++                    quarantine_bytes += bytes;
++                    quarantined.push_back(std::move(data));
++                    std::fprintf(stderr, "strata upload quarantine: %s; retained %llu bytes, total %llu; relocation %d/2\n", tensor.name.c_str(), (unsigned long long)bytes, (unsigned long long)quarantine_bytes, relocation+1);
++                    continue;
++                }
+                 if (status != 0) {
+                     /*
+                     DPCT1009: SYCL reports errors using exceptions and does
+@@ -254,6 +272,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+                           dpct::get_error_string_dummy(status);
+                         return false;
+                 }
++                break;
++                }
+                 max_in = (std::max)(max_in, (int) ref.ne0);
+                 total += bytes;
+                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+@@ -284,7 +304,9 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+             return false;
+         }
+         // All checks and allocations finish before publishing any reference.
+-        weights_.reserve(pending.size());
++        weights_.reserve(pending.size()+quarantined.size());
++        for (auto& bad : quarantined) weights_.push_back(bad.release());
++        if (quarantine_bytes) std::fprintf(stderr, "strata upload quarantine: %llu bytes retained for process lifetime; all published tensors verified\n", (unsigned long long)quarantine_bytes);
+         for (auto& item : pending) {
+             item.ref->native_data = item.data.get();
+             item.ref->native_type = item.type;
+@@ -292,7 +314,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
+             weights_.push_back(item.data.release());
+         }
+         scratch_ = scratch.release();
+-        bytes_ = total;
++        bytes_ = total+quarantine_bytes;
+         return true;
+     } catch (const std::exception& error) {
+         err = std::string("native dense: ") + error.what();
+-- 
+2.43.0
+
