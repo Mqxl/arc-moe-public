@@ -1187,3 +1187,38 @@ requests, but that alone is not a speed acceptance. Reports:
 tune-20261009-190836.txt and .tune-20261009-190836/ (not committed).
 The user authorized stopping when remaining candidates give no noticeable
 improvement; no further optimization sweep is justified by these results.
+
+## Tuner acceptance and configuration isolation (patch 66)
+
+The tuned-opencode JSON previously overwrote candidate STRATA values, making
+some apparent A/B tests identical. Opt-in STRATA_CONFIG_ENV_OVERRIDE=1 now
+lets an explicit caller STRATA variable override its JSON counterpart; unset
+preserves config precedence and non-STRATA variables still follow the config.
+The tuner first reconstructs the effective baseline including JSON values,
+then applies candidate overrides. API keys are excluded from generated envs.
+
+Each GPU mode resolves its baseline independently: this machine uses 4096
+chunks and 30/18 for dual, auto chunks for single. No dual flags leak into G1.
+Base/final matrices cover eight cases, two runs, all fourteen correctness
+requests including both long prompts. Screens cover six cases and twelve
+short correctness requests. tools/tune_metrics.py rejects missing, duplicate,
+empty, broken, failed and nonfinite rows, and compares every throughput, TTFT
+and wall metric. Target gain must be >=2%; loss <=2% (agent screen <=3%, final
+<=2%). Combination and fallback are remeasured and compared, not accepted
+solely on correctness. If all candidates lose, the actual verified baseline
+is saved rather than dropping local tuning. Environment files are atomic.
+
+scripts/profile.sh also resolves each mode independently, preserving explicit
+caller settings while removing inherited automatically exported dual defaults.
+Shell syntax, Python compilation, precedence cases, GPU-free launch argument
+controls and synthetic acceptance failures passed. The actual dual tuner
+completed all three remaining screens and retained its baseline. The single
+base full control was completed separately; further single candidates were
+cancelled at a server-free boundary under the user's stop criterion.
+
+The trace parser reports only complete DMA events within a selected window,
+with event count, bytes, summed and union durations and aggregate GB/s for each
+direction. Boundary-clipped copies are excluded so full bytes are not divided
+by a clipped duration. Synthetic overlap/direction/boundary checks passed.
+Existing stage-0 GPU traces remain baseline evidence, not a new post-balance
+trace or a measurement of the hardware's maximum PCIe bandwidth.

@@ -99,6 +99,7 @@ def analyze(path, requests, handoff_bytes=()):
             for pid, name in devices.items():
                 groups = defaultdict(list)
                 copies = defaultdict(float)
+                complete_copies = defaultdict(list)
                 named = defaultdict(list)
                 allops = []
                 for a, b, p, _, n in scoped:
@@ -112,11 +113,23 @@ def analyze(path, requests, handoff_bytes=()):
                         m = re.search(r'\[(\d+)\]', n)
                         if m:
                             copies[str(int(m.group(1)))] += (item[1] - item[0]) / 1000
+                            # A boundary-clipped DMA has its full size in the
+                            # event name: do not divide those bytes by a partial
+                            # duration and invent an impossible transfer rate.
+                            direction = re.search(r'MemoryCopy\((\w+)\)', n)
+                            if direction and a >= begin and b <= end and b > a:
+                                complete_copies[(direction.group(1), int(m.group(1)))].append((a, b))
                 busy = union(allops)
                 detail['devices'][name] = {
                     'busy_ms': busy / 1000, 'unrecorded_idle_pct': 100 * (1 - busy / span),
                     'categories': {k: {'union_ms': union(v) / 1000, 'pct_of_span': 100 * union(v) / span}
                                    for k, v in groups.items()}, 'copy_bytes_duration_ms': dict(copies),
+                    'complete_dma': {f'{direction}:{size}': {
+                        'count': len(v), 'bytes': size * len(v),
+                        'sum_ms': sum(b-a for a,b in v) / 1000,
+                        'union_ms': union(v) / 1000,
+                        'aggregate_GB_s': size * len(v) / (union(v) * 1000)
+                    } for (direction,size),v in complete_copies.items()},
                     'top_gpu_ops_ms': {n: v / 1000 for n,v in
                                        sorted(((n, union(v)) for n,v in named.items()), key=lambda x:x[1], reverse=True)[:12]}}
             rows.append(detail)

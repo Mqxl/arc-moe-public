@@ -1,0 +1,29 @@
+From 66b482ee0a956073b5f58500cabcafaf36b572b8 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 19:01:38 +0500
+Subject: [PATCH] serve: opt-in caller precedence for STRATA tuning parameters
+
+---
+ serve/server.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index fc0294d..af39dcc 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1572,7 +1572,12 @@ def child_env(cfg: dict) -> dict:
+     elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
+         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
++    override_strata = os.environ.get("STRATA_CONFIG_ENV_OVERRIDE") == "1"
+     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
++        # Opt-in tuning: an explicit STRATA_* candidate must reach the engine.
++        # Other backend/library variables retain the config's existing policy.
++        if override_strata and str(k).startswith("STRATA_") and str(k) in os.environ:
++            continue
+         env[str(k)] = str(v)
+     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
+     if dirs:
+-- 
+2.43.0
+

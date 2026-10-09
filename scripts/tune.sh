@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # ./arc tune [model] - find this machine's fastest CORRECT settings and keep them for ./arc start.
 #
-# For one card (ARC_GPUS=0) and, with two or more Arcs, for the layer split, the server is started once per candidate
-# below; each candidate must first answer the 12 short checks of tools/check.py, then tools/bench.py measures it
-# (short code, Russian prose, a 10K prompt and an agent turn, two runs each). A candidate is kept when it beats the
-# base by >= 2% on the number it targets (code decode for decode switches, 10K prompt tok/s for prompt ones) and
-# loses no more than 3% anywhere else. The kept ones are then combined and the combination has to pass the full
-# check (with the two 10K prompts) and stay at least as fast as the base - otherwise the best single candidate is
-# used. The result goes to tune-dual.env / tune-single.env in the repository root; ./arc start (lib.sh) applies the
-# one that matches the cards it runs on. A variable set by the caller still wins. Everything is written to
-# tune-<time>.txt. About 35 minutes per mode (each start reloads the model). The server must be stopped first.
+# Resolve the current measured configuration independently for dual and single.
+# Baseline and final runs use full 14-request checks and all eight benchmark cases;
+# screens use 12 checks and six cases including prose, post-10K/64K and vision.
+# Keep >=2% target gain, <=2% loss in every metric (agent screen <=3%).
+# Recheck combined and fallback settings against the full baseline. Failed or
+# incomplete JSON never qualifies. Save tune-dual.env/tune-single.env atomically;
+# retain the verified baseline when no candidate qualifies. Caller values win.
+# Reports are tune-<time>.txt; a server must be stopped before this starts.
 #
 #   ARC_TUNE_MODES="dual single"   which modes to tune (default: both when two Arcs are present, else single)
 #   ARC_TUNE_RUNS=2                bench runs per case
+#   ARC_TUNE_CANDIDATES="spec5 split_rows8" optional focused shortlist
+# The baseline now includes all eight context/vision cases. Candidate screens
+# include prose, post-10K and 64K decode; final combinations and fallback must
+# pass all cases within 2%. Agent screen tolerance is 3%, final tolerance 2%.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 cd "$STRATA"
@@ -36,10 +39,11 @@ work="$ROOT/.tune-$stamp"
 mkdir -p "$work"
 : >"$out"
 
-# the tuned files must not steer the measurements: every run starts from lib.sh's own defaults
-export ARC_TUNE_IGNORE=1
-arc_engine_env
-BASE_ARGS="$STRATA_EXTRA_ARGS"
+# Each mode resolves its current tune file in a fresh shell. Tuning must not
+# discard an already verified machine configuration or leak dual args to single.
+all_cases=short,prose,10k,32k,64k,120k,agent,vision
+screen_cases=short,prose,10k,64k,agent,vision
+baseline_env=()
 
 srv_pid=""
 stop_server() {
@@ -59,9 +63,11 @@ trap stop_server EXIT
 # measure <tag> <full-check 0|1> <env...>: prints "ok" or "fail" into $work/<tag>.status, bench rows into <tag>.json
 measure() {
     local tag=$1 full=$2; shift 2
+    local cases=$screen_cases
+    [ "$full" = 1 ] && cases=$all_cases
     say "${B}tune $tag${N}: $*"
     echo "================ $tag: $*" >>"$out"
-    env "$@" setsid "$ROOT/scripts/start.sh" "$want" >"$work/$tag.start" 2>&1 &
+    env "${baseline_env[@]}" "$@" setsid "$ROOT/scripts/start.sh" "$want" >"$work/$tag.start" 2>&1 &
     srv_pid=$!
     local t=0 loaded=1
     until curl -fsS -m 3 "$url/health" 2>/dev/null | grep -q '"loaded": *true'; do
@@ -74,11 +80,18 @@ measure() {
         echo fail >"$work/$tag.status"; stop_server; return 0
     fi
     local long=(--no-long); [ "$full" = 1 ] && long=()
-    if python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/check.py" --url "$url" "${long[@]}" >>"$out" 2>&1; then
-        python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/bench.py" --url "$url" --runs "$runs" \
-            --max-tokens 128 --cases short,prose,10k,agent --json "$work/$tag.json" >>"$out" 2>&1 || true
-        if [ -s "$work/$tag.json" ]; then echo ok >"$work/$tag.status"; else echo fail >"$work/$tag.status"; fi
+    if python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/check.py" --url "$url" "${long[@]}" >"$work/$tag.check.txt" 2>&1; then
+        cat "$work/$tag.check.txt" >>"$out"
+        if python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/bench.py" --url "$url" --runs "$runs" \
+            --max-tokens 128 --cases "$cases" --ttft --vram --seed "tune-$stamp" --json "$work/$tag.json" >>"$out" 2>&1 \
+            && python3 "$ROOT/tools/tune_metrics.py" validate "$work/$tag.json" --cases "$cases" --runs "$runs" >>"$out" 2>&1; then
+            echo ok >"$work/$tag.status"
+        else
+            echo "incomplete, erroneous or broken benchmark: rejected" >>"$out"
+            echo fail >"$work/$tag.status"
+        fi
     else
+        cat "$work/$tag.check.txt" >>"$out"
         echo "check failed: rejected" | tee -a "$out"
         echo fail >"$work/$tag.status"
     fi
@@ -112,13 +125,34 @@ spec5 decode STRATA_EXTRA_ARGS=${BASE_ARGS// --spec 6/} --spec 5
 spec4 decode STRATA_EXTRA_ARGS=${BASE_ARGS// --spec 6/} --spec 4
 chunk4096 prompt STRATA_EXTRA_ARGS=${BASE_ARGS// --prefill auto/} --prefill 4096
 split_rows8 prompt STRATA_PF_SPLIT_ROWS=8
+expert_tail decode STRATA_EXPERT_TAIL_BATCH=1
 EOF
 }
 
 for mode in $modes; do
-    menv=(); [ "$mode" = single ] && menv=(ARC_GPUS=0)
+    case "$mode" in dual) menv=(ARC_GPUS=0,1) ;; single) menv=(ARC_GPUS=0) ;; *) die "invalid tune mode: $mode" ;; esac
+    mapfile -d '' -t baseline_env < <(env "${menv[@]}" bash -c '
+        . "$1"; arc_engine_env
+        python3 - "$2" <<"PY_ENV"
+import json, os, sys
+values = {k: v for k, v in os.environ.items() if k.startswith("STRATA_")}
+cfg = json.load(open(sys.argv[1]))
+if os.environ.get("STRATA_CONFIG_ENV_OVERRIDE") != "1":
+    values.update({str(k): str(v) for k, v in (cfg.get("env") or {}).items() if str(k).startswith("STRATA_")})
+else:
+    for k, v in (cfg.get("env") or {}).items():
+        if str(k).startswith("STRATA_"): values.setdefault(str(k), str(v))
+values.pop("STRATA_API_KEY", None)
+values["STRATA_CONFIG_ENV_OVERRIDE"] = "1"
+for k, v in sorted(values.items()):
+    sys.stdout.buffer.write((k + "=" + v + "\0").encode())
+PY_ENV
+        ' _ "$ROOT/scripts/lib.sh" "$cfg")
+    BASE_ARGS=""
+    for kv in "${baseline_env[@]}"; do [[ "$kv" != STRATA_EXTRA_ARGS=* ]] || BASE_ARGS=${kv#*=}; done
+    [ -n "$BASE_ARGS" ] || die "failed to resolve baseline arguments for $mode"
     say "${B}=== mode $mode${N}"
-    measure "$mode-base" 0 "${menv[@]}"
+    measure "$mode-base" 1 "${menv[@]}"
     [ "$(cat "$work/$mode-base.status")" = ok ] || { warn "$mode: the base itself fails - not tuned"; continue; }
     read -r bd bp ba < <(metrics "$mode-base")
     echo "$mode base: decode $bd tok/s, 10K prompt $bp tok/s, agent $ba s" | tee -a "$out"
@@ -126,15 +160,15 @@ for mode in $modes; do
     declare -A envof=()
     while read -r tag target rest; do
         [ -n "$tag" ] || continue
+        if [ -n "${ARC_TUNE_CANDIDATES:-}" ]; then
+            case " $ARC_TUNE_CANDIDATES " in *" $tag "*) ;; *) continue ;; esac
+        fi
         # one env assignment per candidate; STRATA_EXTRA_ARGS keeps its spaces
         measure "$mode-$tag" 0 "${menv[@]}" "$rest"
         [ "$(cat "$work/$mode-$tag.status")" = ok ] || continue
         read -r d p a < <(metrics "$mode-$tag")
-        verdict=$(python3 -c "
-bd,bp,ba,d,p,a=map(float,'$bd $bp $ba $d $p $a'.split()); t='$target'
-gain = d/bd-1 if t=='decode' else p/bp-1
-keep = gain >= 0.02 and d >= bd*0.97 and p >= bp*0.97 and (a <= ba*1.05 or ba == 0)
-print(f'{\"keep\" if keep else \"drop\"} {gain:.4f}')")
+        verdict=$(python3 "$ROOT/tools/tune_metrics.py" compare "$work/$mode-base.json" "$work/$mode-$tag.json" \
+            --baseline-cases "$all_cases" --cases "$screen_cases" --runs "$runs" --target "$target" --agent-tolerance .03)
         echo "$mode $tag: decode $d, 10K $p, agent $a -> $verdict" | tee -a "$out"
         set -- $verdict
         if [ "$1" = keep ]; then
@@ -158,23 +192,40 @@ print(f'{\"keep\" if keep else \"drop\"} {gain:.4f}')")
         if [ "$(cat "$work/$mode-combined.status")" = ok ]; then
             read -r d p a < <(metrics "$mode-combined")
             echo "$mode combined (${kept[*]}): decode $d, 10K $p, agent $a" | tee -a "$out"
-            if python3 -c "import sys; sys.exit(0 if $d >= $bd and $p >= $bp*0.98 else 1)"; then chosen=("${final[@]}"); fi
+            verdict=$(python3 "$ROOT/tools/tune_metrics.py" compare "$work/$mode-base.json" "$work/$mode-combined.json" \
+                --cases "$all_cases" --runs "$runs" --target any)
+            echo "$mode combined gate: $verdict" >>"$out"
+            [[ "$verdict" != keep* ]] || chosen=("${final[@]}")
         fi
         if [ ${#chosen[@]} -eq 0 ] && [ -n "$best_tag" ]; then
             measure "$mode-best" 1 "${menv[@]}" "${envof[$best_tag]}"
-            [ "$(cat "$work/$mode-best.status")" = ok ] && chosen=("${envof[$best_tag]}")
+            if [ "$(cat "$work/$mode-best.status")" = ok ]; then
+                verdict=$(python3 "$ROOT/tools/tune_metrics.py" compare "$work/$mode-base.json" "$work/$mode-best.json" \
+                    --cases "$all_cases" --runs "$runs" --target any)
+                echo "$mode fallback gate: $verdict" >>"$out"
+                [[ "$verdict" != keep* ]] || chosen=("${envof[$best_tag]}")
+            fi
         fi
     fi
     f="$ROOT/tune-$mode.env"
-    {
-        echo "# ./arc tune $stamp ($mode): base decode $bd tok/s, 10K prompt $bp tok/s, agent $ba s"
-        echo "# measured candidates and verdicts: tune-$stamp.txt"
-        for kv in "${chosen[@]}"; do
-            k=${kv%%=*}; v=${kv#*=}
-            printf 'export %s="${%s-%s}"\n' "$k" "$k" "$v"
-        done
-    } >"$f"
-    if [ ${#chosen[@]} -gt 0 ]; then ok "$mode: kept ${chosen[*]} -> $f"; else ok "$mode: the defaults are the fastest -> $f (empty)"; fi
+    # Retain the measured base when all candidates lose. Escape defaults as
+    # shell literals; secrets are excluded above. Replace atomically.
+    python3 - "$f" "$stamp" "$mode" "${baseline_env[@]}" "${chosen[@]}" <<'PY_SAVE'
+import os, re, sys
+from pathlib import Path
+path, stamp, mode, *assignments = sys.argv[1:]
+values = dict(a.split('=', 1) for a in assignments)
+lines = [f'# ./arc tune {stamp} ({mode}); see tune-{stamp}.txt']
+for key, value in sorted(values.items()):
+    if not re.fullmatch(r'STRATA_[A-Z0-9_]+', key) or key == 'STRATA_API_KEY':
+        raise ValueError('unexpected tune variable')
+    escaped = ''.join('\\' + c if c in '\\"`$}' else c for c in value)
+    lines.append('export ' + key + '="${' + key + '-' + escaped + '}"')
+tmp = Path(path + '.tmp')
+tmp.write_text('\n'.join(lines) + '\n')
+os.replace(tmp, path)
+PY_SAVE
+    if [ ${#chosen[@]} -gt 0 ]; then ok "$mode: kept ${chosen[*]} -> $f"; else ok "$mode: retained verified base -> $f"; fi
     unset envof
 done
 trap - EXIT

@@ -44,7 +44,15 @@ if curl -fsS -m 3 "$url/health" >/dev/null 2>&1; then
 fi
 [ "$log" != "-" ] || die "$cfg has no \"log\": the engine's lines are needed"
 case "$log" in /*) ;; *) log="$STRATA/$log" ;; esac
+profile_args_set=${STRATA_EXTRA_ARGS+x}
+profile_user_args=${STRATA_EXTRA_ARGS-}
+declare -A profile_user_knobs=()
+for knob in ${!STRATA_@}; do profile_user_knobs[$knob]=1; done
 arc_engine_env
+profile_auto_unset=()
+for knob in ${!STRATA_@}; do
+    [[ -v profile_user_knobs[$knob] ]] || profile_auto_unset+=(-u "$knob")
+done
 out="$ROOT/profile-$(date +%Y%m%d-%H%M%S).txt"
 
 unitrace=""
@@ -112,7 +120,7 @@ PY_CHECK
     say "${B}profile $name${N}: $*"
     local since=0
     [ -f "$log" ] && since=$(stat -c %s "$log")
-    env "$@" STRATA_SYCL_NATIVE=1 setsid "$ROOT/scripts/start.sh" "$want" >"$out.$name.start" 2>&1 &
+    env "${profile_auto_unset[@]}" "$@" STRATA_SYCL_NATIVE=1 setsid "$ROOT/scripts/start.sh" "$want" >"$out.$name.start" 2>&1 &
     srv_pid=$!
     local t=0
     until curl -fsS -m 3 "$url/health" 2>/dev/null | grep -q '"loaded": *true'; do
@@ -198,7 +206,7 @@ if [ "${ARC_PROFILE_LAYER_SWEEP:-0}" = 1 ]; then
     if [ "$profile_args_set" = x ]; then
         single_args=$profile_user_args
     else
-    single_args=$(env -u STRATA_EXTRA_ARGS ARC_GPUS=0 bash -c '. "$1"; arc_engine_env; printf "%s" "$STRATA_EXTRA_ARGS"' _ "$ROOT/scripts/lib.sh")
+    single_args=$(env "${profile_auto_unset[@]}" ARC_GPUS=0 bash -c '. "$1"; arc_engine_env; printf "%s" "$STRATA_EXTRA_ARGS"' _ "$ROOT/scripts/lib.sh")
     fi
     run G1-LAY "$context_cases" 128 ARC_GPUS=0 "STRATA_EXTRA_ARGS=$single_args" STRATA_LAYER_SPLIT=auto
 elif [ "${ARC_PROFILE_DECODE_TRACE_ONLY:-0}" = 1 ]; then
