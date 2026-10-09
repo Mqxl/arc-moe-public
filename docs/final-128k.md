@@ -179,3 +179,5 @@ and union durations, separately per GPU/size/direction; they are observed
 transfers, not a claim that end-to-end MoE compute reaches those rates or
 that software can turn the lower x4 slot into a 25 GB/s link. The 160 MiB
 owner D2H handoff event takes 12.531 ms (~13.39 GB/s), using pinned host RAM.
+
+Current requested model migration and active service: [uncensored-iq2-xs.md](uncensored-iq2-xs.md). Stock before/after tables above remain stock-model measurements.
