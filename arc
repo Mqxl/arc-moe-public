@@ -9,6 +9,7 @@
 #                           every Arc by default, ARC_GPUS=0 for one card
 #   ./arc bench [opts]      measure prompt and decode speed through the API
 #   ./arc profile           where the time goes: three profiled runs into one file to send       (~10 min)
+#   ./arc tune              find the fastest correct settings for this PC (1 and 2 cards), used by start (~70 min)
 #   ./arc check             does every kind of client get text (greedy, sampled, stream, tools)? (~1 / ~10 min)
 #   ./arc service           install a systemd unit that starts the server at boot              (sudo)
 #   ./arc check-fp64        prove the device code has no FP64 left (no GPU needed)
@@ -26,11 +27,12 @@ case "$cmd" in
   start)      exec "$ROOT/scripts/start.sh" "$@" ;;
   bench)      exec "$ROOT/scripts/bench.sh" "$@" ;;
   profile)    exec "$ROOT/scripts/profile.sh" "$@" ;;
+  tune)       exec bash "$ROOT/scripts/tune.sh" "$@" ;;
   check)      exec bash "$ROOT/scripts/check.sh" "$@" ;;
   service)    exec "$ROOT/scripts/install-service.sh" "$@" ;;
   check-fp64) exec "$ROOT/scripts/check-fp64.sh" "$@" ;;
   probe)      exec "$ROOT/scripts/probe.sh" "$@" ;;
   all)        "$ROOT/scripts/install-deps.sh" && "$ROOT/scripts/build.sh" && exec "$ROOT/scripts/setup-model.sh" "$@" ;;
-  help|-h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) echo "unknown command: $cmd (./arc help)" >&2; exit 2 ;;
 esac

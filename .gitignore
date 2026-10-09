@@ -7,3 +7,7 @@ __pycache__/
 *.log
 profile-*.txt*
 third_party/pti-gpu/
+tune-*.txt
+tune-*.env
+.tune-*/
+check-*.txt

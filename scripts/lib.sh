@@ -25,6 +25,16 @@ ONEAPI=${ONEAPI_ROOT:-/opt/intel/oneapi}
 #                                     SR1536 also reads 730/1425 through slow decode windows. Keep 64.
 ARC_ENGINE_ARGS_DEFAULT="--prefill-borrow --prefill auto --vram-reserve-mib 768 --spec 6 --short-read 64"
 arc_engine_env() {   # export the defaults above; a variable already set (even empty) wins
+    # ./arc tune's result for this machine and this card count (tune-dual.env / tune-single.env in the repository root)
+    # comes before the defaults, so it replaces them; a variable set by the caller still wins over both
+    if [ "${ARC_TUNE_IGNORE:-0}" != 1 ]; then
+        local tmode=dual
+        if [ "$(arc_bdfs | wc -l)" -lt 2 ] || { [ -n "${ARC_GPUS:-}" ] && [ "${ARC_GPUS//,/}" = "$ARC_GPUS" ]; }; then
+            tmode=single
+        fi
+        # shellcheck disable=SC1090
+        [ -f "$ROOT/tune-$tmode.env" ] && . "$ROOT/tune-$tmode.env"
+    fi
     export STRATA_EXTRA_ARGS="${STRATA_EXTRA_ARGS-$ARC_ENGINE_ARGS_DEFAULT}"
     export STRATA_PREFILL_FIRST="${STRATA_PREFILL_FIRST-0}"
     export STRATA_GU_LANES="${STRATA_GU_LANES-32}"
@@ -41,7 +51,9 @@ arc_engine_env() {   # export the defaults above; a variable already set (even e
     # Startup diagnostics only; no measured throughput gain/default promotion.
     export STRATA_NATIVE_UPLOAD_PINNED="${STRATA_NATIVE_UPLOAD_PINNED-0}"
     export STRATA_DENSE_UPLOAD_KERNEL="${STRATA_DENSE_UPLOAD_KERNEL-0}"
-    export STRATA_UPLOAD_VERIFY="${STRATA_UPLOAD_VERIFY-0}"
+    # On by default since 2026-10-09: the upper A770 of the test machine once corrupted uploaded weights (bit 0x20)
+    # and answered NaN; with the readback check a corrupted upload is rewritten or stops the engine instead
+    export STRATA_UPLOAD_VERIFY="${STRATA_UPLOAD_VERIFY-1}"
     export STRATA_UPLOAD_RELOCATE="${STRATA_UPLOAD_RELOCATE-0}"
     # Full check213531:42/42; normal profile214426 confirms both card modes.
     # Eager immutable loan copies cost extra host RAM; the engine bounds the pool and falls back.
