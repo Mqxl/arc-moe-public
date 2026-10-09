@@ -13,12 +13,16 @@ Only the standard library is used.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
+
+from bench_context import VramPeak, counted_context, red_image_url
 
 SHORT_CODE = "Write a Python function that returns the n-th Fibonacci number, with a docstring and a test."
 SHORT_PROSE = "Объясни простыми словами, как работает смесь экспертов (MoE) в языковых моделях. Пять предложений."
@@ -60,7 +64,9 @@ def call(url: str, key: str | None, prompt: str, max_tokens: int, extra: dict | 
             del body[k]
     req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})})
-    t = time.time()
+    t = time.perf_counter()
+    epoch_start_us = time.time() * 1e6
+    ttft = None
     with urllib.request.urlopen(req, timeout=900) as r:
         if not body.get("stream"):
             res = json.load(r)
@@ -76,6 +82,9 @@ def call(url: str, key: str | None, prompt: str, max_tokens: int, extra: dict | 
                         res[k] = ch[k]
                 for c in ch.get("choices") or []:
                     d = c.get("delta") or {}
+                    if ttft is None and (d.get("content") or d.get("reasoning_content") or
+                                         d.get("reasoning") or d.get("tool_calls")):
+                        ttft = time.perf_counter() - t
                     text += (d.get("content") or "") + (d.get("reasoning_content") or d.get("reasoning") or "")
                     for tc in d.get("tool_calls") or []:
                         index = tc.get("index", 0)
@@ -86,7 +95,10 @@ def call(url: str, key: str | None, prompt: str, max_tokens: int, extra: dict | 
                         for field in ("name", "arguments"):
                             acc["function"][field] += fn.get(field) or ""
             res["choices"] = [{"message": {"content": text, "tool_calls": [calls[i] for i in sorted(calls)]}}]
-    res["_wall"] = time.time() - t
+    res["_wall"] = time.perf_counter() - t
+    res["_ttft"] = ttft
+    res['_started_epoch_us'] = epoch_start_us
+    res['_ended_epoch_us'] = epoch_start_us + res['_wall'] * 1e6
     return res
 
 
@@ -119,8 +131,11 @@ def main() -> int:
     ap.add_argument("--long", action="store_true", help="also the ~2K-token code prompt")
     ap.add_argument("--json", help="write the raw rows here")
     ap.add_argument("--cases", help="comma list of short, prose, prose-en, prose-zh, prose-ru-long, 1k, 1.5k, 2k, 8k, 10k, sampled, agent "
-                                    "(default: short,prose, and 2k with --long)")
+                                    "32k, 64k, 120k, vision (default: short,prose, and 2k with --long)")
     ap.add_argument("--show", action="store_true", help="print every reply's start")
+    ap.add_argument("--ttft", action="store_true", help="stream all cases to measure time to first productive delta")
+    ap.add_argument("--vram", action="store_true", help="sample engine resident VRAM via Linux DRM fdinfo")
+    ap.add_argument("--seed", default="baseline", help="reproducible independent corpus seed for 32k/64k/120k")
     a = ap.parse_args()
     if a.spec_min_p is not None and not 0 <= a.spec_min_p <= 1:
         ap.error("--spec-min-p must be between 0 and 1")
@@ -146,26 +161,54 @@ def main() -> int:
              "agent": ("agent (stream)", lambda: "Look at README.md and tell me what this project does.",
                        {**SAMPLED, "stream": True, "tools": AGENT_TOOLS, "chat_template_kwargs": None,
                         "reasoning_effort": None, "stream_options": {"include_usage": True}})}
+    for size in (32, 64, 120):
+        known[f"{size}k"] = (f"{size}K mixed code", lambda: "", {"stream": True})
+    known['vision'] = ('vision + 2K', lambda: '', {"stream": True})
     want = a.cases.split(",") if a.cases else ["short", "prose"] + (["2k"] if a.long else [])
     bad = [c for c in want if c not in known]
     if bad:
         print(f"unknown case(s) {bad}: pick from {sorted(known)}", file=sys.stderr)
         return 2
-    cases = [(known[c][0], known[c][1](), known[c][2]) for c in want]
+    cases = [(known[c][0], known[c][1](), known[c][2], c) for c in want]
     if a.spec_min_p is not None:
-        cases = [(name, prompt, {**(extra or {}), "strata_tune": {"spec_min_p": a.spec_min_p}}) for name, prompt, extra in cases]
+        cases = [(name, prompt, {**(extra or {}), "strata_tune": {"spec_min_p": a.spec_min_p}}, code)
+                 for name, prompt, extra, code in cases]
     rows = []
     print(f"{'prompt':18s} {'run':>3s} {'in':>6s} {'out':>5s} {'prompt tok/s':>13s} {'decode tok/s':>13s} {'wall s':>7s}")
     n_broken = 0
     n_errors = 0
-    for name, prompt, extra in cases:
+    for name, prompt, original_extra, code in cases:
         for i in range(a.runs):
+            extra = dict(original_extra or {})
+            current_prompt = prompt + ("" if i == 0 else f" (#{i})")
+            counted = None
+            image_hash = None
+            memory = None
+            if a.ttft:
+                extra['stream'] = True
             if extra and extra.get("tools"):
                 extra = {**extra, "messages": [{"role": "system", "content": AGENT_SYSTEM},
-                                               {"role": "user", "content": prompt + ("" if i == 0 else f" (#{i})")}]}
+                                               {"role": "user", "content": current_prompt}]}
             try:
-                res = call(a.url, a.api_key, prompt + ("" if i == 0 else f" (#{i})"), a.max_tokens, extra)
-            except OSError as e:
+                if code in ('32k', '64k', '120k', 'vision'):
+                    target = 2000 if code == 'vision' else int(code[:-1]) * 1000
+                    current_prompt, counted = counted_context(a.url, a.api_key, target, f'{a.seed}/{code}/{i + 1}')
+                    if code == 'vision':
+                        image_url = red_image_url(f'{a.seed}/vision/{i + 1}')
+                        image_hash = hashlib.sha256(image_url.encode()).hexdigest()
+                        current_prompt = ("First name the dominant color of the attached picture. Then review the code below.\n"
+                                          + current_prompt)
+                        extra['messages'] = [{'role': 'user', 'content': [
+                            {'type': 'text', 'text': current_prompt},
+                            {'type': 'image_url', 'image_url': {'url': image_url}}]}]
+                    extra['stream_options'] = {'include_usage': True}
+                memory = VramPeak() if a.vram else None
+                if memory:
+                    with memory:
+                        res = call(a.url, a.api_key, current_prompt, a.max_tokens, extra)
+                else:
+                    res = call(a.url, a.api_key, current_prompt, a.max_tokens, extra)
+            except (OSError, ValueError, RuntimeError) as e:
                 n_errors += 1
                 detail = str(e)
                 # Keep useful engine errors without exposing authentication responses or the key.
@@ -183,27 +226,54 @@ def main() -> int:
                 if a.api_key:
                     detail = detail.replace(a.api_key, "[REDACTED]")
                 rows.append({"case": name, "run": i + 1, "prompt_tokens": None, "tokens": None,
-                             "prompt_tps": None, "decode_tps": None, "wall": None, "error": detail})
+                             "prompt_tps": None, "decode_tps": None, "wall": None, "ttft_s": None,
+                             "counted_input_tokens": counted, "reply_chars": 0, "error": detail})
+                if memory:
+                    rows[-1].update(memory.result())
                 print(f"{name:18s} {i + 1:3d}  failed: {detail}")
+                sys.stdout.flush()
+                if a.json:
+                    Path(a.json).write_text(json.dumps(rows, indent=1))
                 continue
             t = res.get("timings") or {}
             u = res.get("usage") or {}
             row = {"case": name, "run": i + 1, "prompt_tokens": t.get("prompt_n", u.get("prompt_tokens")),
                    "tokens": t.get("predicted_n", u.get("completion_tokens")),
                    "prompt_tps": t.get("prompt_per_second"), "decode_tps": t.get("predicted_per_second"),
-                   "wall": res["_wall"]}
+                   "wall": res["_wall"], "ttft_s": res['_ttft'], "counted_input_tokens": counted,
+                   "started_epoch_us": res['_started_epoch_us'], "ended_epoch_us": res['_ended_epoch_us'],
+                   "cached_tokens": t.get('cache_n', (u.get('prompt_tokens_details') or {}).get('cached_tokens')),
+                   "prompt_sha256": hashlib.sha256(current_prompt.encode()).hexdigest()}
+            if memory:
+                row.update(memory.result())
+            if image_hash:
+                row['image_sha256'] = image_hash
             rows.append(row)
             f = lambda v: f"{v:13.1f}" if isinstance(v, (int, float)) else f"{'-':>13s}"
             text = reply_text(res)
             why = broken(text)
+            if not why and code == 'vision' and not any(color in text.lower() for color in ('red', 'красн')):
+                why = 'vision fixture: dominant red color not identified'
+            if not why and code in ('32k', '64k', '120k'):
+                cached = row.get('cached_tokens')
+                if isinstance(cached, (int, float)) and cached > 0:
+                    why = 'fresh-context fixture unexpectedly reused cached tokens'
+            row['reply_chars'] = len(text)
+            row['broken'] = why
+            row['reply_preview'] = text[:240]
             n_broken += why is not None
             print(f"{name:18s} {i + 1:3d} {str(row['prompt_tokens']):>6s} {str(row['tokens']):>5s} "
                   f"{f(row['prompt_tps'])} {f(row['decode_tps'])} {row['wall']:7.1f}"
                   + (f"  BROKEN REPLY: {why}: {text[:80]!r}" if why else ""))
             if a.show and not why:
                 print(f"{'':18s}     {' '.join(text.split())[:120]!r}")
+            if row['ttft_s'] is not None:
+                print(f"{'':18s}     TTFT {row['ttft_s']:.3f}s; resident VRAM MiB: {row.get('vram_peak_mib', {})}")
+            sys.stdout.flush()
+            if a.json:
+                Path(a.json).write_text(json.dumps(rows, indent=1))
     print()
-    for name, _, _ in cases:
+    for name, _, _, _ in cases:
         d = [r["decode_tps"] for r in rows if r["case"] == name and isinstance(r["decode_tps"], (int, float))]
         if d:
             print(f"{name:18s} decode: median {statistics.median(d):.1f} tok/s (min {min(d):.1f}, max {max(d):.1f})")
