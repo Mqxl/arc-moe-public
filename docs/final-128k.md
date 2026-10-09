@@ -144,6 +144,7 @@ tokens with max output 128, using the actual 131072-configured int8-KV server.
 The existing project <client-project> OpenCode 1.18.35 client returned 63
 for 7*9 with no transport errors. This used --pure with external MCP/plugins
 disabled and tools denied; it does not certify every project plugin or UI flow.
+OpenCode image attachment also correctly identified the fresh red fixture.
 Vision benchmark identifies the red fixture; large photos, audio and video
 were not validated by this final matrix.
 
@@ -169,3 +170,12 @@ and API authentication. A separate requested uncensored-model migration is
 not included in the numerical tables above. Its weights and measurements
 must be reported separately; it cannot inherit stock-model acceptance.
 
+
+The re-parsed baseline prefill interval contains 6138 owner H2D expert copies
+of 1,510,400 bytes at aggregate 14.22 GB/s and 1020 peer copies of the same
+size at 4.99 GB/s. Other 1,305,600-byte owner copies aggregate 14.31 GB/s;
+1,177,600-byte peer copies 5.00 GB/s. These rates use complete event bytes
+and union durations, separately per GPU/size/direction; they are observed
+transfers, not a claim that end-to-end MoE compute reaches those rates or
+that software can turn the lower x4 slot into a 25 GB/s link. The 160 MiB
+owner D2H handoff event takes 12.531 ms (~13.39 GB/s), using pinned host RAM.
