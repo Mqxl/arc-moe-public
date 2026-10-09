@@ -1105,3 +1105,61 @@ sampled/agent or full-128K stability test. Functional recovery tests quoted
 above were run on patch 60. The transient unit is not a reboot-persistent setup.
 The upper card is excluded from inference; new dual-card correctness/speed
 claims are blocked by its unresolved upload fault. Optimization is stopped.
+
+
+## 128K baseline and measured layer balance (9 October, patch 64)
+
+After the user's reboot, both GPUs passed upload verification and full 14-request
+checks on the actual 131072/int8-KV/vision configuration. No RAM test, clocks,
+power, fans or voltage were changed. Earlier upper-card upload corruption is
+not diagnosed or proven permanently repaired by these successful runs.
+
+Stage 0 is documented in profile-128k.md (commit 99b9836). Continuous unitrace
+shows a complete short verification window of 137.632 ms, GPU union 126.265 ms;
+64K verification: 125.012/113.776 ms. Host waits overlap GPU work and cannot be
+added to it. Upper/lower idle fractions are 25.25%/83.01% short and
+31.68%/77.31% after 64K. MoE, including mapped host expert reads, dominates.
+The 64K prefill owner chunk has upper/lower idle 4.56%/57.75%. This supports
+balancing layers before changing synchronization. It does not establish a
+hardware ceiling or 100 ms of removable host wait.
+
+Native graph forcing fails at graph construction, before recording any body:
+UR_DEVICE_INFO_GRAPH_RECORD_AND_REPLAY_SUPPORT_EXP unsupported (SYCL code 8).
+The minimal write-63 probe works with force_native=0 on both cards; native=1
+fails with both installed Level Zero adapters (V1/V2). Moving graph-body
+operations cannot fix this installed-backend capability failure.
+
+Patch 64 adds STRATA_LAYER_SPLIT to the native launcher, applied only with at
+least two visible GPUs, after extra arguments. Unset preserves model policy.
+No C++ kernel or decode algorithm changes. The local tune-dual.env selects 30;
+the repository does not hardcode this machine's boundary.
+
+Baseline auto 34/14 vs accepted 30/18, medians of two full 128K-config requests:
+
+| case | prefill before/after tok/s | decode before/after tok/s | TTFT before/after s | wall before/after s |
+|---|---|---|---|---|
+| code | 49.55 / 56.15 | 33.2 / 37.6 | .730 / .647 | 4.530 / 4.000 |
+| Russian prose | 52.5 / 55.8 | 27.1 / 27.65 | .808 / .762 | 5.478 / 5.338 |
+| 10K | 506.75 / 568.25 | 28.8 / 32.0 | 21.193 / 18.907 | 25.593 / 22.857 |
+| 32K | 549.2 / 627.85 | 28.1 / 32.15 | 58.309 / 51.025 | 62.813 / 54.961 |
+| 64K | 556.45 / 644.9 | 27.1 / 30.45 | 115.154 / 99.375 | 119.825 / 103.534 |
+| 120K | 545.4 / 630.35 | 27.95 / 30.5 | 220.294 / 190.645 | 224.823 / 194.792 |
+| agent | 103.5 / 152.9 | 36.75 / 40.65 | 3.424 / 2.333 | 4.756 / 3.382 |
+| vision | 315.25 / 334.65 | 31.85 / 36.35 | 6.461 / 6.096 | 10.426 / 9.566 |
+
+All 16 responses valid; no metric regresses >2%. Seeds baseline/layer30 produce
+unique mixed prompts (input counts differ by a few tokens), max output 128;
+vision inputs also differ in image hash to avoid encoder cache. Full dual check
+14/14. Single check 14/14 and five-case/two-run control: code 24.3 ->25.05,
+prose 19.85 ->19.85, 10K prefill 417.7 ->416.6, after10K 20.65 ->20.7,
+agent wall 6.629 ->6.448, vision TTFT 6.704 ->6.769; all within 2%.
+Single launcher argv is byte-identical with/without override. Its 32K/64K/120K
+baseline remains valid unchanged-path evidence, not a fresh candidate run.
+
+Artifacts (uncommitted): test-logs/stage0-{dual,single}.{json,txt},
+layer30-full.{json,txt}, layer30-full-check.txt, layer30-single-check.txt,
+layer30-single-control.{json,txt}, single-argv-{before,after}.json.
+Focused reproduction: ARC_PROFILE_LAYER_SWEEP=1 ./arc profile tuned-opencode
+--no-unitrace, with ARC_PROFILE_LAYER_SPLITS selecting boundaries. This mode
+includes all eight cases plus one-card control, TTFT and per-card peak VRAM;
+explicit caller STRATA_EXTRA_ARGS is preserved for the control.

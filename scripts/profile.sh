@@ -18,6 +18,8 @@
 #   ARC_PROFILE_EXPERT_SWEEP=1: DP4A baseline versus 8/16-row prefill tiles
 #   ARC_PROFILE_XMX_SWEEP=1: DP4A, tile16, SG8 XMX (128/256 GRF), small groups
 #   ARC_PROFILE_COPY_SWEEP=1: staging banks/slots, group/row caps, then phase timing
+#   ARC_PROFILE_LAYER_SWEEP=1: layer boundaries on this model/context and one-card control
+#   ARC_PROFILE_LAYER_SPLITS="auto 30 32": optional boundaries, not global defaults
 #   ARC_PROFILE_SWEEP=1 adds round 4's kernel-variant runs (K*: decode, G*: the GDN recurrence)
 #
 # D and E need unitrace (Intel's pti-gpu, built once by scripts/get-unitrace.sh: cmake + network, ~5 min).
@@ -135,7 +137,8 @@ PY_CHECK
             failures=$((failures + 1))
         fi ;;
     esac
-    if python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/bench.py" --url "$url"  --runs "${ARC_PROFILE_RUNS:-2}" --max-tokens "$maxt" --cases "$cases" --json "$out.$name.json" >>"$out" 2>&1; then
+    local observers=(); [ "${ARC_PROFILE_CONTEXT_TIMING:-0}" != 1 ] || observers=(--ttft --vram)
+    if python3 "$ROOT/tools/run-authorized.py" "$cfg" "$ROOT/tools/bench.py" --url "$url" --runs "${ARC_PROFILE_RUNS:-2}" --max-tokens "$maxt" --cases "$cases" "${observers[@]}" --json "$out.$name.json" >>"$out" 2>&1; then
         :
     else
         failures=$((failures + 1))
@@ -168,7 +171,7 @@ PY_CHECK
     echo "arc-moe profile, $(date), $(git -C "$ROOT" rev-parse --short HEAD), model $want"
     echo "screen=${ARC_PROFILE_SCREEN:-0}; runs=${ARC_PROFILE_RUNS:-2}; screen decode rates are not final speed measurements"
     echo "engine source: $(git -C "$STRATA" rev-parse --short HEAD); patch fingerprint: $(git -C "$STRATA" config --get arcmoe.applied)"
-    for knob in STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_COPY_TIMING STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT STRATA_PF_GU_I8_XMX STRATA_PF_DOWN_I8_XMX STRATA_PF_I8_SLAB STRATA_PF_I8_PAD STRATA_PF_I8_GROUP_MIN STRATA_PF_GU_SPLIT STRATA_PF_GU_SPLIT_LANES STRATA_PF_EP STRATA_VERIFY_COMMIT_OVERLAP STRATA_MTP_CHAIN_SUBMIT STRATA_VERIFY_SKIP_EMPTY STRATA_VERIFY_NATIVE_GRAPH STRATA_MTP_LOOKAHEAD STRATA_NATIVE_UPLOAD_PINNED STRATA_DENSE_UPLOAD_KERNEL STRATA_UPLOAD_VERIFY STRATA_UPLOAD_RELOCATE STRATA_DBG_PF_PHASES STRATA_DBG_WEIGHT_COPY; do
+    for knob in STRATA_LAYER_SPLIT STRATA_PF_EXPERT_KERNEL STRATA_PF_XMX_GRF STRATA_PF_XMX_MIN_ROWS STRATA_PF_STAGE_BANKS STRATA_PF_STAGE_SLOTS STRATA_PF_GROUPS STRATA_PF_BATCH_ROWS STRATA_PCIE_PINNED_PROBE STRATA_PF_PIN_LOAN STRATA_PF_PIN_REFILL STRATA_PF_COPY_TIMING STRATA_PF_PREFETCH_SLOTS STRATA_PF_PIPELINE STRATA_PROMPT_ATTN_XMX STRATA_PF_SPLIT_ROWS STRATA_PF_FUSE_EXPERT STRATA_PF_GU_I8_XMX STRATA_PF_DOWN_I8_XMX STRATA_PF_I8_SLAB STRATA_PF_I8_PAD STRATA_PF_I8_GROUP_MIN STRATA_PF_GU_SPLIT STRATA_PF_GU_SPLIT_LANES STRATA_PF_EP STRATA_VERIFY_COMMIT_OVERLAP STRATA_MTP_CHAIN_SUBMIT STRATA_VERIFY_SKIP_EMPTY STRATA_VERIFY_NATIVE_GRAPH STRATA_MTP_LOOKAHEAD STRATA_NATIVE_UPLOAD_PINNED STRATA_DENSE_UPLOAD_KERNEL STRATA_UPLOAD_VERIFY STRATA_UPLOAD_RELOCATE STRATA_DBG_PF_PHASES STRATA_DBG_WEIGHT_COPY; do
         [ -z "${!knob-}" ] || echo "$knob=${!knob}"
     done
     for b in $(arc_bdfs); do
@@ -183,7 +186,22 @@ PY_CHECK
 } >"$out"
 
 # A focused sweep uses the same loader, reply checks and final report as the full profile.
-if [ "${ARC_PROFILE_DECODE_TRACE_ONLY:-0}" = 1 ]; then
+if [ "${ARC_PROFILE_LAYER_SWEEP:-0}" = 1 ]; then
+    ARC_PROFILE_CONTEXT_TIMING=1
+    context_cases=${ARC_PROFILE_CONTEXT_CASES:-short,prose,10k,32k,64k,120k,agent,vision}
+    for boundary in ${ARC_PROFILE_LAYER_SPLITS:-auto 30 32}; do
+        [[ "$boundary" == auto || "$boundary" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "invalid layer boundary: $boundary"
+        run "LAY-${boundary//,/_}" "$context_cases" 128 ARC_GPUS=0,1 "STRATA_LAYER_SPLIT=$boundary"
+    done
+    # Resolve single-card arguments in a fresh shell: the global dual tuning
+    # exports would otherwise override an empty tune-single.env (auto prefill).
+    if [ "$profile_args_set" = x ]; then
+        single_args=$profile_user_args
+    else
+    single_args=$(env -u STRATA_EXTRA_ARGS ARC_GPUS=0 bash -c '. "$1"; arc_engine_env; printf "%s" "$STRATA_EXTRA_ARGS"' _ "$ROOT/scripts/lib.sh")
+    fi
+    run G1-LAY "$context_cases" 128 ARC_GPUS=0 "STRATA_EXTRA_ARGS=$single_args" STRATA_LAYER_SPLIT=auto
+elif [ "${ARC_PROFILE_DECODE_TRACE_ONLY:-0}" = 1 ]; then
     [ -n "$unitrace" ] || die "decode trace needs ARC_PROFILE_TRACE=1 and unitrace"
     run DT short,prose-ru-long,10k 128 STRATA_PF_EP=0 STRATA_DECODE_TIMING=1 STRATA_SPLIT_TIMING=1
     run D short,prose-ru-long 64 STRATA_PF_EP=0 STRATA_DECODE_TIMING=1 STRATA_EXIT_SIGNAL=10 "STRATA_WRAP=$unitrace -d -s --chrome-kernel-logging --teardown-on-signal 10 -o $out.D.unitrace"
