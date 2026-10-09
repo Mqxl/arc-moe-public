@@ -1,0 +1,313 @@
+From 85336094292f9eeb37959ebfe5fdc50c20f33a11 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 18:44:45 +0500
+Subject: [PATCH] sycl: optional eight-entry expert tails with numerical and
+ placement probe
+
+---
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp   | 80 +++++++++++++++++++----
+ sycl/src/kernels/native_expert_parity.cpp | 45 ++++++++++++-
+ 2 files changed, 111 insertions(+), 14 deletions(-)
+
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 1d846b9..82c1fd2 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -1337,7 +1337,7 @@ __dpct_inline__ void row_dot_multi(const uint8_t* row, const block_q8_1* const*
+ }
+ 
+ // The entries e0..e1 of one row: chunks of 4 through the multi-entry dot, the rest one at a time.
+-template <int TY, int LANES, int E = 4>
++template <int TY, int LANES, int E = 4, bool PACK_TAIL = false>
+ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_stride, const int32_t* ent_idx,
+                                  int e0, int e1, int nb, int sub, float* dst, size_t dst_stride,
+                                  const void* grid = nullptr) {
+@@ -1357,6 +1357,20 @@ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_s
+                     for (int i = 0; i < E; ++i) dst[(size_t) (e + i) * dst_stride] = o[i];
+             }
+         }
++        if constexpr (PACK_TAIL && E == 8) {
++            const int left = e1 - e;
++            // Clamp only the padded inputs; never read a nonexistent entry or
++            // store a padded output. Each valid row retains its dot order.
++            if (left >= 5) {
++                const block_q8_1* xs[8];
++                for (int i = 0; i < 8; ++i) xs[i] = x + (size_t) ent_idx[e + sycl::min(i, left - 1)] * x_stride;
++                float o[8];
++                row_dot_multi<TY, LANES, 8>(wr, xs, nb, sub, o, grid);
++                if (sub == 0)
++                    for (int i = 0; i < left; ++i) dst[(size_t) (e + i) * dst_stride] = o[i];
++                e = e1;
++            }
++        }
+         for (; e + 4 <= e1; e += 4) {
+             const block_q8_1* xs[4] = {x + (size_t) ent_idx[e] * x_stride, x + (size_t) ent_idx[e + 1] * x_stride,
+                                        x + (size_t) ent_idx[e + 2] * x_stride, x + (size_t) ent_idx[e + 3] * x_stride};
+@@ -1366,6 +1380,17 @@ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_s
+ #pragma unroll
+                 for (int i = 0; i < 4; ++i) dst[(size_t) (e + i) * dst_stride] = o[i];
+         }
++        if constexpr (PACK_TAIL) {
++            if (e1 - e == 3) {
++                const block_q8_1* xs[4];
++                for (int i = 0; i < 4; ++i) xs[i] = x + (size_t) ent_idx[e + sycl::min(i, 2)] * x_stride;
++                float o[4];
++                row_dot_multi<TY, LANES, 4>(wr, xs, nb, sub, o, grid);
++                if (sub == 0)
++                    for (int i = 0; i < 3; ++i) dst[(size_t) (e + i) * dst_stride] = o[i];
++                e = e1;
++            }
++        }
+         if (e + 2 <= e1) {
+             const block_q8_1* xs[2] = {x + (size_t) ent_idx[e] * x_stride, x + (size_t) ent_idx[e + 1] * x_stride};
+             float o[2];
+@@ -1382,7 +1407,7 @@ __dpct_inline__ void row_entries(const uint8_t* wr, const block_q8_1* x, int x_s
+ 
+ constexpr int GU_ROWS = 8;     // rows per block (one warp each)
+ 
+-template <int TG, int LN = kExpertLanes, int E = 4>
++template <int TG, int LN = kExpertLanes, int E = 4, bool PACK_TAIL = false>
+ __dpct_inline__ void native_gu_kernel(
+     const unsigned long long *__restrict__ grp_ptr,
+     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+@@ -1419,7 +1444,7 @@ __dpct_inline__ void native_gu_kernel(
+     for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+         const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
+         const int e0 = grp_start[g], e1 = grp_start[g + 1];
+-        row_entries<TG, LN, E>(wr, xq, xb, ent_tok, e0, e1, nb, sub, (is_up ? up : gate) + r, (size_t) L.n_ff, grid);
++        row_entries<TG, LN, E, PACK_TAIL>(wr, xq, xb, ent_tok, e0, e1, nb, sub, (is_up ? up : gate) + r, (size_t) L.n_ff, grid);
+     }
+ }
+ 
+@@ -1477,7 +1502,7 @@ __dpct_inline__ void swiglu_entries_kernel(const float *__restrict__ gate,
+     h[i] = (g / (1.0f + sycl::native::exp(-g))) * up[i];
+ }
+ 
+-template <int TD, int LN = kExpertLanes, int E = 4>
++template <int TD, int LN = kExpertLanes, int E = 4, bool PACK_TAIL = false>
+ __dpct_inline__ void native_down_kernel(
+     const unsigned long long *__restrict__ grp_ptr,
+     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+@@ -1509,6 +1534,18 @@ __dpct_inline__ void native_down_kernel(
+                         for (int i = 0; i < E; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
+                 }
+             }
++            if constexpr (PACK_TAIL && E == 8) {
++                const int left = e1 - e;
++                if (left >= 5) {
++                    const block_q8_1* xs[8];
++                    for (int i = 0; i < 8; ++i) xs[i] = hq + (size_t) (e + sycl::min(i, left - 1)) * hb;
++                    float o[8];
++                    row_dot_multi<TD, LN, 8>(wr, xs, nb, sub, o);
++                    if (sub == 0)
++                        for (int i = 0; i < left; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
++                    e = e1;
++                }
++            }
+             for (; e + 4 <= e1; e += 4) {
+                 const block_q8_1* xs[4] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb, hq + (size_t) (e + 2) * hb, hq + (size_t) (e + 3) * hb};
+                 float o[4];
+@@ -1517,6 +1554,17 @@ __dpct_inline__ void native_down_kernel(
+ #pragma unroll
+                     for (int i = 0; i < 4; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
+             }
++            if constexpr (PACK_TAIL) {
++                if (e1 - e == 3) {
++                    const block_q8_1* xs[4];
++                    for (int i = 0; i < 4; ++i) xs[i] = hq + (size_t) (e + sycl::min(i, 2)) * hb;
++                    float o[4];
++                    row_dot_multi<TD, LN, 4>(wr, xs, nb, sub, o);
++                    if (sub == 0)
++                        for (int i = 0; i < 3; ++i) out[(size_t) ent_dst[e + i] * L.n_embd + r] = o[i];
++                    e = e1;
++                }
++            }
+             if (e + 2 <= e1) {
+                 const block_q8_1* xs[2] = {hq + (size_t) e * hb, hq + (size_t) (e + 1) * hb};
+                 float o[2];
+@@ -2224,17 +2272,17 @@ inline int lanes_env(const char* name) {
+ }
+ inline int gu_lanes() { static const int v = lanes_env("STRATA_GU_LANES"); return v; }
+ inline int down_lanes() { static const int v = lanes_env("STRATA_DOWN_LANES"); return v; }
+-template <int TG, int LN, int E = 4>
++template <int TG, int LN, int E = 4, bool PACK_TAIL = false>
+ void launch_gu_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
+                     const NativeExpertLayout &L, float *gate, float *up) {
+     constexpr int ROWS = 256 / LN;
+     const unsigned gx = (unsigned) ((2 * L.n_ff + ROWS - 1) / ROWS);
+     auto exp_props = sycl::ext::oneapi::experimental::properties{STRATA_ROOT_SYNC_PROP};
+-    s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<E>>>(
++    s->parallel_for<dpct_kernel_name<class native_gu_port, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<E>, dpct_kernel_scalar<PACK_TAIL>>>(
+         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+-            native_gu_kernel<TG, LN, E>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++            native_gu_kernel<TG, LN, E, PACK_TAIL>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+         });
+ }
+ template <int TG>
+@@ -2248,17 +2296,17 @@ void launch_gu_lanes(dpct::dim3 grid, dpct::queue_ptr s, const unsigned long lon
+         default: launch_gu_port<TG, 8>(grid.y, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+     }
+ }
+-template <int TD, int LN, int E = 4>
++template <int TD, int LN, int E = 4, bool PACK_TAIL = false>
+ void launch_down_port(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
+                       const int32_t *n_groups, const int32_t *ent_dst, const block_q8_1 *hq,
+                       const NativeExpertLayout &L, float *out) {
+     constexpr int ROWS = 256 / LN;
+     const unsigned gx = (unsigned) ((L.n_embd + ROWS - 1) / ROWS);
+     auto exp_props = sycl::ext::oneapi::experimental::properties{STRATA_ROOT_SYNC_PROP};
+-    s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<E>>>(
++    s->parallel_for<dpct_kernel_name<class native_down_port, dpct_kernel_scalar<TD>, dpct_kernel_scalar<LN>, dpct_kernel_scalar<E>, dpct_kernel_scalar<PACK_TAIL>>>(
+         sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+-            native_down_kernel<TD, LN, E>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++            native_down_kernel<TD, LN, E, PACK_TAIL>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         });
+ }
+ template <int TD>
+@@ -3070,7 +3118,12 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     const dpct::dim3 ggu((unsigned)((2 * L.n_ff + kExpertRows - 1) / kExpertRows),
+                          (unsigned)gy);
+     static const bool pf_i8_gu = env_on("STRATA_PF_GU_I8_XMX");
+-    if (prefill && !v1 && pf_i8_gu && L.gu_type == 16 && L.n_embd % 256 == 0 &&
++    static const int pack_tail = [] { const char* v = std::getenv("STRATA_EXPERT_TAIL_BATCH"); return v ? std::atoi(v) : 0; }();
++    const bool use_tail = !prefill && !v1 && (pack_tail == 1 || pack_tail == 2) && !g_old_kernels && !g_split_multi;
++    if (use_tail && L.gu_type == 22 && gu_lanes() == 32) {
++        if (pack_tail == 2) launch_gu_port<22, 32, 8, true>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++        else launch_gu_port<22, 32, 4, true>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++    } else if (prefill && !v1 && pf_i8_gu && L.gu_type == 16 && L.n_embd % 256 == 0 &&
+         cap_groups > 0 && cap_entries >= cap_groups * xmx_min_rows && pf_i8_supported(s->get_device())) {
+         dispatch_pf_i8<false>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+     } else if (use_xmx) {
+@@ -3147,7 +3200,10 @@ static void native_expert_grouped_impl(const NativeExpertLayout& L, const unsign
+     check("native_expert_grouped/swiglu");
+     const dpct::dim3 gd((unsigned)((L.n_embd + kExpertRows - 1) / kExpertRows), (unsigned)gy);
+     static const bool pf_i8 = env_on("STRATA_PF_DOWN_I8_XMX");
+-    if (prefill && !v1 && pf_i8 && L.d_type == 42 && L.n_ff % 64 == 0 &&
++    if (use_tail && L.d_type == 42 && down_lanes() == 8) {
++        if (pack_tail == 2) launch_down_port<42, 8, 8, true>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++        else launch_down_port<42, 8, 4, true>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++    } else if (prefill && !v1 && pf_i8 && L.d_type == 42 && L.n_ff % 64 == 0 &&
+         cap_groups > 0 && cap_entries >= cap_groups * xmx_min_rows && pf_i8_supported(s->get_device())) {
+         dispatch_pf_i8<true>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, nullptr);
+     } else if (use_xmx) {
+diff --git a/sycl/src/kernels/native_expert_parity.cpp b/sycl/src/kernels/native_expert_parity.cpp
+index 2b064f2..04fa8ea 100644
+--- a/sycl/src/kernels/native_expert_parity.cpp
++++ b/sycl/src/kernels/native_expert_parity.cpp
+@@ -19,10 +19,12 @@
+ #include <sycl/sycl.hpp>
+ #include <dpct/dpct.hpp>   // SYCL port: hand-ported (dpct needs ggml-cpu.h to parse this file)
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <random>
+ #include <string>
+ #include <vector>
+@@ -43,9 +45,21 @@ int main(int argc, char** argv) {
+     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
+     const int NT = 3, E = 7;
++    const char* dump_path = std::getenv("STRATA_NATIVE_PARITY_DUMP");
++    FILE* dump = dump_path ? std::fopen(dump_path, "wb") : nullptr;
++    if (dump_path && !dump) { std::perror("parity dump"); return 2; }
+     const int64_t H = 2560, FF = 640;
+     int failures = 0;
+     sycl::queue* s = &dpct::get_in_order_queue();
++    auto verify_upload = [&](const void* ptr, const std::vector<uint8_t>& expected) {
++        if (!std::getenv("STRATA_UPLOAD_VERIFY") || std::strcmp(std::getenv("STRATA_UPLOAD_VERIFY"), "1")) return;
++        std::vector<uint8_t> readback(expected.size());
++        s->memcpy(readback.data(), ptr, expected.size()).wait_and_throw();
++        if (readback != expected) {
++            std::fprintf(stderr, "native parity: uploaded weights differ from source\n");
++            std::exit(1);
++        }
++    };
+     for (int l : layers) {
+         const strata::TensorInfo* t[3] = {};
+         const char* roles[3] = {"gate", "up", "down"};
+@@ -234,6 +248,7 @@ int main(int argc, char** argv) {
+             ddst = (decltype(ddst)) sycl::malloc_device(NT * 4, *s);
+             dtok = (decltype(dtok)) sycl::malloc_device(NT * 4, *s);
+             s->memcpy(dblob, blob.data(), blob.size()).wait();
++            verify_upload(dblob, blob);
+             s->memcpy(dx, x.data(), x.size() * 4).wait();
+             const unsigned long long p = (unsigned long long) dblob;
+             const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
+@@ -248,12 +263,16 @@ int main(int argc, char** argv) {
+             s->memcpy(got_g.data(), dout, got_g.size() * 4).wait();
+             if (std::getenv("NATIVE_BENCH") != nullptr) {   // SYCL port: one layer's worth of hits, timed
+                 // G distinct experts (copies of this blob at different addresses), E entries each = a T-token window
+-                const int G = 10, E = 4, NE = G * E, iters = 20;
++                const char* entries = std::getenv("STRATA_NATIVE_BENCH_ENTRIES");
++                const int G = 10, E = entries ? std::clamp(std::atoi(entries), 1, 8) : 4, NE = G * E, iters = 20;
++                const bool host_weights = std::getenv("STRATA_NATIVE_BENCH_HOST") &&
++                                          std::strcmp(std::getenv("STRATA_NATIVE_BENCH_HOST"), "1") == 0;
+                 std::vector<void*> blobs((size_t) G);
+                 std::vector<unsigned long long> ptrs((size_t) G);
+                 for (int g = 0; g < G; ++g) {
+-                    blobs[(size_t) g] = sycl::malloc_device(blob.size(), *s);
++                    blobs[(size_t) g] = host_weights ? sycl::malloc_host(blob.size(), *s) : sycl::malloc_device(blob.size(), *s);
+                     s->memcpy(blobs[(size_t) g], blob.data(), blob.size()).wait();
++                    verify_upload(blobs[(size_t) g], blob);
+                     ptrs[(size_t) g] = (unsigned long long) blobs[(size_t) g];
+                 }
+                 std::vector<int32_t> starts((size_t) G + 1), dst((size_t) NE), tokv((size_t) NE);
+@@ -274,6 +293,23 @@ int main(int argc, char** argv) {
+                 s->memcpy(btok, tokv.data(), (size_t) NE * 4).wait();
+                 strata::kernels::native_expert_grouped(L, bptr, bstart, bn, bdst, btok, G, NE, dxq, bscr, bout, s);
+                 s->wait();
++                // Repeated activation rows must agree with the three-entry
++                // reference above; this also checks padded 5/6/7-entry tails.
++                std::vector<float> batch((size_t) NE * H);
++                s->memcpy(batch.data(), bout, batch.size() * sizeof(float)).wait_and_throw();
++                double diff = 0, magnitude = 0;
++                for (int g = 0; g < G; ++g)
++                    for (int e = 0; e < E; ++e)
++                        for (int d = 0; d < H; ++d) {
++                            const float v = batch[((size_t)g * E + e) * H + d];
++                            const float expected = got_g[(size_t)(e % NT) * H + d];
++                            if (!std::isfinite(v)) { std::fprintf(stderr, "nonfinite batch output\n"); return 1; }
++                            diff += std::fabs((double)v - expected);
++                            magnitude += std::fabs((double)expected);
++                        }
++                const double batch_rel = diff / (magnitude + 1e-30);
++                std::printf("          batch entries %d vs three-entry reference: rel %.3e\n", E, batch_rel);
++                if (batch_rel > 1e-5) { std::fprintf(stderr, "batch reference mismatch\n"); return 1; }
+                 const auto b0 = std::chrono::steady_clock::now();
+                 for (int i = 0; i < iters; ++i)
+                     strata::kernels::native_expert_grouped(L, bptr, bstart, bn, bdst, btok, G, NE, dxq, bscr, bout, s);
+@@ -281,6 +317,7 @@ int main(int argc, char** argv) {
+                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count() / iters;
+                 std::printf("          GPU grouped: %d experts x %d entries: %.3f ms per layer call  (%.1f GB/s of expert bytes)\n",
+                             G, E, ms, (double) G * (double) blob.size() / ms / 1e6);
++                std::printf("          weight placement: %s\n", host_weights ? "mapped pinned host" : "device");
+                 for (int g = 0; g < G; ++g) sycl::free(blobs[(size_t) g], *s);
+                 sycl::free(bptr, *s); sycl::free(bstart, *s); sycl::free(bn, *s); sycl::free(bdst, *s); sycl::free(btok, *s);
+                 sycl::free(bscr, *s); sycl::free(bout, *s);
+@@ -288,6 +325,9 @@ int main(int argc, char** argv) {
+             sycl::free(dblob, *s); sycl::free(dx, *s); sycl::free(dxq, *s); sycl::free(dscr, *s); sycl::free(dout, *s); sycl::free(dptr, *s);
+             sycl::free(dstart, *s); sycl::free(dn, *s); sycl::free(ddst, *s); sycl::free(dtok, *s);
+         }
++        if (dump && std::fwrite(got_g.data(), sizeof(float), got_g.size(), dump) != got_g.size()) {
++            std::perror("parity dump write"); return 2;
++        }
+         const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
+         const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+         std::printf("layer %2d  %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", l,
+@@ -296,5 +336,6 @@ int main(int argc, char** argv) {
+         if (!ok) ++failures;
+     }
+     std::printf("native_expert_parity: %d failures\n", failures);
++    if (dump) std::fclose(dump);
+     return failures ? 1 : 0;
+ }
+-- 
+2.43.0
+

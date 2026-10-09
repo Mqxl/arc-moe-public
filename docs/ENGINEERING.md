@@ -1163,3 +1163,27 @@ Focused reproduction: ARC_PROFILE_LAYER_SWEEP=1 ./arc profile tuned-opencode
 --no-unitrace, with ARC_PROFILE_LAYER_SPLITS selecting boundaries. This mode
 includes all eight cases plus one-card control, TTFT and per-card peak VRAM;
 explicit caller STRATA_EXTRA_ARGS is preserved for the control.
+
+## Final 128K screens: expert tails rejected (patches 65 and 67)
+
+Patch 65 is opt-in STRATA_EXPERT_TAIL_BATCH: unset/0 is the existing path,
+1 batches only a three-entry decode tail, 2 also batches five-to-seven-entry
+ tails. Prefill, other formats and lane configurations keep the existing path.
+Real-weight dump parity was exact on both cards with VRAM and mapped-host
+weights. Patch 67 fixes the parity harness reference to use the global entry
+index in repeated groups; its earlier mismatch was a test-reference error.
+Five/six/seven-entry synthetic groups then matched exactly in both modes.
+
+A wide tail made upper-card VRAM kernels about 8% slower (~0.380 ->0.410 ms).
+The narrow tail improved one VRAM microcase, but in the same-seed API tuner
+short-code decode was 37.45 ->37.60 tok/s (+0.40%), 10K prefill 567.7 ->564.7.
+It failed the required 2% target gain and remains OFF. No kernel default changed.
+
+Other controlled dual screens: commit overlap code 37.45 ->37.80 (+0.93%),
+agent wall 3.275 ->3.390 s (+3.50% loss); split_rows8 10K 567.7 ->574.8
+(+1.26%), post-10K decode 31.45 ->30.25 (-3.82%) and agent decode
+43.35 ->40.45 (-6.69%). Both rejected. All three screens passed 12 correctness
+requests, but that alone is not a speed acceptance. Reports:
+tune-20261009-190836.txt and .tune-20261009-190836/ (not committed).
+The user authorized stopping when remaining candidates give no noticeable
+improvement; no further optimization sweep is justified by these results.

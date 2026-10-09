@@ -1,0 +1,26 @@
+From 33b4b8b9b4c0d35705b2948667be2cbfd4237428 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 9 Oct 2026 19:03:37 +0500
+Subject: [PATCH] test: match repeated activation by global entry index in
+ parity probe
+
+---
+ sycl/src/kernels/native_expert_parity.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sycl/src/kernels/native_expert_parity.cpp b/sycl/src/kernels/native_expert_parity.cpp
+index 04fa8ea..eca3127 100644
+--- a/sycl/src/kernels/native_expert_parity.cpp
++++ b/sycl/src/kernels/native_expert_parity.cpp
+@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
+                     for (int e = 0; e < E; ++e)
+                         for (int d = 0; d < H; ++d) {
+                             const float v = batch[((size_t)g * E + e) * H + d];
+-                            const float expected = got_g[(size_t)(e % NT) * H + d];
++                            const float expected = got_g[(size_t)((g * E + e) % NT) * H + d];
+                             if (!std::isfinite(v)) { std::fprintf(stderr, "nonfinite batch output\n"); return 1; }
+                             diff += std::fabs((double)v - expected);
+                             magnitude += std::fabs((double)expected);
+-- 
+2.43.0
+
