@@ -57,7 +57,7 @@ locally because the user explicitly requested the uncensored model.
 
 Full check 14/14, including both 10K prompts. All 11 benchmark replies valid,
 including the red image fixture; no broken/repeated/empty reply. OpenCode
-1.18.35 in <client-project> returned 63 and Красный with the new model ID.
+1.18.35 returned 63 and Красный with the new model ID.
 CLI verification used --pure, external MCP/plugins disabled, tools denied.
 The actual project settings were otherwise retained, including its existing
 other providers and default model. Vision is image input; no audio/video or
@@ -66,7 +66,7 @@ large-photo accuracy is certified here.
 Project Qwen model ID: arc-moe/qwen3.8-flash-next-uncensored-iq2_xs.
 Context 131072, output 4096, compaction/pruning enabled with 8192 reserved
 and recent tokens. API key remains an environment reference; no key in files
-or OS argv. Backup: <client-project>/opencode.before-uncensored-20261009.json.bak.
+or OS argv. Back up the existing client configuration before migration.
 The generated standalone client config is opencode-uncensored-128k.json in
 local outputs/final-128k. Start a new chat and select the new Qwen model.
 

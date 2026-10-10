@@ -141,7 +141,7 @@ Agent wall: 6.629 → 6.639 s.
 Full correctness: dual and single 14/14, including both 10K requests, sampled
 and streamed agent cases. Text benchmarks exercised up to ~119953 input
 tokens with max output 128, using the actual 131072-configured int8-KV server.
-The existing project <client-project> OpenCode 1.18.35 client returned 63
+An OpenCode 1.18.35 client returned 63
 for 7*9 with no transport errors. This used --pure with external MCP/plugins
 disabled and tools denied; it does not certify every project plugin or UI flow.
 OpenCode image attachment also correctly identified the fresh red fixture.

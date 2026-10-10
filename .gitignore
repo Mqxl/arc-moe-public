@@ -10,4 +10,17 @@ third_party/pti-gpu/
 tune-*.txt
 tune-*.env
 .tune-*/
-check-*.txt
+check-*.txt*
+
+# Private machine/runtime artifacts: never publish credentials or local logs.
+/test-logs/
+/existing-gguf/
+/.ssh/
+/.env
+/.env.*
+!/.env.example
+*.pem
+*.key
+/auth.json
+/credentials.json
+/opencode*.local.json
